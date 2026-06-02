@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moomoo-small-cap-options-agent"
+version = "0.1.0"
+description = "Moomoo MY small-cap event-driven options agent foundation"
+requires-python = ">=3.11"
+dependencies = [
+  "moomoo-api==10.6.6608",
+  "openai>=1.40,<3",
+  "pydantic>=2.12,<3",
+  "python-dotenv>=1.2,<2",
+  "PyYAML>=6,<7",
+  "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9,<10"]
+
+[project.scripts]
+trading-agent = "trading_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+

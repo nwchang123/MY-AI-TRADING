@@ -1,0 +1,46 @@
+{
+  "proposal": {
+    "decision": "open_position",
+    "ticker": "EXAMPLE",
+    "option_code": "US.EXAMPLE260626C00005000",
+    "option_side": "call",
+    "action": "buy_to_open",
+    "contracts": 1,
+    "limit_price": 0.2,
+    "max_limit_price": 0.21,
+    "thesis": "Public catalyst with bounded premium risk.",
+    "evidence_ids": [
+      "evt_1"
+    ],
+    "confidence": 0.7,
+    "expected_catalyst_window": "2026-06-10/2026-06-20",
+    "exit_plan": {
+      "take_profit_pct": 100,
+      "stop_loss_pct": 50,
+      "time_stop": "2026-06-24"
+    },
+    "invalidation": [
+      "Catalyst is delayed"
+    ]
+  },
+  "quote": {
+    "option_code": "US.EXAMPLE260626C00005000",
+    "bid": 0.19,
+    "ask": 0.21,
+    "open_interest": 200,
+    "daily_volume": 30,
+    "lot_size": 100,
+    "expiry": "2026-06-26",
+    "observed_at": "2026-06-02T15:00:00+00:00"
+  },
+  "portfolio": {
+    "open_positions": 0,
+    "total_premium_at_risk_usd": 0,
+    "new_positions_today": 0,
+    "daily_pnl_usd": 0,
+    "total_drawdown_usd": 0,
+    "consecutive_losses": 0,
+    "duplicate_order_exists": false
+  },
+  "now": "2026-06-02T15:00:00+00:00"
+}

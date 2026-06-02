@@ -1,0 +1,33 @@
+{
+  "candidate": {
+    "ticker": "EXAMPLE",
+    "as_of": "2026-06-02T15:00:00+00:00",
+    "evidence": [
+      {
+        "evidence_id": "evt_1",
+        "ticker": "EXAMPLE",
+        "source_type": "sec_8k",
+        "source_url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=EXAMPLE",
+        "published_at": "2026-06-01T12:30:00+00:00",
+        "observed_fact": "Company filed an 8-K announcing a named multi-year supply agreement with a large customer, with revenue beginning next quarter.",
+        "retrieved_at": "2026-06-02T13:00:00+00:00"
+      },
+      {
+        "evidence_id": "evt_2",
+        "ticker": "EXAMPLE",
+        "source_type": "earnings_calendar",
+        "source_url": "https://example.com/ir/earnings",
+        "published_at": "2026-05-20T00:00:00+00:00",
+        "observed_fact": "Next earnings call scheduled for 2026-06-18, inside the option window.",
+        "retrieved_at": "2026-06-02T13:00:00+00:00"
+      }
+    ]
+  },
+  "score_inputs": {
+    "catalyst": 0.8,
+    "options": 0.6,
+    "underlying": 0.5,
+    "operations": 0.6,
+    "contradictions": 0.1
+  }
+}

@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+from dotenv import load_dotenv
+
+Mode = Literal["paper", "live"]
+LIVE_ACKNOWLEDGMENT = "I_UNDERSTAND_REAL_MONEY"
+
+
+@dataclass(frozen=True)
+class Settings:
+    root_dir: Path
+    mode: Mode
+    moomoo_host: str
+    moomoo_port: int
+    security_firm: str
+    account_id: int | None
+    live_acknowledgment: str
+    llm_api_key: str = ""
+    llm_base_url: str = "https://api.deepseek.com"
+    llm_model: str = "deepseek-v4-flash"
+    llm_model_pro: str = "deepseek-v4-pro"
+    sec_user_agent: str = ""
+    live_account_allowlist: tuple[int, ...] = ()
+
+    @classmethod
+    def from_env(cls, root_dir: Path | None = None) -> "Settings":
+        root = (root_dir or Path.cwd()).resolve()
+        load_dotenv(root / ".env")
+        mode = os.getenv("TRADING_AGENT_MODE", "paper").strip().lower()
+        if mode not in {"paper", "live"}:
+            raise ValueError("TRADING_AGENT_MODE must be 'paper' or 'live'")
+
+        raw_account_id = os.getenv("TRADING_AGENT_ACCOUNT_ID", "").strip()
+        raw_allowlist = os.getenv("TRADING_AGENT_LIVE_ACCOUNT_ALLOWLIST", "").strip()
+        allowlist = tuple(
+            int(part.strip()) for part in raw_allowlist.split(",") if part.strip()
+        )
+        return cls(
+            root_dir=root,
+            mode=mode,  # type: ignore[arg-type]
+            moomoo_host=os.getenv("TRADING_AGENT_MOOMOO_HOST", "127.0.0.1"),
+            moomoo_port=int(os.getenv("TRADING_AGENT_MOOMOO_PORT", "11111")),
+            security_firm=os.getenv("TRADING_AGENT_SECURITY_FIRM", "FUTUMY").strip(),
+            account_id=int(raw_account_id) if raw_account_id else None,
+            live_acknowledgment=os.getenv("TRADING_AGENT_ENABLE_LIVE", "").strip(),
+            llm_api_key=os.getenv("TRADING_AGENT_LLM_API_KEY", "").strip(),
+            llm_base_url=os.getenv(
+                "TRADING_AGENT_LLM_BASE_URL", "https://api.deepseek.com"
+            ).strip(),
+            llm_model=os.getenv("TRADING_AGENT_LLM_MODEL", "deepseek-v4-flash").strip(),
+            llm_model_pro=os.getenv(
+                "TRADING_AGENT_LLM_MODEL_PRO", "deepseek-v4-pro"
+            ).strip(),
+            sec_user_agent=os.getenv("TRADING_AGENT_SEC_USER_AGENT", "").strip(),
+            live_account_allowlist=allowlist,
+        )
+
+    @property
+    def mandate_path(self) -> Path:
+        return self.root_dir / "config" / f"mandate.{self.mode}.yaml"
+
+    def assert_live_startup_allowed(self) -> None:
+        if self.mode != "live":
+            return
+        if self.live_acknowledgment != LIVE_ACKNOWLEDGMENT:
+            raise RuntimeError(
+                "Live mode is disabled. Set TRADING_AGENT_ENABLE_LIVE="
+                f"{LIVE_ACKNOWLEDGMENT} manually for a controlled live run."
+            )
+        if self.account_id is None:
+            raise RuntimeError("TRADING_AGENT_ACCOUNT_ID is required in live mode.")
+        if not self.live_account_allowlist:
+            raise RuntimeError(
+                "Live mode requires an operator-pinned allowlist. Set "
+                "TRADING_AGENT_LIVE_ACCOUNT_ALLOWLIST to the approved account id(s)."
+            )
+        if self.account_id not in self.live_account_allowlist:
+            raise RuntimeError(
+                f"Account {self.account_id} is not in the live allowlist "
+                f"{self.live_account_allowlist}."
+            )
+

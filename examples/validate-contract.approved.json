@@ -1,0 +1,15 @@
+{
+  "ticker": "EXAMPLE",
+  "contracts": 1,
+  "now": "2026-06-02T15:00:00+00:00",
+  "quote": {
+    "option_code": "US.EXAMPLE260626C00005000",
+    "bid": 0.19,
+    "ask": 0.21,
+    "open_interest": 200,
+    "daily_volume": 30,
+    "lot_size": 100,
+    "expiry": "2026-06-26",
+    "observed_at": "2026-06-02T15:00:00+00:00"
+  }
+}
