@@ -34,3 +34,32 @@ def test_live_mode_requires_pinned_account(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="ACCOUNT_ID"):
         settings.assert_live_startup_allowed()
 
+
+def test_adversary_llm_config_parsed_from_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRADING_AGENT_LLM_ADVERSARY_API_KEY", "advkey")
+    monkeypatch.setenv("TRADING_AGENT_LLM_ADVERSARY_BASE_URL", "https://adv.example/v1")
+    monkeypatch.setenv("TRADING_AGENT_LLM_ADVERSARY_MODEL", "gemini-2.0-flash")
+
+    settings = Settings.from_env(tmp_path)
+
+    assert settings.llm_adversary_api_key == "advkey"
+    assert settings.llm_adversary_base_url == "https://adv.example/v1"
+    assert settings.llm_adversary_model == "gemini-2.0-flash"
+
+
+def test_adversary_llm_defaults_blank(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for var in (
+        "TRADING_AGENT_LLM_ADVERSARY_API_KEY",
+        "TRADING_AGENT_LLM_ADVERSARY_BASE_URL",
+        "TRADING_AGENT_LLM_ADVERSARY_MODEL",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    settings = Settings.from_env(tmp_path)
+
+    assert settings.llm_adversary_model == ""
+

@@ -26,9 +26,11 @@ _CATALYST_TYPE_WEIGHT: dict[SourceType, float] = {
     "sec_10k": 0.4,
 }
 
-_DILUTION_TYPES: set[SourceType] = {"sec_s3", "sec_424b"}
+# Public so the deterministic red-flag detector reuses the exact same
+# dilution / insider-selling vocabulary as the scorer (single source of truth).
+DILUTION_TYPES: set[SourceType] = {"sec_s3", "sec_424b"}
 
-_DILUTION_KEYWORDS = (
+DILUTION_KEYWORDS = (
     "dilution",
     "at-the-market",
     "atm offering",
@@ -39,7 +41,7 @@ _DILUTION_KEYWORDS = (
     "public offering",
     "private placement",
 )
-_INSIDER_SELL_KEYWORDS = ("sold", "sale of", "disposed", "insider selling")
+INSIDER_SELL_KEYWORDS = ("sold", "sale of", "disposed", "insider selling")
 _OPERATIONS_KEYWORDS = (
     "hiring",
     "hire",
@@ -97,18 +99,12 @@ def _contains(text: str, keywords: tuple[str, ...]) -> bool:
     return any(keyword in lowered for keyword in keywords)
 
 
-def derive_score_inputs(
-    items: list[EvidenceItem],
-    as_of: datetime,
-    *,
-    options: float = 0.0,
-    underlying: float = 0.0,
-) -> ScoreInputs:
+def derive_score_inputs(items: list[EvidenceItem], as_of: datetime) -> ScoreInputs:
     """Deterministically map catalyst evidence to score sub-inputs.
 
-    ``options`` and ``underlying`` come from market data (Phase 2) and are passed
-    through; this function fills ``catalyst``, ``operations``, and
-    ``contradictions`` from the public evidence.
+    Fills ``catalyst``, ``operations``, and ``contradictions`` from the public
+    evidence. (Live option-chain / underlying market-data sub-scores are not
+    derived here and are not part of the score until that feed is wired.)
     """
 
     if as_of.tzinfo is None:
@@ -134,11 +130,11 @@ def derive_score_inputs(
         if _contains(item.observed_fact, _OPERATIONS_KEYWORDS):
             operations_scores.append(catalyst_w)
 
-        is_dilution = item.source_type in _DILUTION_TYPES or _contains(
-            item.observed_fact, _DILUTION_KEYWORDS
+        is_dilution = item.source_type in DILUTION_TYPES or _contains(
+            item.observed_fact, DILUTION_KEYWORDS
         )
         is_insider_sale = item.source_type == "sec_form4" and _contains(
-            item.observed_fact, _INSIDER_SELL_KEYWORDS
+            item.observed_fact, INSIDER_SELL_KEYWORDS
         )
         if is_dilution:
             dilution_count += 1
@@ -154,8 +150,6 @@ def derive_score_inputs(
 
     return ScoreInputs(
         catalyst=round(catalyst, 4),
-        options=options,
-        underlying=underlying,
         operations=round(operations, 4),
         contradictions=round(contradictions, 4),
     )

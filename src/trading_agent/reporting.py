@@ -52,12 +52,18 @@ def build_daily_report(events: list[dict[str, Any]], on_date: date) -> dict[str,
     realized_pnl = 0.0
     positions_closed = 0
     failures = 0
+    llm = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
 
     for event in day_events:
         etype = event.get("event_type", "")
         payload = event.get("payload", {})
 
-        if etype == "committee_run":
+        if etype == "llm_usage":
+            for key in llm:
+                value = payload.get(key)
+                if isinstance(value, int):
+                    llm[key] += value
+        elif etype == "committee_run":
             decision = payload.get("decision")
             if decision in committee_decisions:
                 committee_decisions[decision] += 1
@@ -100,4 +106,5 @@ def build_daily_report(events: list[dict[str, Any]], on_date: date) -> dict[str,
         "close_reasons": close_reasons,
         "realized_pnl_usd": round(realized_pnl, 4),
         "failures": failures,
+        "llm_usage": {**llm, "total_tokens": llm["prompt_tokens"] + llm["completion_tokens"]},
     }

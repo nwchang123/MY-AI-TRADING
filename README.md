@@ -26,6 +26,7 @@ an order.
 - autonomous paper cycle: reconcile, exits, gated entries
 - position monitor (take-profit, stop-loss, time stop, forced close)
 - local position ledger and daily audit-log report
+- offline backtest v0 for proposal/quote replay through the risk and exit engine
 - gated USD 100 live run: allowlist, ramp cap, circuit-breaker HALT
 
 ## Controlled Live Run (Phase 6)
@@ -76,6 +77,21 @@ Schedule `run-cycle` on an external timer (Task Scheduler / cron) for the
 20-session paper shadow run; the `HALT` kill switch aborts a cycle before any
 broker call.
 
+## Offline Backtest v0
+
+`backtest` replays point-in-time proposals and option quotes through the same
+liquidity validator, deterministic risk gate, and position monitor used by the
+paper/live cycle. It does not connect to Moomoo and does not call the LLM. Buy
+limits fill only when the quote ask is at or below the proposal limit; long
+options are marked and exited at the bid.
+
+```powershell
+trading-agent backtest --input examples/backtest-v0.example.json
+```
+
+Use this first to test loss stops, position caps, spread costs, unfilled orders,
+and exit behavior before spending API calls or running paper/live cycles.
+
 ## Public Catalyst Pipeline
 
 `catalysts` pulls a ticker's recent SEC EDGAR filings (8-K, 10-Q/K, S-3, 424B,
@@ -116,21 +132,35 @@ trading-agent validate-contract --input examples/validate-contract.approved.json
 ## LLM Research Committee
 
 The committee (`catalyst_analyst`, `skeptic`, `options_analyst`, `risk_manager`,
-`portfolio_manager`) runs against any OpenAI-compatible endpoint, using two model
-tiers: a fast "flash" model for the four analyst/critic roles and a stronger
-"pro" model for the decisive `portfolio_manager`. Defaults target DeepSeek V4;
-override via `.env`:
+`portfolio_manager`) runs against any OpenAI-compatible endpoint, using up to
+three model tiers: a fast "flash" model for the idea-generating roles, an
+optional cross-provider "adversary" model for the `skeptic` and `risk_manager`,
+and a stronger "pro" model for the decisive `portfolio_manager`. Defaults target
+DeepSeek V4; override via `.env`:
 
 ```env
 TRADING_AGENT_LLM_API_KEY=sk-...
 TRADING_AGENT_LLM_BASE_URL=https://api.deepseek.com
 TRADING_AGENT_LLM_MODEL=deepseek-v4-flash
 TRADING_AGENT_LLM_MODEL_PRO=deepseek-v4-pro
+# Optional: run the veto roles on a different provider for an independent
+# second opinion. Blank model = reuse the primary model.
+TRADING_AGENT_LLM_ADVERSARY_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+TRADING_AGENT_LLM_ADVERSARY_API_KEY=...
+TRADING_AGENT_LLM_ADVERSARY_MODEL=gemini-2.0-flash
 ```
 
+Pointing the `skeptic` / `risk_manager` at a different model lineage gives their
+vetoes genuinely uncorrelated errors, instead of the same model grading its own
+work. Before any LLM call, a deterministic red-flag detector
+(`research/redflags.py`) blocks the trade outright on a fresh dilution shelf or
+insider selling (zero API cost) and hands softer warnings (earnings IV-crush,
+stale catalyst, thin evidence) to the veto roles as confirmed facts.
+
 The committee never calls the broker or the risk gate. It emits a schema-checked
-proposal; invalid JSON, uncited evidence, a ticker mismatch, or a skeptic /
-risk-manager veto all force a `reject`. Run it over an evidence bundle:
+proposal; invalid JSON, uncited evidence, a ticker mismatch, a deterministic
+critical red flag, or a skeptic / risk-manager veto all force a `reject`. Run it
+over an evidence bundle:
 
 ```powershell
 trading-agent committee-run --input examples/committee-run.example.json

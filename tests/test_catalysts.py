@@ -79,14 +79,6 @@ def test_dilution_filing_reduces_total_score() -> None:
     assert dirty.total < clean.total
 
 
-def test_options_and_underlying_pass_through() -> None:
-    inputs = derive_score_inputs(
-        [_ev("e1", "sec_8k", age_days=1)], AS_OF, options=0.6, underlying=0.4
-    )
-    assert inputs.options == 0.6
-    assert inputs.underlying == 0.4
-
-
 def test_build_candidate_context_requires_evidence() -> None:
     with pytest.raises(ValueError, match="no usable evidence"):
         build_candidate_context("EXAMPLE", [], AS_OF)

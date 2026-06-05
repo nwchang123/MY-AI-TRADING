@@ -22,6 +22,8 @@ def _events() -> list[dict]:
         _ev("order_placed", {"side": "sell"}),
         _ev("position_closed", {"reason": "take profit", "realized_pnl_usd": 12.5}),
         _ev("position_closed", {"reason": "stop loss", "realized_pnl_usd": -5.0}),
+        _ev("llm_usage", {"calls": 5, "prompt_tokens": 100, "completion_tokens": 40}),
+        _ev("llm_usage", {"calls": 5, "prompt_tokens": 50, "completion_tokens": 10}),
         _ev("cycle_step_failed", {"stage": "entry"}),
         _ev("committee_run", {"decision": "hold"}, day=OTHER_DAY),  # different day, excluded
     ]
@@ -39,6 +41,12 @@ def test_report_aggregates_single_day() -> None:
     assert report["close_reasons"] == {"take profit": 1, "stop loss": 1}
     assert report["realized_pnl_usd"] == 7.5
     assert report["failures"] == 1
+    assert report["llm_usage"] == {
+        "calls": 10,
+        "prompt_tokens": 150,
+        "completion_tokens": 50,
+        "total_tokens": 200,
+    }
 
 
 def test_report_excludes_other_days() -> None:
@@ -52,3 +60,4 @@ def test_empty_report() -> None:
     assert report["events"] == 0
     assert report["avg_spread_pct"] is None
     assert report["realized_pnl_usd"] == 0.0
+    assert report["llm_usage"]["total_tokens"] == 0

@@ -45,9 +45,7 @@ def _context() -> CandidateContext:
 
 
 def _scores():
-    return score_candidate(
-        ScoreInputs(catalyst=0.8, options=0.6, underlying=0.5, operations=0.6, contradictions=0.1)
-    )
+    return score_candidate(ScoreInputs(catalyst=0.8, operations=0.6, contradictions=0.1))
 
 
 def _run(responses: list[str]):
@@ -123,3 +121,128 @@ def test_json_code_fences_are_stripped() -> None:
     out = _run(["c", "o", "fine", "fine", fenced])
     assert out.decision == "open_position"
     assert out.proposal is not None
+
+
+def _dilution_context() -> CandidateContext:
+    return CandidateContext(
+        ticker="EXAMPLE",
+        as_of=NOW,
+        evidence=[
+            EvidenceItem(
+                evidence_id="evt_1",
+                ticker="EXAMPLE",
+                source_type="sec_8k",
+                source_url="https://sec.gov/x",
+                published_at=NOW,
+                observed_fact="Named multi-year supply agreement filed in an 8-K.",
+                retrieved_at=NOW,
+            ),
+            EvidenceItem(
+                evidence_id="evt_2",
+                ticker="EXAMPLE",
+                source_type="sec_s3",
+                source_url="https://sec.gov/s3",
+                published_at=NOW,
+                observed_fact="Filed an S-3 shelf registration for up to USD 100M.",
+                retrieved_at=NOW,
+            ),
+        ],
+    )
+
+
+def test_critical_red_flag_short_circuits_without_llm_calls() -> None:
+    client = MockLLMClient(
+        ["catalyst", "options", "fine", "fine", json.dumps(_PROPOSAL)]
+    )
+    out = Committee(client).run(_dilution_context(), _scores())
+    assert out.decision == "reject"
+    assert out.proposal is None
+    assert out.llm_calls == 0
+    assert client.calls == []  # committee skipped entirely
+    assert any("redflags" in v for v in out.vetoes)
+    assert any(f.code == "dilution_overhang" for f in out.red_flags)
+
+
+def test_warn_red_flags_do_not_block_open() -> None:
+    # The single-item _context() yields only a thin_evidence warning.
+    out = _run(
+        ["catalyst note", "options note", "looks fine", "acceptable", json.dumps(_PROPOSAL)]
+    )
+    assert out.decision == "open_position"
+    assert out.llm_calls == 5
+    assert any(f.code == "thin_evidence" for f in out.red_flags)
+    assert all(f.severity == "warn" for f in out.red_flags)
+
+
+def test_warn_red_flags_are_passed_to_the_skeptic() -> None:
+    client = MockLLMClient(
+        ["catalyst", "options", "fine", "fine", json.dumps(_PROPOSAL)]
+    )
+    Committee(client).run(_context(), _scores())
+    skeptic_prompt = client.calls[2]["user"]
+    assert "Deterministic red flags" in skeptic_prompt
+    assert "thin_evidence" in skeptic_prompt
+
+
+def _named(responses: list[str], model: str) -> MockLLMClient:
+    client = MockLLMClient(responses)
+    client.model = model  # exercised by RoleNote model attribution
+    return client
+
+
+def test_adversary_client_runs_skeptic_and_risk() -> None:
+    primary = _named(["catalyst note", "options note"], "primary-flash")
+    adversary = _named(["skeptic ok", "risk ok"], "adversary-model")
+    pro = _named([json.dumps(_PROPOSAL)], "pro-model")
+
+    out = Committee(primary, pro_client=pro, adversary_client=adversary).run(
+        _context(), _scores()
+    )
+
+    assert out.decision == "open_position"
+    # Idea roles hit the primary, veto roles hit the adversary, PM hits pro.
+    assert len(primary.calls) == 2
+    assert len(adversary.calls) == 2
+    assert len(pro.calls) == 1
+    roles = {note.role: note.model for note in out.role_notes}
+    assert roles["skeptic"] == "adversary-model"
+    assert roles["risk_manager"] == "adversary-model"
+    assert roles["catalyst_analyst"] == "primary-flash"
+    assert roles["portfolio_manager"] == "pro-model"
+
+
+def test_adversary_veto_blocks_open() -> None:
+    primary = MockLLMClient(["catalyst", "options"])
+    adversary = MockLLMClient(["VETO: dilution shelf detected", "ok"])
+    pro = MockLLMClient([json.dumps(_PROPOSAL)])
+
+    out = Committee(primary, pro_client=pro, adversary_client=adversary).run(
+        _context(), _scores()
+    )
+    assert out.decision == "reject"
+    assert any("skeptic" in v for v in out.vetoes)
+
+
+def test_omitted_adversary_falls_back_to_primary() -> None:
+    primary = MockLLMClient(
+        ["catalyst", "options", "skeptic ok", "risk ok", json.dumps(_PROPOSAL)]
+    )
+    out = Committee(primary).run(_context(), _scores())
+    assert out.decision == "open_position"
+    assert len(primary.calls) == 5  # all five roles ran on the one client
+
+
+def test_usage_total_sums_distinct_clients() -> None:
+    primary = MockLLMClient(["catalyst", "options"])
+    adversary = MockLLMClient(["skeptic ok", "risk ok"])
+    pro = MockLLMClient([json.dumps(_PROPOSAL)])
+    committee = Committee(primary, pro_client=pro, adversary_client=adversary)
+    committee.run(_context(), _scores())
+    assert committee.usage_total().calls == 5  # 2 + 2 + 1
+
+
+def test_usage_total_dedupes_shared_client() -> None:
+    primary = MockLLMClient(["c", "o", "s", "r", json.dumps(_PROPOSAL)])
+    committee = Committee(primary)  # one client backs all three tiers
+    committee.run(_context(), _scores())
+    assert committee.usage_total().calls == 5  # counted once, not tripled

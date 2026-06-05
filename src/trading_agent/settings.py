@@ -24,6 +24,13 @@ class Settings:
     llm_base_url: str = "https://api.deepseek.com"
     llm_model: str = "deepseek-v4-flash"
     llm_model_pro: str = "deepseek-v4-pro"
+    # Optional cross-provider model for the skeptic / risk_manager roles. When
+    # set, the adversarial roles run on a different model lineage so their errors
+    # are uncorrelated with the primary model. Base URL / key fall back to the
+    # primary endpoint when left blank.
+    llm_adversary_api_key: str = ""
+    llm_adversary_base_url: str = ""
+    llm_adversary_model: str = ""
     sec_user_agent: str = ""
     live_account_allowlist: tuple[int, ...] = ()
 
@@ -55,6 +62,15 @@ class Settings:
             llm_model=os.getenv("TRADING_AGENT_LLM_MODEL", "deepseek-v4-flash").strip(),
             llm_model_pro=os.getenv(
                 "TRADING_AGENT_LLM_MODEL_PRO", "deepseek-v4-pro"
+            ).strip(),
+            llm_adversary_api_key=os.getenv(
+                "TRADING_AGENT_LLM_ADVERSARY_API_KEY", ""
+            ).strip(),
+            llm_adversary_base_url=os.getenv(
+                "TRADING_AGENT_LLM_ADVERSARY_BASE_URL", ""
+            ).strip(),
+            llm_adversary_model=os.getenv(
+                "TRADING_AGENT_LLM_ADVERSARY_MODEL", ""
             ).strip(),
             sec_user_agent=os.getenv("TRADING_AGENT_SEC_USER_AGENT", "").strip(),
             live_account_allowlist=allowlist,

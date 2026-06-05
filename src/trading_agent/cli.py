@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from trading_agent.backtest import run_backtest_file
 from trading_agent.brokers.moomoo import MoomooBroker, MoomooConnection
 from trading_agent.data.moomoo_market import MoomooMarket
 from trading_agent.data.sec_edgar import SecEdgarClient
@@ -17,10 +19,11 @@ from trading_agent.domain.risk import Mandate, PortfolioState, QuoteSnapshot, Ri
 from trading_agent.execution.live import LIVE_UNLOCK_CHECKLIST, live_position_cap
 from trading_agent.execution.lock import single_instance_lock
 from trading_agent.execution.orchestrator import PaperTradingCycle
+from trading_agent.execution.scheduler import run_scheduler
 from trading_agent.reporting import build_daily_report, read_audit_events
 from trading_agent.research.catalysts import build_candidate_context, derive_score_inputs
 from trading_agent.research.committee import Committee
-from trading_agent.research.llm import OpenAICompatibleClient
+from trading_agent.research.llm import OpenAICompatibleClient, usage_delta
 from trading_agent.research.scoring import ScoreInputs, score_candidate
 from trading_agent.settings import Settings
 from trading_agent.storage.audit import AuditWriter
@@ -95,11 +98,42 @@ def _check_proposal(settings: Settings, input_path: Path) -> bool:
     return decision.approved
 
 
-def _llm_client(settings: Settings, model: str) -> OpenAICompatibleClient:
+def _llm_client(
+    settings: Settings,
+    model: str,
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
+) -> OpenAICompatibleClient:
     return OpenAICompatibleClient(
-        api_key=settings.llm_api_key,
-        base_url=settings.llm_base_url,
+        api_key=api_key or settings.llm_api_key,
+        base_url=base_url or settings.llm_base_url,
         model=model,
+    )
+
+
+def _adversary_client(settings: Settings) -> OpenAICompatibleClient | None:
+    """Optional cross-provider client for the skeptic / risk_manager roles.
+
+    Returns None when no adversary model is configured, so the committee falls
+    back to the primary model for those roles. Endpoint and key default to the
+    primary ones when only a model is given.
+    """
+    if not settings.llm_adversary_model:
+        return None
+    return _llm_client(
+        settings,
+        settings.llm_adversary_model,
+        base_url=settings.llm_adversary_base_url or settings.llm_base_url,
+        api_key=settings.llm_adversary_api_key or settings.llm_api_key,
+    )
+
+
+def _build_committee(settings: Settings) -> Committee:
+    return Committee(
+        _llm_client(settings, settings.llm_model),
+        _llm_client(settings, settings.llm_model_pro),
+        adversary_client=_adversary_client(settings),
     )
 
 
@@ -107,13 +141,14 @@ def _run_committee(settings: Settings, input_path: Path) -> bool:
     payload = json.loads(input_path.read_text(encoding="utf-8"))
     context = CandidateContext.model_validate(payload["candidate"])
     scores = score_candidate(ScoreInputs.model_validate(payload["score_inputs"]))
-    committee = Committee(
-        _llm_client(settings, settings.llm_model),
-        _llm_client(settings, settings.llm_model_pro),
-    )
+    committee = _build_committee(settings)
+    before = committee.usage_total()
     output = committee.run(context, scores)
+    usage = usage_delta(before, committee.usage_total())
     output_payload = output.model_dump(mode="json")
-    _audit_writer(settings).append(
+    output_payload["llm_usage"] = usage.model_dump(mode="json")
+    audit = _audit_writer(settings)
+    audit.append(
         "committee_run",
         {
             "ticker": context.ticker,
@@ -123,6 +158,7 @@ def _run_committee(settings: Settings, input_path: Path) -> bool:
             "output": output_payload,
         },
     )
+    audit.append("llm_usage", {"ticker": context.ticker, **usage.model_dump(mode="json")})
     _print_json(output_payload)
     return output.decision == "open_position"
 
@@ -201,10 +237,7 @@ def _build_cycle(
     max_open_positions_override: int | None = None,
 ) -> PaperTradingCycle:
     mandate = Mandate.load(settings.mandate_path)
-    committee = Committee(
-        _llm_client(settings, settings.llm_model),
-        _llm_client(settings, settings.llm_model_pro),
-    )
+    committee = _build_committee(settings)
     return PaperTradingCycle(
         mandate=mandate,
         account_id=settings.account_id,  # type: ignore[arg-type]
@@ -247,6 +280,40 @@ def _run_cycle(settings: Settings, tickers: list[str]) -> None:
     _print_json(_cycle_payload(result))
 
 
+def _run_loop(
+    settings: Settings,
+    tickers: list[str],
+    *,
+    interval_seconds: float,
+    max_iterations: int | None,
+    market_hours_only: bool,
+) -> None:
+    if settings.account_id is None:
+        raise RuntimeError(
+            "run-loop requires a pinned account: set TRADING_AGENT_ACCOUNT_ID."
+        )
+
+    def run_cycle() -> None:
+        with single_instance_lock(_cycle_lock_path(settings)):
+            result = _build_cycle(settings, trd_env="SIMULATE").run_once(tickers)
+        _print_json(_cycle_payload(result))
+
+    def is_halted() -> bool:
+        return _halt_path(settings).exists()
+
+    ran = run_scheduler(
+        run_cycle=run_cycle,
+        is_halted=is_halted,
+        interval_seconds=interval_seconds,
+        sleep_fn=time.sleep,
+        now_fn=lambda: datetime.now(timezone.utc),
+        max_iterations=max_iterations,
+        market_hours_only=market_hours_only,
+        on_skip=lambda reason: print(f"skip cycle ({reason})", file=sys.stderr),
+    )
+    print(f"run-loop finished: {ran} cycle(s) executed", file=sys.stderr)
+
+
 def _run_live(settings: Settings, tickers: list[str]) -> None:
     if settings.mode != "live":
         raise RuntimeError("run-live requires TRADING_AGENT_MODE=live.")
@@ -278,6 +345,18 @@ def _report(settings: Settings, on_date: date | None) -> None:
     events = read_audit_events(settings.root_dir / "runtime" / "audit.jsonl")
     target = on_date or datetime.now(timezone.utc).date()
     _print_json(build_daily_report(events, target))
+
+
+def _run_backtest(settings: Settings, input_path: Path) -> None:
+    mandate = Mandate.load(settings.mandate_path)
+    result = run_backtest_file(
+        input_path,
+        mandate=mandate,
+        # Keep offline replays independent from the operator's live/paper HALT
+        # file while still exercising RiskGate's kill-switch path.
+        root_dir=settings.root_dir / "runtime" / "backtest_sandbox",
+    )
+    _print_json(result.model_dump(mode="json"))
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -320,6 +399,24 @@ def _build_parser() -> argparse.ArgumentParser:
     cycle_parser.add_argument(
         "--tickers", required=True, help="Comma-separated tickers to evaluate"
     )
+    loop_parser = subparsers.add_parser(
+        "run-loop",
+        help="Run paper cycles on an interval (HALT- and market-hours-aware)",
+    )
+    loop_parser.add_argument(
+        "--tickers", required=True, help="Comma-separated tickers to evaluate"
+    )
+    loop_parser.add_argument(
+        "--interval-seconds", type=float, default=900.0, help="Seconds between cycles"
+    )
+    loop_parser.add_argument(
+        "--max-iterations", type=int, default=None, help="Stop after N ticks (default: forever)"
+    )
+    loop_parser.add_argument(
+        "--ignore-market-hours",
+        action="store_true",
+        help="Run cycles even when the U.S. market is closed",
+    )
     live_parser = subparsers.add_parser(
         "run-live",
         help="Run one controlled LIVE cycle (real money; requires explicit setup)",
@@ -332,6 +429,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "report", help="Build a daily report from the audit log"
     )
     report_parser.add_argument("--date", default=None, help="UTC date YYYY-MM-DD")
+    backtest_parser = subparsers.add_parser(
+        "backtest",
+        help="Replay offline proposals and option quotes through the risk/exit engine",
+    )
+    backtest_parser.add_argument("--input", required=True, type=Path)
     halt_parser = subparsers.add_parser("halt", help="Activate the local kill switch")
     halt_parser.add_argument("--reason", default="operator halt")
     subparsers.add_parser("resume", help="Clear the local kill switch")
@@ -375,6 +477,16 @@ def main() -> None:
         tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
         _run_cycle(settings, tickers)
         return
+    if args.command == "run-loop":
+        tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+        _run_loop(
+            settings,
+            tickers,
+            interval_seconds=args.interval_seconds,
+            max_iterations=args.max_iterations,
+            market_hours_only=not args.ignore_market_hours,
+        )
+        return
     if args.command == "run-live":
         tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
         _run_live(settings, tickers)
@@ -385,6 +497,9 @@ def main() -> None:
     if args.command == "report":
         on_date = date.fromisoformat(args.date) if args.date else None
         _report(settings, on_date)
+        return
+    if args.command == "backtest":
+        _run_backtest(settings, args.input)
         return
     if args.command == "halt":
         halt_path = _halt_path(settings)

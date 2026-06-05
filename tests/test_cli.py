@@ -5,9 +5,55 @@ from shutil import copyfile
 
 import pytest
 
-from trading_agent.cli import main
+from trading_agent.cli import _adversary_client, _build_committee, main
+from trading_agent.settings import Settings
 
 ROOT = Path(__file__).parents[1]
+
+
+def _settings(tmp_path: Path, **overrides) -> Settings:
+    base = dict(
+        root_dir=tmp_path,
+        mode="paper",
+        moomoo_host="127.0.0.1",
+        moomoo_port=11111,
+        security_firm="FUTUMY",
+        account_id=None,
+        live_acknowledgment="",
+        llm_api_key="primary-key",
+        llm_base_url="https://api.deepseek.com",
+        llm_model="deepseek-v4-flash",
+        llm_model_pro="deepseek-v4-pro",
+    )
+    base.update(overrides)
+    return Settings(**base)
+
+
+def test_adversary_client_is_none_without_model(tmp_path: Path) -> None:
+    assert _adversary_client(_settings(tmp_path)) is None
+
+
+def test_adversary_client_built_when_model_set(tmp_path: Path) -> None:
+    settings = _settings(
+        tmp_path,
+        llm_adversary_model="gemini-2.0-flash",
+        llm_adversary_base_url="https://adv.example/v1",
+        llm_adversary_api_key="adv-key",
+    )
+    client = _adversary_client(settings)
+    assert client is not None
+    assert client.model == "gemini-2.0-flash"
+
+
+def test_build_committee_wires_distinct_adversary(tmp_path: Path) -> None:
+    committee = _build_committee(_settings(tmp_path, llm_adversary_model="gemini-2.0-flash"))
+    assert committee.adversary_client is not committee.client
+    assert committee.adversary_client.model == "gemini-2.0-flash"
+
+
+def test_build_committee_falls_back_without_adversary(tmp_path: Path) -> None:
+    committee = _build_committee(_settings(tmp_path))
+    assert committee.adversary_client is committee.client
 
 
 def _offline_input(tmp_path: Path, *, bid: float = 0.19) -> Path:

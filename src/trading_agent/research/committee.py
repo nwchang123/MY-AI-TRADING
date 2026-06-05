@@ -7,7 +7,13 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from trading_agent.domain.evidence import CandidateContext
 from trading_agent.domain.proposals import OpenPositionProposal
-from trading_agent.research.llm import LLMClient
+from trading_agent.research.llm import LLMClient, LlmUsage
+from trading_agent.research.redflags import (
+    RedFlag,
+    critical_flags,
+    detect_red_flags,
+    format_red_flags,
+)
 from trading_agent.research.scoring import ScoreComponents
 
 VETO_PREFIX = "VETO"
@@ -41,15 +47,18 @@ _OPTIONS_SYSTEM = (
 _SKEPTIC_SYSTEM = (
     _COMMON_RULES
     + "\n\nRole: skeptic. Hunt for dilution, ATM shelves, insider selling, stale"
-    " news, weak evidence, and IV-crush risk. If the trade should not proceed,"
-    f" begin your reply with '{VETO_PREFIX}:' followed by the reason."
+    " news, weak evidence, and IV-crush risk. The briefing includes deterministic"
+    " red flags already computed by code; treat them as confirmed facts and weigh"
+    " them rather than re-deriving them. If the trade should not proceed, begin"
+    f" your reply with '{VETO_PREFIX}:' followed by the reason."
 )
 
 _RISK_SYSTEM = (
     _COMMON_RULES
     + "\n\nRole: risk_manager. Argue against the trade when downside is poorly"
-    " bounded or the catalyst window is unclear. If risk is unacceptable, begin"
-    f" your reply with '{VETO_PREFIX}:' followed by the reason."
+    " bounded or the catalyst window is unclear. Weigh the deterministic red flags"
+    " in the briefing. If risk is unacceptable, begin your reply with"
+    f" '{VETO_PREFIX}:' followed by the reason."
 )
 
 _PM_SYSTEM = (
@@ -88,29 +97,79 @@ class CommitteeOutput(BaseModel):
     role_notes: list[RoleNote]
     vetoes: list[str]
     llm_calls: int
+    red_flags: list[RedFlag] = []
 
 
 class Committee:
     """Sequential 5-role pipeline producing a schema-checked decision.
 
-    Two model tiers: the four analyst/critic roles run on ``client`` (the fast
-    "flash" model) and the decisive portfolio_manager runs on ``pro_client``
-    (the stronger model). If ``pro_client`` is omitted, ``client`` is used for
-    every role.
+    Three model tiers:
+    - ``client`` (fast "flash" model) runs catalyst_analyst and options_analyst;
+    - ``adversary_client`` runs the skeptic and risk_manager. Point it at a
+      different provider so the adversarial roles' errors are uncorrelated with
+      the idea-generating roles. Falls back to ``client`` when omitted;
+    - ``pro_client`` (stronger model) runs the decisive portfolio_manager. Falls
+      back to ``client`` when omitted.
 
     The committee never touches the broker or the risk gate. Its output is fed
     into the deterministic risk gate downstream, so invalid JSON or uncited
     evidence here results in a reject rather than an order.
     """
 
-    def __init__(self, client: LLMClient, pro_client: LLMClient | None = None):
+    def __init__(
+        self,
+        client: LLMClient,
+        pro_client: LLMClient | None = None,
+        adversary_client: LLMClient | None = None,
+    ):
         self.client = client
         self.pro_client = pro_client or client
+        self.adversary_client = adversary_client or client
+
+    def usage_total(self) -> LlmUsage:
+        """Aggregate token/call usage across the distinct clients in use.
+
+        Snapshot this before and after ``run`` (see ``llm.usage_delta``) to meter
+        the spend of a single committee pass.
+        """
+
+        total = LlmUsage()
+        seen: list[LLMClient] = []
+        for client in (self.client, self.adversary_client, self.pro_client):
+            if any(client is other for other in seen):
+                continue
+            seen.append(client)
+            usage = getattr(client, "usage", None)
+            if usage is not None:
+                total.add(usage)
+        return total
 
     def run(self, context: CandidateContext, scores: ScoreComponents) -> CommitteeOutput:
         briefing = self._briefing(context, scores)
         flash_model = self._model_name(self.client)
+        adversary_model = self._model_name(self.adversary_client)
         pro_model = self._model_name(self.pro_client)
+
+        red_flags = detect_red_flags(context, scores)
+        criticals = critical_flags(red_flags)
+        # A critical, code-detected red flag (a fresh dilution shelf or insider
+        # selling) blocks the trade deterministically and skips the committee
+        # entirely: a known disqualifier never depends on the LLM noticing it,
+        # and the block costs zero API calls.
+        if criticals:
+            vetoes = [f"redflags: {flag.message}" for flag in criticals]
+            return CommitteeOutput(
+                decision="reject",
+                rationale="Blocked by deterministic red flag(s): "
+                + ", ".join(flag.code for flag in criticals),
+                proposal=None,
+                role_notes=[],
+                vetoes=vetoes,
+                llm_calls=0,
+                red_flags=red_flags,
+            )
+
+        flag_block = format_red_flags(red_flags)
         calls = 0
 
         catalyst = self.client.complete(system=_CATALYST_SYSTEM, user=briefing)
@@ -118,10 +177,13 @@ class Committee:
         calls += 2
 
         analyst_context = (
-            f"{briefing}\n\n[catalyst_analyst]\n{catalyst}\n\n[options_analyst]\n{options}"
+            f"{briefing}\n\n{flag_block}\n\n[catalyst_analyst]\n{catalyst}"
+            f"\n\n[options_analyst]\n{options}"
         )
-        skeptic = self.client.complete(system=_SKEPTIC_SYSTEM, user=analyst_context)
-        risk = self.client.complete(
+        skeptic = self.adversary_client.complete(
+            system=_SKEPTIC_SYSTEM, user=analyst_context
+        )
+        risk = self.adversary_client.complete(
             system=_RISK_SYSTEM, user=f"{analyst_context}\n\n[skeptic]\n{skeptic}"
         )
         calls += 2
@@ -132,13 +194,13 @@ class Committee:
             RoleNote(
                 role="skeptic",
                 note=skeptic.strip(),
-                model=flash_model,
+                model=adversary_model,
                 vetoed=self._is_veto(skeptic),
             ),
             RoleNote(
                 role="risk_manager",
                 note=risk.strip(),
-                model=flash_model,
+                model=adversary_model,
                 vetoed=self._is_veto(risk),
             ),
         ]
@@ -164,9 +226,10 @@ class Committee:
                 role_notes=notes,
                 vetoes=vetoes,
                 llm_calls=calls,
+                red_flags=red_flags,
             )
 
-        return self._finalize(pm_raw, context, notes, vetoes, calls)
+        return self._finalize(pm_raw, context, notes, vetoes, calls, red_flags)
 
     def _finalize(
         self,
@@ -175,6 +238,7 @@ class Committee:
         notes: list[RoleNote],
         vetoes: list[str],
         calls: int,
+        red_flags: list[RedFlag],
     ) -> CommitteeOutput:
         def reject(rationale: str) -> CommitteeOutput:
             return CommitteeOutput(
@@ -184,6 +248,7 @@ class Committee:
                 role_notes=notes,
                 vetoes=vetoes,
                 llm_calls=calls,
+                red_flags=red_flags,
             )
 
         try:
@@ -203,6 +268,7 @@ class Committee:
                 role_notes=notes,
                 vetoes=vetoes,
                 llm_calls=calls,
+                red_flags=red_flags,
             )
         if decision != "open_position":
             return reject(f"portfolio_manager returned unknown decision: {decision!r}")
@@ -230,6 +296,7 @@ class Committee:
             role_notes=notes,
             vetoes=vetoes,
             llm_calls=calls,
+            red_flags=red_flags,
         )
 
     @staticmethod
@@ -239,8 +306,7 @@ class Committee:
             f"As of: {context.as_of.isoformat()}",
             "",
             "Deterministic score components (computed before this committee):",
-            f"  catalyst={scores.catalyst} options={scores.options} "
-            f"underlying={scores.underlying} operations={scores.operations} "
+            f"  catalyst={scores.catalyst} operations={scores.operations} "
             f"contradictions={scores.contradictions} total={scores.total}",
             "",
             "Public evidence:",

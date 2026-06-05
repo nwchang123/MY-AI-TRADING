@@ -36,6 +36,21 @@ def test_trading_days_until_excludes_weekends() -> None:
     assert trading_days_until(date(2026, 6, 1), NOW) == 0
 
 
+def test_mark_price_uses_bid_not_mid() -> None:
+    # A long option is closed at the bid; the mark must be the bid, never the mid.
+    assert _position(bid=0.30, ask=0.50).mark_price() == 0.30
+    # No bid means no exit liquidity -> worthless mark.
+    assert _position(bid=0.0, ask=0.50).mark_price() == 0.0
+
+
+def test_exit_pnl_reflects_the_full_round_trip_spread() -> None:
+    # Entry paid the ask (0.20). With bid at 0.20 the mid would show +5% (ask 0.22),
+    # but marking at the bid correctly shows break-even, not a phantom gain.
+    pos = _position(entry_price=0.20, bid=0.20, ask=0.22)
+    signals = _monitor().evaluate([pos], NOW)
+    assert signals == []  # +0% at the bid, so neither take-profit nor stop fires
+
+
 def test_no_signal_when_inside_plan() -> None:
     assert _monitor().evaluate([_position()], NOW) == []
 

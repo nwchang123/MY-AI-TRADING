@@ -14,6 +14,7 @@ from trading_agent.domain.proposals import OpenPositionProposal
 from trading_agent.domain.risk import Mandate, PortfolioState, QuoteSnapshot, RiskGate
 from trading_agent.research.catalysts import build_candidate_context, derive_score_inputs
 from trading_agent.research.committee import Committee
+from trading_agent.research.llm import usage_delta
 from trading_agent.research.scoring import score_candidate
 from trading_agent.storage.audit import AuditWriter
 from trading_agent.storage.positions import PositionStore
@@ -331,11 +332,14 @@ class PaperTradingCycle:
         evidence = self.sec_client.fetch_evidence(ticker)
         context = build_candidate_context(ticker, evidence, now)
         scores = score_candidate(derive_score_inputs(context.evidence, now))
+        before = self.committee.usage_total()
         output = self.committee.run(context, scores)
+        usage = usage_delta(before, self.committee.usage_total())
         self.audit.append(
             "committee_run",
             {"ticker": ticker, "decision": output.decision, "output": output.model_dump(mode="json")},
         )
+        self.audit.append("llm_usage", {"ticker": ticker, **usage.model_dump(mode="json")})
         if output.decision != "open_position" or output.proposal is None:
             return None
 

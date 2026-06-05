@@ -28,8 +28,11 @@ class MonitoredPosition(BaseModel):
     observed_at: datetime
 
     def mark_price(self) -> float:
-        if self.bid > 0 and self.ask > self.bid:
-            return (self.bid + self.ask) / 2
+        # Every monitored position is a long option (mandate allows buy_to_open
+        # only), so it is closed by SELLING, which fills at the bid. Marking at
+        # the bid -- not the mid -- keeps exit triggers, the sell limit price, and
+        # recorded P/L honest about the full spread you actually pay to get out.
+        # A non-positive bid means there is no exit liquidity: mark it worthless.
         return max(self.bid, 0.0)
 
 

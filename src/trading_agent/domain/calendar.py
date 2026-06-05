@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from functools import lru_cache
+
+# Regular U.S. equity/option session in Eastern time (ignores early-close days).
+MARKET_OPEN = time(9, 30)
+MARKET_CLOSE = time(16, 0)
 
 try:
     from zoneinfo import ZoneInfo
@@ -87,6 +91,22 @@ def us_market_holidays(year: int) -> frozenset[date]:
 
 def is_trading_day(day: date) -> bool:
     return day.weekday() < 5 and day not in us_market_holidays(day.year)
+
+
+def is_market_hours(now: datetime) -> bool:
+    """True if ``now`` is within the regular U.S. session (9:30-16:00 ET) on a
+    trading day. Requires a timezone-aware datetime.
+
+    Does not model early-close half-days; it is a coarse gate for the autonomous
+    loop, not an execution-timing guarantee.
+    """
+
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    eastern = now.astimezone(MARKET_TZ) if MARKET_TZ is not None else now
+    if not is_trading_day(eastern.date()):
+        return False
+    return MARKET_OPEN <= eastern.time() <= MARKET_CLOSE
 
 
 def trading_days_until(expiry: date, now: date | datetime) -> int:
