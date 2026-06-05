@@ -83,10 +83,29 @@ broker call.
 liquidity validator, deterministic risk gate, and position monitor used by the
 paper/live cycle. It does not connect to Moomoo and does not call the LLM. Buy
 limits fill only when the quote ask is at or below the proposal limit; long
-options are marked and exited at the bid.
+options are marked and exited at the bid. Results report gross P/L, fees, and
+net realized P/L so small-account friction stays visible.
+
+An optional `costs` block models the real friction a small account pays:
+
+```jsonc
+"costs": {
+  "commission_per_contract_usd": 0.65,   // per side; max(min, per_contract * n) + platform
+  "commission_min_usd": 1.0,
+  "platform_fee_per_order_usd": 0.3,
+  "commission_waiver_usd": 10.0,          // a free-trade card: first $10 of commission waived
+  "slippage_usd_per_share": 0.01,         // adverse fill; entry is capped at the proposal limit
+  "max_exit_fill_spread_pct": 25.0        // wider than this, the close does not fill (lingers)
+}
+```
+
+The waiver is consumed across trades, so the report's `commission_waiver_remaining_usd`
+and post-waiver fees show the steady state once the card runs out. Omit `costs`
+to fall back to a flat per-side fee of the mandate's `fee_buffer_usd`.
 
 ```powershell
 trading-agent backtest --input examples/backtest-v0.example.json
+trading-agent backtest --input examples/backtest-costs.example.json
 ```
 
 Use this first to test loss stops, position caps, spread costs, unfilled orders,

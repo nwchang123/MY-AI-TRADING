@@ -29,6 +29,33 @@ class BacktestStep(BaseModel):
     label: str | None = None
 
 
+class CostModel(BaseModel):
+    """Per-order trading-cost assumptions for a small-capital account.
+
+    All fields are optional and default to zero; when ``costs`` is omitted from a
+    scenario the runner falls back to a flat per-side fee of the mandate's
+    ``fee_buffer_usd`` (the prior behaviour). Spread is always modelled implicitly
+    by filling buys at the ask and marking/closing longs at the bid.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Per-side broker commission: max(min, per_contract * contracts) + platform.
+    commission_per_contract_usd: float = Field(default=0.0, ge=0)
+    commission_min_usd: float = Field(default=0.0, ge=0)
+    platform_fee_per_order_usd: float = Field(default=0.0, ge=0)
+    # One-off promo (e.g. a commission-free card): the first N USD of commissions
+    # are waived, then full cost resumes -- so the report shows the steady state.
+    commission_waiver_usd: float = Field(default=0.0, ge=0)
+    # Adverse marketable-fill slippage per share. On entry it is capped by the
+    # proposal limit (a limit order never pays above it); on exit it can push the
+    # fill below the bid (a forced close behaves like a marketable order).
+    slippage_usd_per_share: float = Field(default=0.0, ge=0)
+    # If the bid-ask spread at exit exceeds this, the close does not fill that
+    # step (mirrors the live cancel-and-retry); 0 disables the check.
+    max_exit_fill_spread_pct: float = Field(default=0.0, ge=0)
+
+
 class BacktestScenario(BaseModel):
     """Offline backtest v0 input.
 
@@ -40,6 +67,7 @@ class BacktestScenario(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     initial_capital_usd: float | None = Field(default=None, gt=0)
+    costs: CostModel | None = None
     steps: list[BacktestStep] = Field(min_length=1)
 
 
@@ -65,6 +93,7 @@ class _OpenTrade:
     stop_loss_pct: float
     time_stop: Any
     opened_at: datetime
+    entry_fee_usd: float
 
 
 @dataclass
@@ -78,13 +107,72 @@ class _ClosedTrade:
     opened_at: datetime
     closed_at: datetime
     reason: str
+    entry_fee_usd: float
+    exit_fee_usd: float
 
     @property
-    def pnl_usd(self) -> float:
+    def gross_pnl_usd(self) -> float:
         return round(
             (self.exit_price - self.entry_price) * self.contracts * self.lot_size,
             4,
         )
+
+    @property
+    def fees_usd(self) -> float:
+        return round(self.entry_fee_usd + self.exit_fee_usd, 4)
+
+    @property
+    def pnl_usd(self) -> float:
+        return round(self.gross_pnl_usd - self.fees_usd, 4)
+
+
+@dataclass
+class _CostEngine:
+    """Applies the scenario's cost assumptions; tracks the commission waiver."""
+
+    per_contract: float
+    minimum: float
+    platform: float
+    slippage: float
+    waiver_remaining: float
+    max_exit_fill_spread_pct: float
+
+    @classmethod
+    def build(cls, costs: CostModel | None, mandate: Mandate) -> "_CostEngine":
+        if costs is None:
+            # Back-compat: a flat per-side fee from the risk buffer, no slippage,
+            # no waiver, every exit fills.
+            return cls(0.0, mandate.options.fee_buffer_usd, 0.0, 0.0, 0.0, 0.0)
+        return cls(
+            costs.commission_per_contract_usd,
+            costs.commission_min_usd,
+            costs.platform_fee_per_order_usd,
+            costs.slippage_usd_per_share,
+            costs.commission_waiver_usd,
+            costs.max_exit_fill_spread_pct,
+        )
+
+    def commission(self, contracts: int) -> float:
+        """One side's commission, after consuming any remaining waiver."""
+
+        raw = round(max(self.minimum, self.per_contract * contracts) + self.platform, 4)
+        if self.waiver_remaining > 0:
+            waived = min(raw, self.waiver_remaining)
+            self.waiver_remaining = round(self.waiver_remaining - waived, 4)
+            return round(raw - waived, 4)
+        return raw
+
+    def entry_fill(self, ask: float, limit_price: float) -> float:
+        # A limit buy never pays above the limit, so slippage is capped there.
+        return round(min(limit_price, ask + self.slippage), 4)
+
+    def exit_fill(self, bid: float) -> float:
+        return round(max(0.0, bid - self.slippage), 4)
+
+    def exit_allowed(self, bid: float, ask: float) -> bool:
+        if self.max_exit_fill_spread_pct <= 0:
+            return True
+        return _spread_pct(bid, ask) <= self.max_exit_fill_spread_pct
 
 
 def load_backtest_scenario(path: Path) -> BacktestScenario:
@@ -106,6 +194,7 @@ def run_backtest(
     initial_capital = scenario.initial_capital_usd or mandate.account.initial_capital_usd
     gate = RiskGate(mandate, root_dir)
     liquidity = LiquidityValidator(mandate.options, mandate.execution)
+    cost = _CostEngine.build(scenario.costs, mandate)
     monitor = PositionMonitor(
         mandate.options.force_close_before_expiry_trading_days,
         mandate.execution.stale_quote_seconds,
@@ -128,6 +217,7 @@ def run_backtest(
             step=step,
             quotes=step_quotes,
             monitor=monitor,
+            cost=cost,
             open_trades=open_trades,
             closed_trades=closed_trades,
             events=events,
@@ -138,7 +228,7 @@ def run_backtest(
                 quote=step_quotes.get(step.proposal.option_code),
                 gate=gate,
                 liquidity=liquidity,
-                mandate=mandate,
+                cost=cost,
                 open_trades=open_trades,
                 closed_trades=closed_trades,
                 events=events,
@@ -162,6 +252,7 @@ def run_backtest(
         events,
         equity_curve,
         last_quotes,
+        cost,
     )
     return BacktestResult(
         summary=summary,
@@ -183,12 +274,14 @@ def _run_exit_step(
     step: BacktestStep,
     quotes: dict[str, QuoteSnapshot],
     monitor: PositionMonitor,
+    cost: _CostEngine,
     open_trades: list[_OpenTrade],
     closed_trades: list[_ClosedTrade],
     events: list[dict[str, Any]],
 ) -> None:
     monitored: list[MonitoredPosition] = []
     by_code: dict[str, _OpenTrade] = {}
+    quote_by_code: dict[str, QuoteSnapshot] = {}
     for trade in open_trades:
         quote = quotes.get(trade.option_code)
         if quote is None:
@@ -210,19 +303,39 @@ def _run_exit_step(
             )
         )
         by_code[trade.option_code] = trade
+        quote_by_code[trade.option_code] = quote
 
     for signal in monitor.evaluate(monitored, step.now):
         trade = by_code[signal.option_code]
+        exit_quote = quote_by_code[signal.option_code]
+        if not cost.exit_allowed(exit_quote.bid, exit_quote.ask):
+            # Spread too wide to get filled this step; the live engine cancels and
+            # retries, so the position lingers and is revisited next step.
+            _append_event(
+                events,
+                step.now,
+                "exit_unfilled",
+                {
+                    "ticker": trade.ticker,
+                    "option_code": trade.option_code,
+                    "reason": signal.reason,
+                    "spread_pct": _spread_pct(exit_quote.bid, exit_quote.ask),
+                },
+            )
+            continue
+        exit_price = cost.exit_fill(signal.mark_price)
         closed = _ClosedTrade(
             option_code=trade.option_code,
             ticker=trade.ticker,
             entry_price=trade.entry_price,
-            exit_price=signal.mark_price,
+            exit_price=exit_price,
             contracts=trade.contracts,
             lot_size=trade.lot_size,
             opened_at=trade.opened_at,
             closed_at=step.now,
             reason=signal.reason,
+            entry_fee_usd=trade.entry_fee_usd,
+            exit_fee_usd=cost.commission(trade.contracts),
         )
         open_trades.remove(trade)
         closed_trades.append(closed)
@@ -234,8 +347,11 @@ def _run_exit_step(
                 "ticker": trade.ticker,
                 "option_code": trade.option_code,
                 "reason": signal.reason,
-                "exit_price": signal.mark_price,
+                "exit_price": exit_price,
+                "gross_pnl_usd": closed.gross_pnl_usd,
+                "fees_usd": closed.fees_usd,
                 "realized_pnl_usd": closed.pnl_usd,
+                "spread_pct": _spread_pct(exit_quote.bid, exit_quote.ask),
             },
         )
 
@@ -246,7 +362,7 @@ def _run_entry_step(
     quote: QuoteSnapshot | None,
     gate: RiskGate,
     liquidity: LiquidityValidator,
-    mandate: Mandate,
+    cost: _CostEngine,
     open_trades: list[_OpenTrade],
     closed_trades: list[_ClosedTrade],
     events: list[dict[str, Any]],
@@ -287,7 +403,7 @@ def _run_entry_step(
         option_code=proposal.option_code,
         ticker=proposal.ticker.upper(),
         option_side=proposal.option_side,
-        entry_price=quote.ask,
+        entry_price=cost.entry_fill(quote.ask, proposal.limit_price),
         contracts=proposal.contracts,
         lot_size=quote.lot_size,
         expiry=quote.expiry,
@@ -295,6 +411,7 @@ def _run_entry_step(
         stop_loss_pct=proposal.exit_plan.stop_loss_pct,
         time_stop=proposal.exit_plan.time_stop,
         opened_at=step.now,
+        entry_fee_usd=cost.commission(proposal.contracts),
     )
     open_trades.append(trade)
     _append_event(
@@ -306,11 +423,13 @@ def _run_entry_step(
             "option_code": trade.option_code,
             "entry_price": trade.entry_price,
             "contracts": trade.contracts,
+            "entry_fee_usd": trade.entry_fee_usd,
             "premium_at_risk_usd": round(
                 trade.entry_price * trade.contracts * trade.lot_size
-                + mandate.options.fee_buffer_usd,
+                + trade.entry_fee_usd,
                 4,
             ),
+            "spread_pct": _spread_pct(quote.bid, quote.ask),
         },
     )
 
@@ -347,6 +466,7 @@ def _summary(
     events: list[dict[str, Any]],
     equity_curve: list[dict[str, Any]],
     last_quotes: dict[str, QuoteSnapshot],
+    cost: _CostEngine,
 ) -> dict[str, Any]:
     realized = _realized_pnl(closed_trades)
     unrealized = _unrealized_pnl(open_trades, last_quotes)
@@ -355,12 +475,27 @@ def _summary(
     rejected = [event for event in events if event["event_type"] == "entry_rejected"]
     rejected_by_stage = Counter(event["payload"].get("stage", "unknown") for event in rejected)
     trade_pnls = [trade.pnl_usd for trade in closed_trades]
+    win_pnl = sum(trade.pnl_usd for trade in closed_trades if trade.pnl_usd > 0)
+    loss_pnl = sum(trade.pnl_usd for trade in closed_trades if trade.pnl_usd < 0)
+    fees_paid = round(
+        sum(trade.entry_fee_usd for trade in open_trades)
+        + sum(trade.fees_usd for trade in closed_trades),
+        4,
+    )
+    entry_spreads = _event_values(events, "position_opened", "spread_pct")
+    exit_spreads = _event_values(events, "position_closed", "spread_pct")
+    exits_unfilled = sum(1 for event in events if event["event_type"] == "exit_unfilled")
+    ending_equity = round(initial_capital + realized + unrealized, 4)
 
     return {
         "initial_capital_usd": round(initial_capital, 4),
-        "ending_equity_usd": round(initial_capital + realized + unrealized, 4),
+        "ending_equity_usd": ending_equity,
+        "return_pct": round((ending_equity - initial_capital) / initial_capital * 100, 4),
         "realized_pnl_usd": realized,
         "unrealized_pnl_usd": round(unrealized, 4),
+        "fees_paid_usd": fees_paid,
+        "commission_waiver_remaining_usd": round(cost.waiver_remaining, 4),
+        "exits_unfilled": exits_unfilled,
         "max_drawdown_usd": _max_drawdown(equity_curve),
         "trades_opened": sum(1 for event in events if event["event_type"] == "position_opened"),
         "trades_closed": len(closed_trades),
@@ -371,9 +506,14 @@ def _summary(
         "avg_trade_pnl_usd": round(sum(trade_pnls) / len(trade_pnls), 4)
         if trade_pnls
         else None,
+        "profit_factor": round(win_pnl / abs(loss_pnl), 4) if loss_pnl < 0 else None,
+        "best_trade_pnl_usd": max(trade_pnls) if trade_pnls else None,
+        "worst_trade_pnl_usd": min(trade_pnls) if trade_pnls else None,
         "max_consecutive_losses": _max_consecutive_losses(closed_trades),
         "rejections": len(rejected),
         "rejected_by_stage": dict(sorted(rejected_by_stage.items())),
+        "avg_entry_spread_pct": _mean(entry_spreads),
+        "avg_exit_spread_pct": _mean(exit_spreads),
         "equity_curve": equity_curve,
     }
 
@@ -386,7 +526,10 @@ def _unrealized_pnl(
         quote = quotes.get(trade.option_code)
         if quote is None:
             continue
-        total += (quote.bid - trade.entry_price) * trade.contracts * trade.lot_size
+        total += (
+            (quote.bid - trade.entry_price) * trade.contracts * trade.lot_size
+            - trade.entry_fee_usd
+        )
     return round(total, 4)
 
 
@@ -427,8 +570,16 @@ def _open_payload(trade: _OpenTrade, quote: QuoteSnapshot | None) -> dict[str, A
         "option_code": trade.option_code,
         "entry_price": trade.entry_price,
         "mark_price": mark,
-        "unrealized_pnl_usd": round(
+        "entry_fee_usd": trade.entry_fee_usd,
+        "gross_unrealized_pnl_usd": round(
             (mark - trade.entry_price) * trade.contracts * trade.lot_size, 4
+        )
+        if mark is not None
+        else None,
+        "unrealized_pnl_usd": round(
+            (mark - trade.entry_price) * trade.contracts * trade.lot_size
+            - trade.entry_fee_usd,
+            4,
         )
         if mark is not None
         else None,
@@ -442,6 +593,8 @@ def _closed_payload(trade: _ClosedTrade) -> dict[str, Any]:
         "option_code": trade.option_code,
         "entry_price": trade.entry_price,
         "exit_price": trade.exit_price,
+        "gross_pnl_usd": trade.gross_pnl_usd,
+        "fees_usd": trade.fees_usd,
         "realized_pnl_usd": trade.pnl_usd,
         "opened_at": trade.opened_at.isoformat(),
         "closed_at": trade.closed_at.isoformat(),
@@ -492,3 +645,26 @@ def _require_chronological_steps(steps: list[BacktestStep]) -> None:
         if previous is not None and step.now < previous:
             raise ValueError("backtest steps must be chronological")
         previous = step.now
+
+
+def _spread_pct(bid: float, ask: float) -> float:
+    if ask <= bid or bid <= 0:
+        return float("inf")
+    return round(((ask - bid) / ((ask + bid) / 2)) * 100, 4)
+
+
+def _event_values(
+    events: list[dict[str, Any]], event_type: str, payload_key: str
+) -> list[float]:
+    values: list[float] = []
+    for event in events:
+        if event.get("event_type") != event_type:
+            continue
+        value = event.get("payload", {}).get(payload_key)
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+    return values
+
+
+def _mean(values: list[float]) -> float | None:
+    return round(sum(values) / len(values), 4) if values else None
