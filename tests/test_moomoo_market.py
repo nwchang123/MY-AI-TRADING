@@ -78,6 +78,16 @@ def test_parse_filter_rows_extracts_fields() -> None:
     ]
 
 
+def test_parse_filter_rows_reads_tuple_keyed_accumulate_turnover() -> None:
+    # Real FilterStockData stores accumulate fields under a (field, days) tuple
+    # key, not a plain attribute (verified live: row.turnover raises).
+    row = SimpleNamespace(
+        stock_code="US.TRLV", stock_name="Trulieve", cur_price=11.885, market_val=2.27e9
+    )
+    row.__dict__[("turnover", 1)] = 6569147.589
+    assert parse_filter_rows([row])[0]["turnover"] == 6569147.589
+
+
 def test_build_us_option_code_emits_no_pad_strike() -> None:
     # Verified live against OpenD: the broker accepts the no-pad strike form and
     # rejects the OCC 8-digit-padded form.

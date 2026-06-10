@@ -116,6 +116,22 @@ def build_universe_filters(universe: UniverseMandate, sdk: Any) -> list[Any]:
     ]
 
 
+def _accumulate_value(row: Any, field_name: str) -> Any:
+    """Read an accumulate-filter value off a FilterStockData row.
+
+    Verified live 2026-06-11: simple-filter fields are plain attributes, but
+    accumulate fields are stored under a ``(field, days)`` tuple key in the
+    row's ``__dict__`` (e.g. ``('turnover', 1)``), so ``row.turnover`` raises
+    AttributeError. Falls back to the plain attribute for fake rows in tests.
+    """
+
+    data = getattr(row, "__dict__", None) or {}
+    for key, value in data.items():
+        if isinstance(key, tuple) and key and key[0] == field_name:
+            return value
+    return getattr(row, field_name, None)
+
+
 def parse_filter_rows(rows: list[Any]) -> list[dict[str, Any]]:
     """Normalize FilterStockData rows into plain dicts."""
 
@@ -127,7 +143,7 @@ def parse_filter_rows(rows: list[Any]) -> list[dict[str, Any]]:
                 "name": getattr(row, "stock_name", None),
                 "cur_price": getattr(row, "cur_price", None),
                 "market_val": getattr(row, "market_val", None),
-                "turnover": getattr(row, "turnover", None),
+                "turnover": _accumulate_value(row, "turnover"),
             }
         )
     return parsed
