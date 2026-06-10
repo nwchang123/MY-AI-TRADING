@@ -10,7 +10,18 @@ from trading_agent.domain.risk import QuoteSnapshot, UniverseMandate
 # US equity options trade in lots of 100 shares.
 US_OPTION_LOT_SIZE = 100
 
-_OPTION_CODE_RE = re.compile(r"^US\.([A-Z]+)(\d{6})([CP])(\d{8})$")
+# Moomoo US option code: US.{ROOT}{YYMMDD}{C|P}{strike*1000}. Unlike the OCC
+# symbol, Moomoo does NOT zero-pad the strike to 8 digits -- place_order rejects
+# the padded form with "Cannot find ... in US Stocks". Verified live 2026-06-11:
+# US.AAPL260717C310000 is accepted and echoed back by position_list_query;
+# US.AAPL260717C00310000 is rejected. The parser accepts any strike width (\d+)
+# so an OCC-padded code still reads, but the builders below always emit the
+# canonical no-pad form that the broker accepts.
+_OPTION_CODE_RE = re.compile(r"^US\.([A-Z]+)(\d{6})([CP])(\d+)$")
+
+# OCC symbol (e.g. CBOE 'option' field 'AAPL260717C00310000'): strike IS
+# zero-padded to 8 digits. Used to convert free-data-source chains to Moomoo.
+_OCC_CODE_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 
 
 class MoomooMarketError(RuntimeError):
@@ -18,10 +29,11 @@ class MoomooMarketError(RuntimeError):
 
 
 def parse_us_option_code(option_code: str) -> tuple[str, date, str, float]:
-    """Parse a Moomoo US option code, e.g. 'US.NVDA260626C00005000'.
+    """Parse a Moomoo US option code, e.g. 'US.NVDA260626C5000'.
 
     Returns (underlying, expiry, side, strike). Lets the agent derive expiry
-    without an extra chain call. Raises ValueError on an unrecognized code.
+    without an extra chain call. Tolerates a zero-padded strike (OCC form) too.
+    Raises ValueError on an unrecognized code.
     """
 
     match = _OPTION_CODE_RE.match(option_code)
@@ -31,6 +43,38 @@ def parse_us_option_code(option_code: str) -> tuple[str, date, str, float]:
     expiry = date(2000 + int(ymd[0:2]), int(ymd[2:4]), int(ymd[4:6]))
     side = "call" if call_put == "C" else "put"
     return root, expiry, side, int(strike) / 1000
+
+
+def build_us_option_code(
+    underlying: str, expiry: date, side: str, strike: float
+) -> str:
+    """Build the canonical Moomoo US option code the broker accepts.
+
+    Strike is encoded as ``int(strike * 1000)`` with NO zero-padding. The inverse
+    of :func:`parse_us_option_code`.
+    """
+
+    if side not in {"call", "put"}:
+        raise ValueError("side must be 'call' or 'put'")
+    call_put = "C" if side == "call" else "P"
+    strike_milli = int(round(strike * 1000))
+    root = underlying.upper().removeprefix("US.")
+    return f"US.{root}{expiry:%y%m%d}{call_put}{strike_milli}"
+
+
+def occ_to_moomoo_code(occ_symbol: str) -> str:
+    """Convert an OCC option symbol to a Moomoo code.
+
+    CBOE/Tradier emit OCC symbols with an 8-digit zero-padded strike
+    (``AAPL260717C00310000``); Moomoo wants the strike without leading zeros
+    (``US.AAPL260717C310000``). Raises ValueError on an unrecognized symbol.
+    """
+
+    match = _OCC_CODE_RE.match(occ_symbol.strip().upper())
+    if match is None:
+        raise ValueError(f"unrecognized OCC option symbol: {occ_symbol}")
+    root, ymd, call_put, strike8 = match.groups()
+    return f"US.{root}{ymd}{call_put}{int(strike8)}"
 
 
 def build_universe_filters(universe: UniverseMandate, sdk: Any) -> list[Any]:

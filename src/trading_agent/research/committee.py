@@ -6,7 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from trading_agent.domain.evidence import CandidateContext
-from trading_agent.domain.proposals import OpenPositionProposal
+from trading_agent.domain.proposals import OpenPositionProposal, OptionCandidate
 from trading_agent.research.llm import LLMClient, LlmUsage
 from trading_agent.research.redflags import (
     RedFlag,
@@ -42,6 +42,25 @@ _OPTIONS_SYSTEM = (
     " (14-45 DTE, premium small enough for a USD 100 account). Note liquidity"
     " concerns. You do not have a live chain; describe the contract profile you"
     " would want and any data you would need to confirm."
+)
+
+# Used instead of _OPTIONS_SYSTEM when the briefing carries a real candidate list
+# (sourced from the live option chain and already liquidity-checked). The analyst
+# must pick from those contracts rather than describe a hypothetical one.
+_OPTIONS_SYSTEM_WITH_CHAIN = (
+    _COMMON_RULES
+    + "\n\nRole: options_analyst. The briefing lists CANDIDATE CONTRACTS that"
+    " already pass the mandate's liquidity, DTE, and cost limits. Recommend"
+    " exactly ONE of them, by its exact option_code, consistent with the catalyst"
+    " direction. Prefer adequate open interest/volume and a tight spread. Do not"
+    " propose any contract that is not in the candidate list."
+)
+
+# Appended to the portfolio_manager prompt in candidate mode so the final
+# option_code is constrained to a real, tradeable contract.
+_PM_CANDIDATE_RULE = (
+    "\nThe option_code MUST be copied exactly from one of the CANDIDATE CONTRACTS"
+    " in the briefing. Do not invent or modify a contract code."
 )
 
 _SKEPTIC_SYSTEM = (
@@ -144,7 +163,22 @@ class Committee:
                 total.add(usage)
         return total
 
-    def run(self, context: CandidateContext, scores: ScoreComponents) -> CommitteeOutput:
+    def run(
+        self,
+        context: CandidateContext,
+        scores: ScoreComponents,
+        candidates: list[OptionCandidate] | None = None,
+    ) -> CommitteeOutput:
+        # In candidate mode the options_analyst/PM pick a real listed contract
+        # from ``candidates`` instead of guessing one; the PM's option_code is
+        # then constrained to that set. ``candidates=None`` keeps legacy behavior.
+        candidate_block = self._format_candidates(candidates)
+        candidate_codes = (
+            {c.option_code for c in candidates} if candidates else None
+        )
+        options_system = _OPTIONS_SYSTEM_WITH_CHAIN if candidate_block else _OPTIONS_SYSTEM
+        pm_system = _PM_SYSTEM + (_PM_CANDIDATE_RULE if candidate_block else "")
+
         briefing = self._briefing(context, scores)
         flash_model = self._model_name(self.client)
         adversary_model = self._model_name(self.adversary_client)
@@ -172,13 +206,17 @@ class Committee:
         flag_block = format_red_flags(red_flags)
         calls = 0
 
+        options_briefing = (
+            f"{briefing}\n\n{candidate_block}" if candidate_block else briefing
+        )
         catalyst = self.client.complete(system=_CATALYST_SYSTEM, user=briefing)
-        options = self.client.complete(system=_OPTIONS_SYSTEM, user=briefing)
+        options = self.client.complete(system=options_system, user=options_briefing)
         calls += 2
 
         analyst_context = (
-            f"{briefing}\n\n{flag_block}\n\n[catalyst_analyst]\n{catalyst}"
-            f"\n\n[options_analyst]\n{options}"
+            f"{briefing}\n\n{flag_block}"
+            + (f"\n\n{candidate_block}" if candidate_block else "")
+            + f"\n\n[catalyst_analyst]\n{catalyst}\n\n[options_analyst]\n{options}"
         )
         skeptic = self.adversary_client.complete(
             system=_SKEPTIC_SYSTEM, user=analyst_context
@@ -210,7 +248,7 @@ class Committee:
             f"{analyst_context}\n\n[skeptic]\n{skeptic}\n\n[risk_manager]\n{risk}"
         )
         pm_raw = self.pro_client.complete(
-            system=_PM_SYSTEM, user=pm_context, json_mode=True
+            system=pm_system, user=pm_context, json_mode=True
         )
         calls += 1
         notes.append(
@@ -229,7 +267,9 @@ class Committee:
                 red_flags=red_flags,
             )
 
-        return self._finalize(pm_raw, context, notes, vetoes, calls, red_flags)
+        return self._finalize(
+            pm_raw, context, notes, vetoes, calls, red_flags, candidate_codes
+        )
 
     def _finalize(
         self,
@@ -239,6 +279,7 @@ class Committee:
         vetoes: list[str],
         calls: int,
         red_flags: list[RedFlag],
+        candidate_codes: set[str] | None = None,
     ) -> CommitteeOutput:
         def reject(rationale: str) -> CommitteeOutput:
             return CommitteeOutput(
@@ -289,6 +330,12 @@ class Committee:
         if unknown:
             return reject(f"proposal cites unknown evidence_ids: {unknown}")
 
+        if candidate_codes is not None and proposal.option_code not in candidate_codes:
+            return reject(
+                f"proposal option_code {proposal.option_code!r} is not in the "
+                "candidate contract list"
+            )
+
         return CommitteeOutput(
             decision="open_position",
             rationale=proposal.thesis,
@@ -316,6 +363,23 @@ class Committee:
                 f"  [{item.evidence_id}] ({item.source_type}, "
                 f"published {item.published_at.isoformat()}) {item.observed_fact} "
                 f"<{item.source_url}>"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_candidates(candidates: list[OptionCandidate] | None) -> str:
+        if not candidates:
+            return ""
+        lines = [
+            "CANDIDATE CONTRACTS (already pass the mandate's liquidity/DTE/cost "
+            "limits; choose option_code from THIS list only):"
+        ]
+        for c in candidates:
+            lines.append(
+                f"  {c.option_code} {c.option_side} strike={c.strike} "
+                f"expiry={c.expiry.isoformat()} DTE={c.dte} bid={c.bid} ask={c.ask} "
+                f"OI={c.open_interest} vol={c.daily_volume} iv={c.iv} "
+                f"est_cost=${c.estimated_contract_cost_usd}"
             )
         return "\n".join(lines)
 

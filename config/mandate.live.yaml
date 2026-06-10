@@ -40,6 +40,9 @@ portfolio:
 
 execution:
   stale_quote_seconds: 15
+  # Live should ideally trade on a real-time feed; this delayed ceiling is a
+  # safety net for delayed-data quotes. Tighten or pay for real-time before live.
+  delayed_quote_max_age_seconds: 1200
   cancel_unfilled_order_seconds: 60
   max_limit_chase_pct: 5
   kill_switch_file: runtime/HALT

@@ -33,6 +33,11 @@ class Settings:
     llm_adversary_model: str = ""
     sec_user_agent: str = ""
     live_account_allowlist: tuple[int, ...] = ()
+    # Option data comes from a free delayed feed (Moomoo does not entitle US
+    # option quotes); execution stays on Moomoo. Source: cboe | tradier | cboe+tradier.
+    option_data_source: str = "cboe"
+    tradier_token: str = ""
+    tradier_base_url: str = "https://sandbox.tradier.com/v1"
 
     @classmethod
     def from_env(cls, root_dir: Path | None = None) -> "Settings":
@@ -74,6 +79,13 @@ class Settings:
             ).strip(),
             sec_user_agent=os.getenv("TRADING_AGENT_SEC_USER_AGENT", "").strip(),
             live_account_allowlist=allowlist,
+            option_data_source=os.getenv(
+                "TRADING_AGENT_OPTION_DATA_SOURCE", "cboe"
+            ).strip(),
+            tradier_token=os.getenv("TRADING_AGENT_TRADIER_TOKEN", "").strip(),
+            tradier_base_url=os.getenv(
+                "TRADING_AGENT_TRADIER_BASE_URL", "https://sandbox.tradier.com/v1"
+            ).strip(),
         )
 
     @property

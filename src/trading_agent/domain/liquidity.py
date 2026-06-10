@@ -66,7 +66,9 @@ class LiquidityValidator:
             reasons.append("daily option volume is below minimum")
 
         quote_age = (current_time - quote.observed_at).total_seconds()
-        if quote_age < 0 or quote_age > self.execution.stale_quote_seconds:
+        if quote_age < 0 or quote_age > self.execution.max_quote_age_seconds(
+            quote.is_delayed
+        ):
             reasons.append("quote is stale")
 
         dte = (quote.expiry - current_time.date()).days

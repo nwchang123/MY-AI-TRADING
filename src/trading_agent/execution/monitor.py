@@ -15,9 +15,21 @@ class PositionMonitor:
     a fresh quote.
     """
 
-    def __init__(self, force_close_before_expiry_trading_days: int, stale_quote_seconds: int):
+    def __init__(
+        self,
+        force_close_before_expiry_trading_days: int,
+        stale_quote_seconds: int,
+        delayed_quote_max_age_seconds: int | None = None,
+    ):
         self.force_close_days = force_close_before_expiry_trading_days
         self.stale_quote_seconds = stale_quote_seconds
+        # Falls back to the real-time threshold when not supplied, so existing
+        # callers that pass only stale_quote_seconds keep their behavior.
+        self.delayed_quote_max_age_seconds = (
+            delayed_quote_max_age_seconds
+            if delayed_quote_max_age_seconds is not None
+            else stale_quote_seconds
+        )
 
     def evaluate(
         self, positions: list[MonitoredPosition], now: datetime | None = None
@@ -39,7 +51,12 @@ class PositionMonitor:
         mark = position.mark_price()
         pnl_pct = round((mark - position.entry_price) / position.entry_price * 100, 4)
         quote_age = (now - position.observed_at).total_seconds()
-        stale = quote_age < 0 or quote_age > self.stale_quote_seconds
+        max_age = (
+            self.delayed_quote_max_age_seconds
+            if position.is_delayed
+            else self.stale_quote_seconds
+        )
+        stale = quote_age < 0 or quote_age > max_age
 
         reason: str | None = None
         if trading_days_until(position.expiry, now) <= self.force_close_days:

@@ -4,13 +4,14 @@ import argparse
 import json
 import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from trading_agent.backtest import run_backtest_file
 from trading_agent.brokers.moomoo import MoomooBroker, MoomooConnection
 from trading_agent.data.moomoo_market import MoomooMarket
+from trading_agent.data.option_data import OptionDataProvider, build_option_provider
 from trading_agent.data.sec_edgar import SecEdgarClient
 from trading_agent.domain.evidence import CandidateContext
 from trading_agent.domain.liquidity import LiquidityValidator
@@ -48,6 +49,17 @@ def _market(settings: Settings) -> MoomooMarket:
             port=settings.moomoo_port,
             security_firm=settings.security_firm,
         )
+    )
+
+
+def _option_provider(settings: Settings) -> OptionDataProvider:
+    # Option chains/quotes come from a free delayed feed (Moomoo does not entitle
+    # US option data); Moomoo is still used for execution. This is the cycle's
+    # `market` dependency (option_quote + is_listed_option).
+    return build_option_provider(
+        settings.option_data_source,
+        tradier_token=settings.tradier_token,
+        tradier_base_url=settings.tradier_base_url,
     )
 
 
@@ -165,14 +177,45 @@ def _run_committee(settings: Settings, input_path: Path) -> bool:
 
 def _scan(settings: Settings) -> None:
     mandate = Mandate.load(settings.mandate_path)
+    # Universe screen uses Moomoo's stock filter (entitled); optionability is
+    # checked against the free option-data feed (Moomoo option data is not).
     market = _market(settings)
+    provider = _option_provider(settings)
     candidates = market.scan_small_caps(mandate.universe)
-    optionable = [c for c in candidates if c.get("code") and market.is_optionable(c["code"])]
+    optionable = [
+        c for c in candidates if c.get("code") and provider.is_optionable(c["code"])
+    ]
     _audit_writer(settings).append(
         "universe_scanned",
         {"scanned": len(candidates), "optionable": len(optionable)},
     )
     _print_json(optionable)
+
+
+def _chain(settings: Settings, ticker: str, option_type: str) -> None:
+    """Fetch a ticker's option chain (DTE window from the mandate) for review."""
+
+    mandate = Mandate.load(settings.mandate_path)
+    provider = _option_provider(settings)
+    today = datetime.now(timezone.utc).date()
+    start = today + timedelta(days=mandate.options.min_dte)
+    end = today + timedelta(days=mandate.options.max_dte)
+    rows = provider.option_chain(ticker, start, end, option_type.upper())
+    payload = [
+        {
+            "code": r["code"],
+            "expiry": r["expiry"].isoformat(),
+            "side": r["side"],
+            "strike": r["strike"],
+            "bid": r["bid"],
+            "ask": r["ask"],
+            "open_interest": r["open_interest"],
+            "daily_volume": r["daily_volume"],
+            "iv": r["iv"],
+        }
+        for r in rows
+    ]
+    _print_json(payload)
 
 
 def _validate_contract(settings: Settings, input_path: Path) -> bool:
@@ -241,7 +284,7 @@ def _build_cycle(
     return PaperTradingCycle(
         mandate=mandate,
         account_id=settings.account_id,  # type: ignore[arg-type]
-        market=_market(settings),
+        market=_option_provider(settings),
         broker=_broker(settings),
         sec_client=SecEdgarClient(settings.sec_user_agent),
         committee=committee,
@@ -367,6 +410,14 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "scan", help="Screen U.S. small-cap optionable equities via OpenD"
     )
+    chain_parser = subparsers.add_parser(
+        "chain",
+        help="Fetch a ticker's option chain (mandate DTE window) from the free feed",
+    )
+    chain_parser.add_argument("--ticker", required=True)
+    chain_parser.add_argument(
+        "--type", default="ALL", choices=["ALL", "CALL", "PUT", "all", "call", "put"]
+    )
     validate_parser = subparsers.add_parser(
         "validate-contract",
         help="Validate an option quote against the deterministic liquidity rules",
@@ -452,6 +503,9 @@ def main() -> None:
         return
     if args.command == "scan":
         _scan(settings)
+        return
+    if args.command == "chain":
+        _chain(settings, args.ticker, args.type)
         return
     if args.command == "validate-contract":
         if not _validate_contract(settings, args.input):

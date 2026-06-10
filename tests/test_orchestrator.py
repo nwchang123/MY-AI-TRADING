@@ -2,6 +2,7 @@ import json
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from trading_agent.data.moomoo_market import parse_us_option_code
 from trading_agent.domain.evidence import EvidenceItem
 from trading_agent.domain.liquidity import LiquidityValidator
 from trading_agent.domain.risk import Mandate, QuoteSnapshot, RiskGate
@@ -33,13 +34,37 @@ _PROPOSAL = {
 
 
 class FakeMarket:
-    def __init__(self, bid: float = 0.19, ask: float = 0.21, listed: bool = True):
+    def __init__(
+        self,
+        bid: float = 0.19,
+        ask: float = 0.21,
+        chain_codes: list[str] | None = None,
+    ):
         self.bid = bid
         self.ask = ask
-        self.listed = listed
+        # Contracts the chain offers; defaults to the proposed code so it is an
+        # eligible candidate. Set to a different code to simulate the committee
+        # naming a contract that is not actually tradeable.
+        self.chain_codes = [OPTION_CODE] if chain_codes is None else chain_codes
 
-    def is_listed_option(self, option_code):
-        return self.listed
+    def option_chain(self, underlying, start, end, option_type="ALL"):
+        rows = []
+        for code in self.chain_codes:
+            _, expiry, side, strike = parse_us_option_code(code)
+            rows.append(
+                {
+                    "code": code,
+                    "side": side,
+                    "strike": strike,
+                    "expiry": expiry,
+                    "bid": self.bid,
+                    "ask": self.ask,
+                    "open_interest": 200,
+                    "daily_volume": 30,
+                    "iv": 0.5,
+                }
+            )
+        return rows
 
     def option_quote(self, *, option_code, expiry, lot_size, now=None):
         return QuoteSnapshot(
@@ -51,6 +76,7 @@ class FakeMarket:
             lot_size=lot_size,
             expiry=expiry,
             observed_at=now or NOW,
+            is_delayed=True,
         )
 
 
@@ -338,19 +364,38 @@ def test_unfilled_entry_is_cancelled_and_not_recorded(tmp_path: Path) -> None:
     assert any(r["stage"] == "unfilled" for r in result.rejected)
 
 
-def test_hallucinated_contract_is_rejected(tmp_path: Path) -> None:
+def test_contract_not_in_chain_blocks_order(tmp_path: Path) -> None:
+    # The chain offers a different contract than the committee names, so the
+    # committee's candidate check rejects the code -> no order reaches the broker.
     broker = FakeBroker()
     cycle = _cycle(
         tmp_path,
         broker=broker,
-        market=FakeMarket(listed=False),  # contract is not a real listed option
-        committee=_committee(_open_responses()),
+        market=FakeMarket(chain_codes=["US.OTHER260626C00005000"]),
+        committee=_committee(_open_responses()),  # PM names OPTION_CODE
     )
 
     result = cycle.run_once(["EXAMPLE"])
 
-    assert broker.placed == []  # never reached the broker
-    assert any(r["stage"] == "not_listed" for r in result.rejected)
+    assert broker.placed == []
+    assert cycle.position_store.open_positions() == []
+
+
+def test_no_eligible_contracts_skips_committee(tmp_path: Path) -> None:
+    # An empty chain means nothing is tradeable: the committee is never called
+    # (saving tokens) and the ticker is recorded as having no eligible contract.
+    broker = FakeBroker()
+    cycle = _cycle(
+        tmp_path,
+        broker=broker,
+        market=FakeMarket(chain_codes=[]),
+        committee=_committee([]),  # would raise if the committee were run
+    )
+
+    result = cycle.run_once(["EXAMPLE"])
+
+    assert broker.placed == []
+    assert any(r["stage"] == "no_eligible_contracts" for r in result.rejected)
 
 
 def test_position_cap_override_blocks_new_entries(tmp_path: Path) -> None:

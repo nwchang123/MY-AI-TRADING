@@ -1,7 +1,8 @@
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from trading_agent.domain.evidence import CandidateContext, EvidenceItem
+from trading_agent.domain.proposals import OptionCandidate
 from trading_agent.research.committee import Committee
 from trading_agent.research.llm import MockLLMClient
 from trading_agent.research.scoring import ScoreInputs, score_candidate
@@ -51,6 +52,30 @@ def _scores():
 def _run(responses: list[str]):
     client = MockLLMClient(responses)
     return Committee(client).run(_context(), _scores())
+
+
+def _candidates() -> list[OptionCandidate]:
+    return [
+        OptionCandidate(
+            option_code="US.EXAMPLE260626C00005000",
+            option_side="call",
+            strike=5.0,
+            expiry=date(2026, 6, 26),
+            bid=0.19,
+            ask=0.21,
+            open_interest=200,
+            daily_volume=30,
+            iv=0.5,
+            dte=24,
+            estimated_contract_cost_usd=22.0,
+        )
+    ]
+
+
+def _run_with_candidates(responses: list[str], candidates: list[OptionCandidate]):
+    client = MockLLMClient(responses)
+    output = Committee(client).run(_context(), _scores(), candidates=candidates)
+    return client, output
 
 
 def test_open_position_flows_through() -> None:
@@ -121,6 +146,39 @@ def test_json_code_fences_are_stripped() -> None:
     out = _run(["c", "o", "fine", "fine", fenced])
     assert out.decision == "open_position"
     assert out.proposal is not None
+
+
+def test_candidate_mode_accepts_listed_code() -> None:
+    _client, out = _run_with_candidates(
+        ["catalyst", "options", "fine", "fine", json.dumps(_PROPOSAL)],
+        _candidates(),
+    )
+    assert out.decision == "open_position"
+    assert out.proposal is not None
+    assert out.proposal.option_code == "US.EXAMPLE260626C00005000"
+
+
+def test_candidate_mode_rejects_code_not_in_list() -> None:
+    # PM names a contract that is not among the supplied candidates -> reject.
+    bad = dict(_PROPOSAL, option_code="US.EXAMPLE260626C00009000")
+    _client, out = _run_with_candidates(
+        ["catalyst", "options", "fine", "fine", json.dumps(bad)],
+        _candidates(),
+    )
+    assert out.decision == "reject"
+    assert "candidate" in out.rationale.lower()
+
+
+def test_candidate_list_is_shown_to_options_and_pm() -> None:
+    client, _out = _run_with_candidates(
+        ["catalyst", "options", "fine", "fine", json.dumps(_PROPOSAL)],
+        _candidates(),
+    )
+    options_prompt = client.calls[1]["user"]
+    pm_prompt = client.calls[4]["user"]
+    assert "CANDIDATE CONTRACTS" in options_prompt
+    assert "US.EXAMPLE260626C00005000" in options_prompt
+    assert "US.EXAMPLE260626C00005000" in pm_prompt
 
 
 def _dilution_context() -> CandidateContext:

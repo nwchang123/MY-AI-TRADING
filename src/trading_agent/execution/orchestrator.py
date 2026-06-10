@@ -10,7 +10,7 @@ from trading_agent.domain.calendar import market_date
 from trading_agent.domain.liquidity import LiquidityValidator
 from trading_agent.domain.positions import MonitoredPosition
 from trading_agent.execution.orders import OrderManager
-from trading_agent.domain.proposals import OpenPositionProposal
+from trading_agent.domain.proposals import OpenPositionProposal, OptionCandidate
 from trading_agent.domain.risk import Mandate, PortfolioState, QuoteSnapshot, RiskGate
 from trading_agent.research.catalysts import build_candidate_context, derive_score_inputs
 from trading_agent.research.committee import Committee
@@ -18,6 +18,10 @@ from trading_agent.research.llm import usage_delta
 from trading_agent.research.scoring import score_candidate
 from trading_agent.storage.audit import AuditWriter
 from trading_agent.storage.positions import PositionStore
+
+# Upper bound on contracts shown to the committee per ticker, so the prompt stays
+# small. The $25 cost cap already filters most chains to well under this.
+_MAX_CANDIDATES = 20
 
 
 @dataclass
@@ -231,6 +235,7 @@ class PaperTradingCycle:
         monitor = PositionMonitor(
             self.mandate.options.force_close_before_expiry_trading_days,
             self.mandate.execution.stale_quote_seconds,
+            self.mandate.execution.delayed_quote_max_age_seconds,
         )
         monitored: list[MonitoredPosition] = []
         ledger_by_code: dict[str, dict[str, Any]] = {}
@@ -261,6 +266,7 @@ class PaperTradingCycle:
                 bid=quote.bid,
                 ask=quote.ask,
                 observed_at=quote.observed_at,
+                is_delayed=quote.is_delayed,
             )
             monitored.append(position)
             marks[code] = position.mark_price()
@@ -326,14 +332,89 @@ class PaperTradingCycle:
             if opened_code is not None:
                 held_codes.add(opened_code)
 
+    def _eligible_candidates(
+        self, now: datetime, ticker: str, result: CycleResult
+    ) -> list[OptionCandidate]:
+        """Mandate-eligible contracts from the live chain, for the committee.
+
+        Pulls the option chain in the mandate DTE window and keeps only contracts
+        that pass the deterministic liquidity validator, so the committee can only
+        ever choose a real, tradeable contract instead of guessing one blind.
+        Bounded to the most liquid ``_MAX_CANDIDATES`` to keep the prompt small.
+        """
+
+        today = now.date()
+        start = today + timedelta(days=self.mandate.options.min_dte)
+        end = today + timedelta(days=self.mandate.options.max_dte)
+        try:
+            chain = self.market.option_chain(ticker, start, end, "ALL")
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(result, "option_chain", ticker, exc)
+            return []
+
+        candidates: list[OptionCandidate] = []
+        for row in chain:
+            ask = float(row.get("ask") or 0.0)
+            if ask <= 0:
+                continue
+            quote = QuoteSnapshot(
+                option_code=row["code"],
+                bid=float(row.get("bid") or 0.0),
+                ask=ask,
+                open_interest=int(row.get("open_interest") or 0),
+                daily_volume=int(row.get("daily_volume") or 0),
+                lot_size=US_OPTION_LOT_SIZE,
+                expiry=row["expiry"],
+                observed_at=now,
+                is_delayed=True,
+            )
+            verdict = self.liquidity.validate(
+                quote, self.mandate.options.contracts_per_order, now
+            )
+            if not verdict.passed:
+                continue
+            candidates.append(
+                OptionCandidate(
+                    option_code=row["code"],
+                    option_side=row["side"],
+                    strike=row["strike"],
+                    expiry=row["expiry"],
+                    bid=quote.bid,
+                    ask=ask,
+                    open_interest=quote.open_interest,
+                    daily_volume=quote.daily_volume,
+                    iv=float(row.get("iv") or 0.0),
+                    dte=verdict.dte,
+                    estimated_contract_cost_usd=verdict.estimated_contract_cost_usd,
+                )
+            )
+        candidates.sort(key=lambda c: c.open_interest, reverse=True)
+        return candidates[:_MAX_CANDIDATES]
+
     def _try_enter(
         self, now: datetime, ticker: str, held_codes: set[str], result: CycleResult
     ) -> str | None:
+        # Build the real, mandate-eligible contract shortlist FIRST: if nothing is
+        # tradeable, skip the SEC fetch and the committee entirely (saves tokens).
+        candidates = self._eligible_candidates(now, ticker, result)
+        if not candidates:
+            self.audit.append(
+                "no_eligible_contracts", {"ticker": ticker, "at": now.isoformat()}
+            )
+            result.rejected.append(
+                {
+                    "ticker": ticker,
+                    "stage": "no_eligible_contracts",
+                    "reasons": ["no mandate-eligible contract in the option chain"],
+                }
+            )
+            return None
+
         evidence = self.sec_client.fetch_evidence(ticker)
         context = build_candidate_context(ticker, evidence, now)
         scores = score_candidate(derive_score_inputs(context.evidence, now))
         before = self.committee.usage_total()
-        output = self.committee.run(context, scores)
+        output = self.committee.run(context, scores, candidates=candidates)
         usage = usage_delta(before, self.committee.usage_total())
         self.audit.append(
             "committee_run",
@@ -344,18 +425,25 @@ class PaperTradingCycle:
             return None
 
         proposal = output.proposal
-        _, expiry, _, _ = parse_us_option_code(proposal.option_code)
-
-        # Guard against a hallucinated contract: it must be a real listed option.
-        if not self.market.is_listed_option(proposal.option_code):
+        # The committee constrains the code to the candidate list; this backstops
+        # against a contract that is not real/tradeable.
+        candidate = next(
+            (c for c in candidates if c.option_code == proposal.option_code), None
+        )
+        if candidate is None:
             self.audit.append(
                 "proposal_rejected",
-                {"option_code": proposal.option_code, "stage": "not_listed"},
+                {"option_code": proposal.option_code, "stage": "not_in_candidates"},
             )
             result.rejected.append(
-                {"ticker": ticker, "stage": "not_listed", "reasons": ["option not listed"]}
+                {
+                    "ticker": ticker,
+                    "stage": "not_in_candidates",
+                    "reasons": ["chosen contract not in candidate list"],
+                }
             )
             return None
+        expiry = candidate.expiry
 
         quote = self.market.option_quote(
             option_code=proposal.option_code,

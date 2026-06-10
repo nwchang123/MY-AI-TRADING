@@ -26,6 +26,7 @@ class MonitoredPosition(BaseModel):
     bid: float = Field(ge=0)
     ask: float = Field(ge=0)
     observed_at: datetime
+    is_delayed: bool = False
 
     def mark_price(self) -> float:
         # Every monitored position is a long option (mandate allows buy_to_open

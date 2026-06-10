@@ -66,9 +66,20 @@ class ExecutionMandate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     stale_quote_seconds: int = Field(gt=0)
+    # Free option-data feeds (CBOE/Tradier) are ~15 min delayed, so a real-time
+    # threshold would reject every quote. Quotes flagged ``is_delayed`` use this
+    # wider age limit instead, which still catches a frozen/weekend feed.
+    delayed_quote_max_age_seconds: int = Field(default=1200, gt=0)
     cancel_unfilled_order_seconds: int = Field(gt=0)
     max_limit_chase_pct: float = Field(ge=0)
     kill_switch_file: str = Field(min_length=1)
+
+    def max_quote_age_seconds(self, is_delayed: bool) -> int:
+        """Staleness ceiling for a quote, widened for delayed data feeds."""
+
+        return (
+            self.delayed_quote_max_age_seconds if is_delayed else self.stale_quote_seconds
+        )
 
 
 class Mandate(BaseModel):
@@ -97,6 +108,9 @@ class QuoteSnapshot(BaseModel):
     lot_size: int = Field(gt=0)
     expiry: date
     observed_at: datetime
+    # True when sourced from a delayed feed (CBOE/Tradier). Selects the wider
+    # staleness ceiling in the gate, liquidity validator, and position monitor.
+    is_delayed: bool = False
 
 
 class PortfolioState(BaseModel):
@@ -163,7 +177,8 @@ class RiskGate:
             reasons.append("daily option volume is below minimum")
 
         quote_age = (current_time - quote.observed_at).total_seconds()
-        if quote_age < 0 or quote_age > self.mandate.execution.stale_quote_seconds:
+        max_age = self.mandate.execution.max_quote_age_seconds(quote.is_delayed)
+        if quote_age < 0 or quote_age > max_age:
             reasons.append("quote is stale")
 
         dte = (quote.expiry - current_time.date()).days

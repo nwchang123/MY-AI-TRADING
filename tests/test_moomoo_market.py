@@ -7,7 +7,10 @@ from trading_agent.data.moomoo_market import (
     MoomooMarket,
     best_bid_ask,
     build_universe_filters,
+    build_us_option_code,
+    occ_to_moomoo_code,
     parse_filter_rows,
+    parse_us_option_code,
 )
 from trading_agent.domain.risk import Mandate
 
@@ -60,6 +63,30 @@ def test_parse_filter_rows_extracts_fields() -> None:
     assert parse_filter_rows(rows) == [
         {"code": "US.AAA", "name": "Alpha", "cur_price": 5.0, "market_val": 2e8, "turnover": 9e6}
     ]
+
+
+def test_build_us_option_code_emits_no_pad_strike() -> None:
+    # Verified live against OpenD: the broker accepts the no-pad strike form and
+    # rejects the OCC 8-digit-padded form.
+    code = build_us_option_code("AAPL", date(2026, 7, 17), "call", 310.0)
+    assert code == "US.AAPL260717C310000"
+    assert build_us_option_code("US.NVDA", date(2026, 6, 26), "put", 5.0) == (
+        "US.NVDA260626P5000"
+    )
+
+
+def test_occ_to_moomoo_strips_strike_padding() -> None:
+    # CBOE/Tradier 'option' field is OCC with an 8-digit padded strike.
+    assert occ_to_moomoo_code("AAPL260717C00310000") == "US.AAPL260717C310000"
+    assert occ_to_moomoo_code("nvda260626p00005000") == "US.NVDA260626P5000"
+
+
+def test_option_code_round_trips_through_parse() -> None:
+    code = build_us_option_code("AAPL", date(2026, 7, 17), "call", 310.0)
+    root, expiry, side, strike = parse_us_option_code(code)
+    assert (root, expiry, side, strike) == ("AAPL", date(2026, 7, 17), "call", 310.0)
+    # Parser still tolerates a zero-padded (OCC-style) strike.
+    assert parse_us_option_code("US.EXAMPLE260626C00005000")[3] == 5.0
 
 
 def test_best_bid_ask_reads_top_of_book() -> None:

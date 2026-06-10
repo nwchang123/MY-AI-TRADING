@@ -40,6 +40,8 @@ portfolio:
 
 execution:
   stale_quote_seconds: 15
+  # Wider age limit applied only to delayed free-feed quotes (CBOE/Tradier ~15min).
+  delayed_quote_max_age_seconds: 1200
   cancel_unfilled_order_seconds: 60
   max_limit_chase_pct: 5
   kill_switch_file: runtime/HALT
