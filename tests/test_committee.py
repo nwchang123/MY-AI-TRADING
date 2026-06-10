@@ -169,6 +169,38 @@ def test_candidate_mode_rejects_code_not_in_list() -> None:
     assert "candidate" in out.rationale.lower()
 
 
+def test_market_snapshot_appears_in_briefing() -> None:
+    client = MockLLMClient(
+        ["catalyst", "options", "fine", "fine", json.dumps(_PROPOSAL)]
+    )
+    Committee(client).run(
+        _context(),
+        _scores(),
+        market_snapshot={
+            "price": 18.4,
+            "change_pct": 6.3,
+            "prev_close": 17.3,
+            "day_high": 18.9,
+            "day_low": 17.1,
+            "volume": 2000000,
+            "iv30": 0.66,
+            "iv30_change": 0.04,
+        },
+    )
+    briefing = client.calls[0]["user"]
+    assert "Underlying market snapshot" in briefing
+    assert "price=18.4" in briefing
+    assert "day_change=+6.30%" in briefing
+
+
+def test_empty_market_snapshot_leaves_briefing_unchanged() -> None:
+    client = MockLLMClient(
+        ["catalyst", "options", "fine", "fine", json.dumps(_PROPOSAL)]
+    )
+    Committee(client).run(_context(), _scores(), market_snapshot={})
+    assert "Underlying market snapshot" not in client.calls[0]["user"]
+
+
 def test_candidate_list_is_shown_to_options_and_pm() -> None:
     client, _out = _run_with_candidates(
         ["catalyst", "options", "fine", "fine", json.dumps(_PROPOSAL)],

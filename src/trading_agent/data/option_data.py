@@ -80,6 +80,33 @@ def _parse_cboe_timestamp(value: Any, fallback: datetime) -> datetime:
     return fallback
 
 
+def parse_cboe_underlying(payload: dict[str, Any]) -> dict[str, Any]:
+    """Underlying market context carried in a CBOE options payload.
+
+    Free extra signal for the committee (price action and 30-day implied vol)
+    without another request. Values may be zero/absent off-hours.
+    """
+
+    data = payload.get("data") or {}
+
+    def num(key: str) -> float:
+        try:
+            return float(data.get(key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    return {
+        "price": num("current_price"),
+        "change_pct": num("price_change_percent"),
+        "prev_close": num("prev_day_close"),
+        "day_high": num("high"),
+        "day_low": num("low"),
+        "volume": int(num("volume")),
+        "iv30": num("iv30"),
+        "iv30_change": num("iv30_change"),
+    }
+
+
 def parse_cboe_payload(
     payload: dict[str, Any], *, fallback_now: datetime
 ) -> tuple[datetime, list[dict[str, Any]]]:
@@ -140,8 +167,10 @@ class CboeOptionData:
         self.cache_ttl_seconds = cache_ttl_seconds
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self._fetch = fetch_fn or self._http_fetch
-        # symbol -> (fetched_at, observed_at, contracts)
-        self._cache: dict[str, tuple[datetime, datetime, list[dict[str, Any]]]] = {}
+        # symbol -> (fetched_at, observed_at, contracts, underlying)
+        self._cache: dict[
+            str, tuple[datetime, datetime, list[dict[str, Any]], dict[str, Any]]
+        ] = {}
 
     def _http_fetch(self, symbol: str) -> dict[str, Any]:
         url = _CBOE_URL.format(symbol=symbol)
@@ -166,11 +195,17 @@ class CboeOptionData:
         cached = self._cache.get(symbol)
         if cached and (now - cached[0]).total_seconds() < self.cache_ttl_seconds:
             return cached[1], cached[2]
-        observed_at, contracts = parse_cboe_payload(
-            self._fetch(symbol), fallback_now=now
-        )
-        self._cache[symbol] = (now, observed_at, contracts)
+        payload = self._fetch(symbol)
+        observed_at, contracts = parse_cboe_payload(payload, fallback_now=now)
+        self._cache[symbol] = (now, observed_at, contracts, parse_cboe_underlying(payload))
         return observed_at, contracts
+
+    def underlying_snapshot(self, underlying: str) -> dict[str, Any]:
+        """Delayed price/IV context for the underlying, from the cached chain."""
+
+        symbol = underlying_symbol(underlying)
+        self._contracts(symbol)
+        return self._cache[symbol][3]
 
     def is_optionable(self, underlying: str) -> bool:
         try:
@@ -441,6 +476,17 @@ class FallbackOptionProvider:
                 option_code=option_code, expiry=expiry, lot_size=lot_size, now=now
             )
         )
+
+    def underlying_snapshot(self, underlying: str) -> dict[str, Any]:
+        for provider in self.providers:
+            method = getattr(provider, "underlying_snapshot", None)
+            if method is None:
+                continue
+            try:
+                return method(underlying)
+            except OptionDataError:
+                continue
+        return {}
 
     def _first(self, call: Callable[[OptionDataProvider], Any]) -> Any:
         last_error: Exception | None = None

@@ -21,6 +21,9 @@ _CATALYST_TYPE_WEIGHT: dict[SourceType, float] = {
     "earnings_calendar": 0.9,
     "sec_13d": 0.9,
     "moomoo_news": 0.8,
+    # Aggregated headlines (Google News etc.): real catalysts surface here first,
+    # but syndicated noise does too, so they weigh below primary sources.
+    "news_rss": 0.7,
     "options_flow": 0.8,
     "sec_10q": 0.5,
     "sec_10k": 0.4,

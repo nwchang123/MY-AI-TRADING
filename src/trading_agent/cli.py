@@ -6,11 +6,12 @@ import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from trading_agent.backtest import run_backtest_file
 from trading_agent.brokers.moomoo import MoomooBroker, MoomooConnection
 from trading_agent.data.moomoo_market import MoomooMarket
+from trading_agent.data.news_feeds import GoogleNewsClient
 from trading_agent.data.option_data import OptionDataProvider, build_option_provider
 from trading_agent.data.sec_edgar import SecEdgarClient
 from trading_agent.domain.evidence import CandidateContext
@@ -24,6 +25,7 @@ from trading_agent.execution.scheduler import run_scheduler
 from trading_agent.reporting import build_daily_report, read_audit_events
 from trading_agent.research.catalysts import build_candidate_context, derive_score_inputs
 from trading_agent.research.committee import Committee
+from trading_agent.research.universe import DEFAULT_MAX_TICKERS, select_universe
 from trading_agent.research.llm import OpenAICompatibleClient, usage_delta
 from trading_agent.research.scoring import ScoreInputs, score_candidate
 from trading_agent.settings import Settings
@@ -294,6 +296,7 @@ def _build_cycle(
         audit=_audit_writer(settings),
         trd_env=trd_env,
         max_open_positions_override=max_open_positions_override,
+        news_client=GoogleNewsClient(),
     )
 
 
@@ -323,9 +326,37 @@ def _run_cycle(settings: Settings, tickers: list[str]) -> None:
     _print_json(_cycle_payload(result))
 
 
+def _auto_universe(settings: Settings, max_tickers: int) -> list[str]:
+    """Let the agent pick its own tickers: scan -> rank -> optionability."""
+
+    mandate = Mandate.load(settings.mandate_path)
+    tickers = select_universe(
+        market=_market(settings),
+        provider=_option_provider(settings),
+        universe=mandate.universe,
+        max_tickers=max_tickers,
+    )
+    _audit_writer(settings).append(
+        "universe_selected", {"tickers": tickers, "max_tickers": max_tickers}
+    )
+    print(f"auto universe: {', '.join(tickers) or '(none)'}", file=sys.stderr)
+    return tickers
+
+
+def _resolve_tickers(settings: Settings, args: Any) -> list[str]:
+    manual = [t.strip().upper() for t in (args.tickers or "").split(",") if t.strip()]
+    if args.auto_universe and manual:
+        raise SystemExit("Use either --tickers or --auto-universe, not both.")
+    if args.auto_universe:
+        return _auto_universe(settings, args.max_tickers)
+    if not manual:
+        raise SystemExit("Provide --tickers or --auto-universe.")
+    return manual
+
+
 def _run_loop(
     settings: Settings,
-    tickers: list[str],
+    tickers_fn: Callable[[], list[str]],
     *,
     interval_seconds: float,
     max_iterations: int | None,
@@ -337,6 +368,8 @@ def _run_loop(
         )
 
     def run_cycle() -> None:
+        # Resolved per tick so an auto universe follows the market day by day.
+        tickers = tickers_fn()
         with single_instance_lock(_cycle_lock_path(settings)):
             result = _build_cycle(settings, trd_env="SIMULATE").run_once(tickers)
         _print_json(_cycle_payload(result))
@@ -418,6 +451,10 @@ def _build_parser() -> argparse.ArgumentParser:
     chain_parser.add_argument(
         "--type", default="ALL", choices=["ALL", "CALL", "PUT", "all", "call", "put"]
     )
+    news_parser = subparsers.add_parser(
+        "news", help="Fetch recent headlines for a ticker (Google News RSS)"
+    )
+    news_parser.add_argument("--ticker", required=True)
     validate_parser = subparsers.add_parser(
         "validate-contract",
         help="Validate an option quote against the deterministic liquidity rules",
@@ -448,14 +485,32 @@ def _build_parser() -> argparse.ArgumentParser:
         "run-cycle", help="Run one autonomous paper trading cycle (requires OpenD)"
     )
     cycle_parser.add_argument(
-        "--tickers", required=True, help="Comma-separated tickers to evaluate"
+        "--tickers", default=None, help="Comma-separated tickers to evaluate"
+    )
+    cycle_parser.add_argument(
+        "--auto-universe",
+        action="store_true",
+        help="Let the agent pick tickers itself (scan + optionability)",
+    )
+    cycle_parser.add_argument(
+        "--max-tickers", type=int, default=DEFAULT_MAX_TICKERS,
+        help="Maximum tickers an auto universe returns",
     )
     loop_parser = subparsers.add_parser(
         "run-loop",
         help="Run paper cycles on an interval (HALT- and market-hours-aware)",
     )
     loop_parser.add_argument(
-        "--tickers", required=True, help="Comma-separated tickers to evaluate"
+        "--tickers", default=None, help="Comma-separated tickers to evaluate"
+    )
+    loop_parser.add_argument(
+        "--auto-universe",
+        action="store_true",
+        help="Re-select tickers automatically before every cycle",
+    )
+    loop_parser.add_argument(
+        "--max-tickers", type=int, default=DEFAULT_MAX_TICKERS,
+        help="Maximum tickers an auto universe returns",
     )
     loop_parser.add_argument(
         "--interval-seconds", type=float, default=900.0, help="Seconds between cycles"
@@ -507,6 +562,10 @@ def main() -> None:
     if args.command == "chain":
         _chain(settings, args.ticker, args.type)
         return
+    if args.command == "news":
+        items = GoogleNewsClient().fetch_evidence(args.ticker)
+        _print_json([i.model_dump(mode="json") for i in items])
+        return
     if args.command == "validate-contract":
         if not _validate_contract(settings, args.input):
             raise SystemExit(2)
@@ -528,14 +587,17 @@ def main() -> None:
             raise SystemExit(2)
         return
     if args.command == "run-cycle":
-        tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
-        _run_cycle(settings, tickers)
+        _run_cycle(settings, _resolve_tickers(settings, args))
         return
     if args.command == "run-loop":
-        tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+        if args.auto_universe:
+            tickers_fn = lambda: _auto_universe(settings, args.max_tickers)  # noqa: E731
+        else:
+            static = _resolve_tickers(settings, args)
+            tickers_fn = lambda: static  # noqa: E731
         _run_loop(
             settings,
-            tickers,
+            tickers_fn,
             interval_seconds=args.interval_seconds,
             max_iterations=args.max_iterations,
             market_hours_only=not args.ignore_market_hours,

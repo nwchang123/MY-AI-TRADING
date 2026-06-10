@@ -34,6 +34,12 @@ class FakeSimpleFilter:
         self.filter_max = None
 
 
+class FakeAccumulateFilter(FakeSimpleFilter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.days = None
+
+
 def _stock_field() -> SimpleNamespace:
     return SimpleNamespace(CUR_PRICE="CUR_PRICE", MARKET_VAL="MARKET_VAL", TURNOVER="TURNOVER")
 
@@ -43,14 +49,21 @@ def _universe() -> "Mandate":
 
 
 def test_build_universe_filters_maps_mandate() -> None:
-    sdk = SimpleNamespace(SimpleFilter=FakeSimpleFilter, StockField=_stock_field())
+    sdk = SimpleNamespace(
+        SimpleFilter=FakeSimpleFilter,
+        AccumulateFilter=FakeAccumulateFilter,
+        StockField=_stock_field(),
+    )
     filters = build_universe_filters(_universe(), sdk)
 
     by_field = {f.stock_field: f for f in filters}
     assert by_field["CUR_PRICE"].filter_min == 2
     assert by_field["MARKET_VAL"].filter_min == 100000000
     assert by_field["MARKET_VAL"].filter_max == 5000000000
+    # TURNOVER is accumulate-class: SimpleFilter is rejected by OpenD.
+    assert isinstance(by_field["TURNOVER"], FakeAccumulateFilter)
     assert by_field["TURNOVER"].filter_min == 5000000
+    assert by_field["TURNOVER"].days == 1
     assert all(f.is_no_filter is False for f in filters)
 
 
@@ -129,6 +142,7 @@ def _fake_sdk(ctx: FakeQuoteContext) -> SimpleNamespace:
         OpenQuoteContext=lambda **kwargs: ctx,
         Market=SimpleNamespace(US="US"),
         SimpleFilter=FakeSimpleFilter,
+        AccumulateFilter=FakeAccumulateFilter,
         StockField=_stock_field(),
         SubType=SimpleNamespace(QUOTE="QUOTE", ORDER_BOOK="ORDER_BOOK"),
     )

@@ -381,6 +381,52 @@ def test_contract_not_in_chain_blocks_order(tmp_path: Path) -> None:
     assert cycle.position_store.open_positions() == []
 
 
+class FakeNews:
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+
+    def fetch_evidence(self, ticker):
+        if self.fail:
+            raise RuntimeError("feed down")
+        return [
+            EvidenceItem(
+                evidence_id="news-1",
+                ticker=ticker.upper(),
+                source_type="news_rss",
+                source_url="https://example.com/n1",
+                published_at=NOW,
+                observed_fact="Partnership headline from a news feed.",
+                retrieved_at=NOW,
+            )
+        ]
+
+
+def test_news_evidence_merges_with_sec(tmp_path: Path) -> None:
+    cycle = _cycle(
+        tmp_path, broker=FakeBroker(), market=FakeMarket(), committee=_committee([])
+    )
+    cycle.news_client = FakeNews()
+
+    from trading_agent.execution.orchestrator import CycleResult
+
+    evidence = cycle._gather_evidence("EXAMPLE", CycleResult())
+    assert {e.evidence_id for e in evidence} == {"e1", "news-1"}
+
+
+def test_news_failure_is_nonfatal_entry_still_proceeds(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    cycle = _cycle(
+        tmp_path, broker=broker, market=FakeMarket(), committee=_committee(_open_responses())
+    )
+    cycle.news_client = FakeNews(fail=True)
+
+    result = cycle.run_once(["EXAMPLE"])
+
+    # The dead feed is recorded but the SEC-backed entry still goes through.
+    assert any(e["stage"] == "news_fetch" for e in result.errors)
+    assert broker.placed == [("buy", OPTION_CODE)]
+
+
 def test_no_eligible_contracts_skips_committee(tmp_path: Path) -> None:
     # An empty chain means nothing is tradeable: the committee is never called
     # (saving tokens) and the ticker is recorded as having no eligible contract.

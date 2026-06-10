@@ -168,6 +168,7 @@ class Committee:
         context: CandidateContext,
         scores: ScoreComponents,
         candidates: list[OptionCandidate] | None = None,
+        market_snapshot: dict | None = None,
     ) -> CommitteeOutput:
         # In candidate mode the options_analyst/PM pick a real listed contract
         # from ``candidates`` instead of guessing one; the PM's option_code is
@@ -180,6 +181,9 @@ class Committee:
         pm_system = _PM_SYSTEM + (_PM_CANDIDATE_RULE if candidate_block else "")
 
         briefing = self._briefing(context, scores)
+        snapshot_block = self._format_snapshot(market_snapshot)
+        if snapshot_block:
+            briefing = f"{briefing}\n\n{snapshot_block}"
         flash_model = self._model_name(self.client)
         adversary_model = self._model_name(self.adversary_client)
         pro_model = self._model_name(self.pro_client)
@@ -365,6 +369,20 @@ class Committee:
                 f"<{item.source_url}>"
             )
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_snapshot(snapshot: dict | None) -> str:
+        if not snapshot or not snapshot.get("price"):
+            return ""
+        return (
+            "Underlying market snapshot (delayed ~15min; observed_fact quality):\n"
+            f"  price={snapshot.get('price')} "
+            f"day_change={snapshot.get('change_pct', 0):+.2f}% "
+            f"prev_close={snapshot.get('prev_close')} "
+            f"day_range={snapshot.get('day_low')}-{snapshot.get('day_high')} "
+            f"volume={snapshot.get('volume')} "
+            f"iv30={snapshot.get('iv30')} (chg {snapshot.get('iv30_change', 0):+.2f})"
+        )
 
     @staticmethod
     def _format_candidates(candidates: list[OptionCandidate] | None) -> str:

@@ -17,6 +17,7 @@ SourceType = Literal[
     "press_release",
     "investor_relations",
     "moomoo_news",
+    "news_rss",
     "earnings_calendar",
     "regulatory_calendar",
     "options_flow",

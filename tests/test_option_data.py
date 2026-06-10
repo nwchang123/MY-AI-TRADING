@@ -23,6 +23,13 @@ CBOE_PAYLOAD = {
     "data": {
         "symbol": "AAPL",
         "current_price": 290.0,
+        "price_change_percent": 1.25,
+        "prev_day_close": 286.4,
+        "high": 291.5,
+        "low": 285.9,
+        "volume": 12345678,
+        "iv30": 0.31,
+        "iv30_change": -0.02,
         "options": [
             {
                 "option": "AAPL260717C00310000",
@@ -140,6 +147,27 @@ def test_option_quote_rejects_zero_ask_and_missing() -> None:
         cboe.option_quote(option_code="US.AAPL260717C400000", expiry=date(2026, 7, 17))
     with pytest.raises(OptionDataError):
         cboe.option_quote(option_code="US.AAPL260101C100000", expiry=date(2026, 1, 1))
+
+
+def test_underlying_snapshot_from_cached_payload() -> None:
+    calls: list[str] = []
+    cboe = _cboe(calls)
+    cboe.option_expirations("AAPL")
+    snapshot = cboe.underlying_snapshot("US.AAPL")
+    assert snapshot["price"] == 290.0
+    assert snapshot["change_pct"] == 1.25
+    assert snapshot["iv30"] == 0.31
+    assert snapshot["volume"] == 12345678
+    assert calls == ["AAPL"]  # served from the same cached fetch
+
+
+def test_fallback_underlying_snapshot_skips_failing_provider() -> None:
+    class NoSnapshot:
+        pass
+
+    fallback = FallbackOptionProvider([NoSnapshot(), _cboe()])
+    assert fallback.underlying_snapshot("AAPL")["price"] == 290.0
+    assert FallbackOptionProvider([NoSnapshot()]).underlying_snapshot("AAPL") == {}
 
 
 def test_cboe_caches_within_ttl() -> None:

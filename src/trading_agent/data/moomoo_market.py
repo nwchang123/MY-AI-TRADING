@@ -78,9 +78,12 @@ def occ_to_moomoo_code(occ_symbol: str) -> str:
 
 
 def build_universe_filters(universe: UniverseMandate, sdk: Any) -> list[Any]:
-    """Translate the universe mandate into Moomoo SimpleFilter objects.
+    """Translate the universe mandate into Moomoo filter objects.
 
     Pure with respect to the SDK module, so it can be tested with a fake ``sdk``.
+    TURNOVER is an accumulate-class field: passing it via SimpleFilter makes
+    get_stock_filter fail with "This filter field is not supported" (verified
+    live 2026-06-11), so it goes through AccumulateFilter with a 1-day window.
     """
 
     simple_filter = sdk.SimpleFilter
@@ -96,6 +99,12 @@ def build_universe_filters(universe: UniverseMandate, sdk: Any) -> list[Any]:
             item.filter_max = fmax
         return item
 
+    turnover = sdk.AccumulateFilter()
+    turnover.stock_field = field.TURNOVER
+    turnover.is_no_filter = False
+    turnover.filter_min = universe.min_average_daily_turnover_usd
+    turnover.days = 1
+
     return [
         make(field.CUR_PRICE, fmin=universe.min_underlying_price_usd),
         make(
@@ -103,7 +112,7 @@ def build_universe_filters(universe: UniverseMandate, sdk: Any) -> list[Any]:
             fmin=universe.min_market_cap_usd,
             fmax=universe.max_market_cap_usd,
         ),
-        make(field.TURNOVER, fmin=universe.min_average_daily_turnover_usd),
+        turnover,
     ]
 
 

@@ -63,6 +63,7 @@ class PaperTradingCycle:
         max_open_positions_override: int | None = None,
         order_poll_interval_seconds: float = 2.0,
         sleep_fn: Callable[[float], None] | None = None,
+        news_client: Any | None = None,
     ):
         if trd_env not in {"SIMULATE", "REAL"}:
             raise ValueError("trd_env must be 'SIMULATE' or 'REAL'")
@@ -79,6 +80,7 @@ class PaperTradingCycle:
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self.trd_env = trd_env
         self.max_open_positions_override = max_open_positions_override
+        self.news_client = news_client
         self.orders = OrderManager(
             broker=broker,
             account_id=account_id,
@@ -391,6 +393,35 @@ class PaperTradingCycle:
         candidates.sort(key=lambda c: c.open_interest, reverse=True)
         return candidates[:_MAX_CANDIDATES]
 
+    def _gather_evidence(self, ticker: str, result: CycleResult) -> list[Any]:
+        """SEC filings plus (optional) news headlines for one ticker.
+
+        A news-feed failure is recorded but never blocks the entry: filings are
+        the primary evidence and headlines are an enrichment.
+        """
+
+        evidence = list(self.sec_client.fetch_evidence(ticker))
+        if self.news_client is not None:
+            try:
+                evidence.extend(self.news_client.fetch_evidence(ticker))
+            except Exception as exc:  # noqa: BLE001
+                self._record_error(result, "news_fetch", ticker, exc)
+        return evidence
+
+    def _underlying_snapshot(
+        self, ticker: str, result: CycleResult
+    ) -> dict[str, Any] | None:
+        """Delayed price/IV context for the committee briefing (best-effort)."""
+
+        method = getattr(self.market, "underlying_snapshot", None)
+        if method is None:
+            return None
+        try:
+            return method(ticker) or None
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(result, "underlying_snapshot", ticker, exc)
+            return None
+
     def _try_enter(
         self, now: datetime, ticker: str, held_codes: set[str], result: CycleResult
     ) -> str | None:
@@ -410,11 +441,14 @@ class PaperTradingCycle:
             )
             return None
 
-        evidence = self.sec_client.fetch_evidence(ticker)
+        evidence = self._gather_evidence(ticker, result)
         context = build_candidate_context(ticker, evidence, now)
         scores = score_candidate(derive_score_inputs(context.evidence, now))
+        snapshot = self._underlying_snapshot(ticker, result)
         before = self.committee.usage_total()
-        output = self.committee.run(context, scores, candidates=candidates)
+        output = self.committee.run(
+            context, scores, candidates=candidates, market_snapshot=snapshot
+        )
         usage = usage_delta(before, self.committee.usage_total())
         self.audit.append(
             "committee_run",
