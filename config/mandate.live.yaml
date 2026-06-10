@@ -2,6 +2,9 @@ account:
   initial_capital_usd: 100
   live_mode_requires_operator_flag: true
   withdrawal_capability: forbidden
+  # Live keeps FIXED dollar caps: no compounding with real money until the
+  # operator reviews paper results and changes this deliberately.
+  compounding: false
 
 universe:
   market: US

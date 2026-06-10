@@ -16,6 +16,10 @@ class AccountMandate(BaseModel):
     initial_capital_usd: float = Field(gt=0)
     live_mode_requires_operator_flag: bool
     withdrawal_capability: Literal["forbidden"]
+    # When true, the dollar risk caps scale with realized equity instead of
+    # staying pinned to initial_capital_usd: wins compound into larger sizing,
+    # losses automatically de-risk. Counts and percentages never scale.
+    compounding: bool = False
 
 
 class UniverseMandate(BaseModel):
@@ -82,6 +86,12 @@ class ExecutionMandate(BaseModel):
         )
 
 
+# Compounding never scales the caps below this fraction of their configured
+# values, so a deep drawdown cannot shrink the limits into nonsense (the hard
+# drawdown stop halts the session long before this floor matters).
+COMPOUND_SCALE_FLOOR = 0.1
+
+
 class Mandate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -95,6 +105,51 @@ class Mandate(BaseModel):
     def load(cls, path: Path) -> "Mandate":
         with path.open("r", encoding="utf-8") as handle:
             return cls.model_validate(yaml.safe_load(handle))
+
+    def scaled_for_equity(
+        self, equity: float, peak_equity: float | None = None
+    ) -> "Mandate":
+        """Risk caps proportional to realized equity (compounding accounts).
+
+        At $200 equity on a $100 mandate, the $25 contract cap becomes $50 and
+        the $60 premium-at-risk cap becomes $120; after losses they shrink the
+        same way, so sizing de-risks automatically. The hard drawdown stop
+        scales with PEAK equity instead, preserving its meaning of "this far
+        off the high-water mark". Counts (positions, contracts) and percentage
+        limits are never scaled. Returns ``self`` unchanged when the account
+        does not compound.
+        """
+
+        if not self.account.compounding:
+            return self
+        initial = self.account.initial_capital_usd
+        scale = max(equity / initial, COMPOUND_SCALE_FLOOR)
+        peak = peak_equity if peak_equity is not None else equity
+        drawdown_scale = max(peak / initial, COMPOUND_SCALE_FLOOR)
+        if scale == 1.0 and drawdown_scale == 1.0:
+            return self
+
+        options = self.options.model_copy(
+            update={
+                "max_contract_cost_usd": round(
+                    self.options.max_contract_cost_usd * scale, 4
+                )
+            }
+        )
+        portfolio = self.portfolio.model_copy(
+            update={
+                "max_total_premium_at_risk_usd": round(
+                    self.portfolio.max_total_premium_at_risk_usd * scale, 4
+                ),
+                "daily_loss_stop_usd": round(
+                    self.portfolio.daily_loss_stop_usd * scale, 4
+                ),
+                "hard_drawdown_stop_usd": round(
+                    self.portfolio.hard_drawdown_stop_usd * drawdown_scale, 4
+                ),
+            }
+        )
+        return self.model_copy(update={"options": options, "portfolio": portfolio})
 
 
 class QuoteSnapshot(BaseModel):

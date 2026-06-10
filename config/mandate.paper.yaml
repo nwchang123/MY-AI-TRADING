@@ -2,6 +2,9 @@ account:
   initial_capital_usd: 100
   live_mode_requires_operator_flag: true
   withdrawal_capability: forbidden
+  # Paper compounds: dollar caps scale with realized equity (win $100 -> trade
+  # like a $200 account; lose -> de-risk). Drawdown is measured from the peak.
+  compounding: true
 
 universe:
   market: US

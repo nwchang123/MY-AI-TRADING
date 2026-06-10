@@ -81,6 +81,12 @@ class PaperTradingCycle:
         self.trd_env = trd_env
         self.max_open_positions_override = max_open_positions_override
         self.news_client = news_client
+        # Refreshed at the start of every cycle: when the account compounds,
+        # these carry the equity-scaled risk caps; otherwise they alias the
+        # injected gate/liquidity unchanged.
+        self.active_mandate = mandate
+        self.active_gate = gate
+        self.active_liquidity = liquidity
         self.orders = OrderManager(
             broker=broker,
             account_id=account_id,
@@ -105,6 +111,7 @@ class PaperTradingCycle:
             self.audit.append("cycle_halted", {"at": now.isoformat()})
             return result
 
+        self._refresh_sizing()
         held_codes = self._reconcile(now, result)
         marks = self._run_exits(now, held_codes, result)
 
@@ -148,9 +155,9 @@ class PaperTradingCycle:
         drawdown = round(max(realized_drawdown, realized_drawdown - unrealized), 4)
 
         reason: str | None = None
-        if daily_total <= -self.mandate.portfolio.daily_loss_stop_usd:
+        if daily_total <= -self.active_mandate.portfolio.daily_loss_stop_usd:
             reason = "daily loss stop"
-        elif drawdown >= self.mandate.portfolio.hard_drawdown_stop_usd:
+        elif drawdown >= self.active_mandate.portfolio.hard_drawdown_stop_usd:
             reason = "hard drawdown stop"
         if reason is None:
             return False
@@ -370,8 +377,8 @@ class PaperTradingCycle:
                 observed_at=now,
                 is_delayed=True,
             )
-            verdict = self.liquidity.validate(
-                quote, self.mandate.options.contracts_per_order, now
+            verdict = self.active_liquidity.validate(
+                quote, self.active_mandate.options.contracts_per_order, now
             )
             if not verdict.passed:
                 continue
@@ -485,7 +492,7 @@ class PaperTradingCycle:
             lot_size=US_OPTION_LOT_SIZE,
             now=now,
         )
-        liquidity_result = self.liquidity.validate(quote, proposal.contracts, now)
+        liquidity_result = self.active_liquidity.validate(quote, proposal.contracts, now)
         self.audit.append(
             "candidate_validated",
             {"ticker": ticker, "option_code": proposal.option_code,
@@ -498,7 +505,7 @@ class PaperTradingCycle:
             return None
 
         portfolio = self._portfolio_state(now, held_codes, proposal)
-        decision = self.gate.evaluate_open(proposal, quote, portfolio, now)
+        decision = self.active_gate.evaluate_open(proposal, quote, portfolio, now)
         self.audit.append(
             "proposal_checked",
             {"option_code": proposal.option_code, "decision": decision.model_dump(mode="json")},
@@ -547,25 +554,83 @@ class PaperTradingCycle:
         return proposal.option_code
 
     # --- helpers --------------------------------------------------------
-    def _realized_pnl(self, now: datetime) -> tuple[float, float, int]:
-        """Return (daily realized P/L, drawdown, consecutive losses) from the ledger."""
+    def _closed_rows(self) -> list[dict[str, Any]]:
+        """Closed ledger rows in close order (ISO timestamps sort correctly)."""
 
-        today = market_date(now)
-        daily_pnl = 0.0
-        total_realized = 0.0
-        consecutive_losses = 0
         closed = [
             r
             for r in self.position_store.all_positions()
             if r["status"] == "closed" and r["exit_price"] is not None
         ]
-        for row in closed:
-            pnl = (row["exit_price"] - row["entry_price"]) * row["contracts"] * row["lot_size"]
-            total_realized += pnl
+        closed.sort(key=lambda r: str(r.get("closed_at") or ""))
+        return closed
+
+    @staticmethod
+    def _row_pnl(row: dict[str, Any]) -> float:
+        return (row["exit_price"] - row["entry_price"]) * row["contracts"] * row["lot_size"]
+
+    def _equity_and_peak(self) -> tuple[float, float]:
+        """Realized equity and its high-water mark, replayed from the ledger.
+
+        Realized-only on purpose: open-position swings must not inflate sizing.
+        """
+
+        equity = self.mandate.account.initial_capital_usd
+        peak = equity
+        for row in self._closed_rows():
+            equity += self._row_pnl(row)
+            peak = max(peak, equity)
+        return round(equity, 4), round(peak, 4)
+
+    def _refresh_sizing(self) -> None:
+        """Re-derive the equity-scaled risk caps at the start of a cycle."""
+
+        equity, peak = self._equity_and_peak()
+        active = self.mandate.scaled_for_equity(equity, peak)
+        self.active_mandate = active
+        if active is self.mandate:
+            self.active_gate = self.gate
+            self.active_liquidity = self.liquidity
+            return
+        self.active_gate = RiskGate(active, self.gate.root_dir)
+        self.active_liquidity = LiquidityValidator(active.options, active.execution)
+        self.audit.append(
+            "risk_caps_scaled",
+            {
+                "equity_usd": equity,
+                "peak_equity_usd": peak,
+                "max_contract_cost_usd": active.options.max_contract_cost_usd,
+                "max_total_premium_at_risk_usd": active.portfolio.max_total_premium_at_risk_usd,
+                "daily_loss_stop_usd": active.portfolio.daily_loss_stop_usd,
+                "hard_drawdown_stop_usd": active.portfolio.hard_drawdown_stop_usd,
+            },
+        )
+
+    def _realized_pnl(self, now: datetime) -> tuple[float, float, int]:
+        """Return (daily realized P/L, drawdown, consecutive losses) from the ledger.
+
+        A compounding account measures drawdown from the equity peak (the hard
+        stop means "this far off the high-water mark"); a fixed account keeps
+        the original below-initial-capital meaning.
+        """
+
+        today = market_date(now)
+        daily_pnl = 0.0
+        consecutive_losses = 0
+        equity = self.mandate.account.initial_capital_usd
+        peak = equity
+        for row in self._closed_rows():
+            pnl = self._row_pnl(row)
+            equity += pnl
+            peak = max(peak, equity)
             if row.get("closed_at") and self._date_of(row["closed_at"]) == today:
                 daily_pnl += pnl
             consecutive_losses = consecutive_losses + 1 if pnl < 0 else 0
-        return round(daily_pnl, 4), round(max(0.0, -total_realized), 4), consecutive_losses
+        reference = peak if self.mandate.account.compounding else (
+            self.mandate.account.initial_capital_usd
+        )
+        drawdown = max(0.0, reference - equity)
+        return round(daily_pnl, 4), round(drawdown, 4), consecutive_losses
 
     def _portfolio_state(
         self, now: datetime, held_codes: set[str], proposal: OpenPositionProposal

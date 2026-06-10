@@ -501,6 +501,106 @@ def test_cooldown_blocks_entries_after_consecutive_losses(tmp_path: Path) -> Non
     assert broker.placed == []
 
 
+def _seed_closed(store: PositionStore, code: str, entry: float, exit_price: float) -> None:
+    _seed_open(store, code)
+    store.mark_closed(code, close_reason="test", exit_price=exit_price)
+    # _seed_open uses entry 0.20; adjust by reopening with the wanted entry.
+    if entry != 0.20:
+        with store._connect() as conn:  # noqa: SLF001 - test seeding
+            conn.execute(
+                "UPDATE positions SET entry_price=? WHERE option_code=?", (entry, code)
+            )
+
+
+def test_compounding_win_unlocks_bigger_contracts(tmp_path: Path) -> None:
+    # A realized +$100 win doubles equity; the $25 contract cap scales to $50,
+    # so a $0.40-ask contract (cost ~$41) becomes tradeable. The paper mandate
+    # has compounding: true.
+    store = PositionStore(tmp_path / "positions.sqlite")
+    _seed_closed(store, "US.WIN260626C00005000", entry=0.20, exit_price=1.20)  # +100
+
+    broker = FakeBroker()
+    cycle = _cycle(
+        tmp_path,
+        broker=broker,
+        market=FakeMarket(bid=0.38, ask=0.40),
+        committee=_committee(_open_responses()),
+        store=store,
+    )
+    result = cycle.run_once(["EXAMPLE"])
+
+    assert broker.placed == [("buy", OPTION_CODE)]
+    assert result.entries
+    assert cycle.active_mandate.options.max_contract_cost_usd == 50.0
+
+
+def test_fixed_mandate_rejects_what_compounding_allows(tmp_path: Path) -> None:
+    # Same +$100 win and same $0.40-ask contract, but compounding off: the
+    # static $25 cap rejects it at the liquidity stage.
+    store = PositionStore(tmp_path / "positions.sqlite")
+    _seed_closed(store, "US.WIN260626C00005000", entry=0.20, exit_price=1.20)
+
+    mandate = _mandate()
+    account = mandate.account.model_copy(update={"compounding": False})
+    mandate = mandate.model_copy(update={"account": account})
+    broker = FakeBroker()
+    cycle = PaperTradingCycle(
+        mandate=mandate,
+        account_id=123,
+        market=FakeMarket(bid=0.38, ask=0.40),
+        broker=broker,
+        sec_client=FakeSec(),
+        committee=_committee([]),  # never reached: no candidate passes the cap
+        gate=RiskGate(mandate, tmp_path),
+        liquidity=LiquidityValidator(mandate.options, mandate.execution),
+        position_store=store,
+        audit=AuditWriter(tmp_path / "audit.jsonl"),
+        now_fn=lambda: NOW,
+        order_poll_interval_seconds=0.1,
+        sleep_fn=lambda _seconds: None,
+    )
+    result = cycle.run_once(["EXAMPLE"])
+
+    assert broker.placed == []
+    assert any(r["stage"] == "no_eligible_contracts" for r in result.rejected)
+
+
+def test_compounding_drawdown_measured_from_peak(tmp_path: Path) -> None:
+    # Win +$100 (peak 200) then lose $60 back (equity 140). Versus initial
+    # capital that is a GAIN, but versus the peak it is a $60 drawdown, beyond
+    # the scaled stop (25 x 2 = 50): the circuit breaker must halt. Both closes
+    # happened "yesterday" relative to the cycle clock, so the daily stop stays
+    # quiet and the drawdown logic is what trips.
+    from datetime import timedelta
+
+    store = PositionStore(tmp_path / "positions.sqlite")
+    _seed_closed(store, "US.WIN260626C00005000", entry=0.20, exit_price=1.20)  # +100
+    _seed_closed(store, "US.LOSS260626C00005000", entry=0.80, exit_price=0.20)  # -60
+
+    broker = FakeBroker()
+    mandate = _mandate()
+    cycle = PaperTradingCycle(
+        mandate=mandate,
+        account_id=123,
+        market=FakeMarket(),
+        broker=broker,
+        sec_client=FakeSec(),
+        committee=_committee([]),
+        gate=RiskGate(mandate, tmp_path),
+        liquidity=LiquidityValidator(mandate.options, mandate.execution),
+        position_store=store,
+        audit=AuditWriter(tmp_path / "audit.jsonl"),
+        now_fn=lambda: datetime.now(timezone.utc) + timedelta(days=1),
+        order_poll_interval_seconds=0.1,
+        sleep_fn=lambda _seconds: None,
+    )
+    result = cycle.run_once(["EXAMPLE"])
+
+    assert result.circuit_breaker == "hard drawdown stop"
+    assert (tmp_path / "runtime" / "HALT").exists()
+    assert broker.placed == []
+
+
 def test_circuit_breaker_trips_halt_and_blocks_entries(tmp_path: Path) -> None:
     store = PositionStore(tmp_path / "positions.sqlite")
     # Two realized losses of -$15 each, closed today => daily P/L -$30 trips the
