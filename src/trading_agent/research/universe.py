@@ -7,8 +7,15 @@ from trading_agent.domain.risk import UniverseMandate
 # Each optionability probe downloads a full option chain from the data feed, so
 # only the most liquid scan hits are probed. Liquidity (turnover) ranking comes
 # first because an optionable-but-dead name is useless to the strategy anyway.
-DEFAULT_MAX_TICKERS = 10
-DEFAULT_PROBE_LIMIT = 30
+#
+# Breadth over frequency: most top-turnover names have NO mandate-eligible
+# contract (cheap enough, tight spread, OI/volume), so a wide per-cycle sweep
+# finds far more opportunities than re-evaluating the same short list more
+# often (which the decision cache would just serve unchanged). Names with no
+# tradeable contract are dropped by the free liquidity filter -- only genuinely
+# tradeable ones reach the LLM committee -- so a wider sweep is nearly free.
+DEFAULT_MAX_TICKERS = 25
+DEFAULT_PROBE_LIMIT = 60
 
 
 def select_universe(
