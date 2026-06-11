@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from trading_agent.backtest import run_backtest_file
-from trading_agent.brokers.moomoo import MoomooBroker, MoomooConnection
+from trading_agent.brokers.moomoo import (
+    MoomooBroker,
+    MoomooConnection,
+    assert_opend_reachable,
+)
 from trading_agent.data.moomoo_market import MoomooMarket
 from trading_agent.data.news_feeds import GoogleNewsClient
 from trading_agent.data.option_data import OptionDataProvider, build_option_provider
@@ -337,6 +341,7 @@ def _run_cycle(settings: Settings, tickers: list[str]) -> None:
         raise RuntimeError(
             "run-cycle requires a pinned account: set TRADING_AGENT_ACCOUNT_ID."
         )
+    assert_opend_reachable(settings.moomoo_host, settings.moomoo_port)
     with single_instance_lock(_cycle_lock_path(settings)):
         result = _build_cycle(settings, trd_env="SIMULATE").run_once(tickers)
     _alert_cycle(settings, result)
@@ -419,6 +424,9 @@ def _run_loop(
         # the fixed interval below means this cannot become a tight retry loop.
         _write_heartbeat(settings, "cycle start")
         try:
+            # Fail fast on a dead gateway: the SDK would otherwise retry the
+            # connection forever and silently hang the whole session.
+            assert_opend_reachable(settings.moomoo_host, settings.moomoo_port)
             tickers = tickers_fn()
             with single_instance_lock(_cycle_lock_path(settings)):
                 result = _build_cycle(settings, trd_env="SIMULATE").run_once(tickers)

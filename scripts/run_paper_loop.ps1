@@ -14,6 +14,13 @@ param(
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+# Revive the Telegram control bot if sleep/reboot killed it since logon (its
+# own single-instance guard makes this a no-op when it is already running).
+Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
+    "-NoProfile", "-ExecutionPolicy", "Bypass",
+    "-File", (Join-Path $PSScriptRoot "run_bot.ps1")
+)
+
 $logDir = Join-Path $root "runtime\logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $log = Join-Path $logDir ("loop-{0:yyyy-MM-dd}.log" -f (Get-Date))

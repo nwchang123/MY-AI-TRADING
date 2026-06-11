@@ -1,6 +1,14 @@
-# Launched by the "TradingAgent-Bot" scheduled task at logon. Keeps the
-# Telegram control bot alive: if the listener crashes (network blip, machine
-# resume), it restarts after 10s. Only the operator's chat id is answered.
+# Launched by the Startup-folder TradingAgent-Bot.vbs at logon, and revived
+# by run_paper_loop.ps1 every trading evening. Keeps the Telegram control bot
+# alive: if the listener crashes, it restarts after 10s. A single-instance
+# guard makes multiple launchers safe (duplicate getUpdates consumers would
+# 409 against each other).
+$existing = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
+    Where-Object { $_.CommandLine -match "trading_agent\s+bot" }
+if ($existing) {
+    exit 0
+}
+
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 

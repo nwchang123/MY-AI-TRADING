@@ -2,7 +2,31 @@ from types import SimpleNamespace
 
 import pytest
 
-from trading_agent.brokers.moomoo import MoomooBroker, MoomooConnection
+from trading_agent.brokers.moomoo import (
+    MoomooBroker,
+    MoomooBrokerError,
+    MoomooConnection,
+    assert_opend_reachable,
+)
+
+
+def test_preflight_raises_on_dead_gateway() -> None:
+    # Nothing listens on this port: the preflight must fail fast (the SDK
+    # itself would retry a refused connection forever).
+    with pytest.raises(MoomooBrokerError, match="not reachable"):
+        assert_opend_reachable("127.0.0.1", 1, timeout=0.5)
+
+
+def test_preflight_passes_with_listener() -> None:
+    import socket
+
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    try:
+        assert_opend_reachable("127.0.0.1", server.getsockname()[1], timeout=1.0)
+    finally:
+        server.close()
 
 
 class FakeFrame:

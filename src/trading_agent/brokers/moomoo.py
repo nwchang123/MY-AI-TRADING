@@ -8,6 +8,27 @@ class MoomooBrokerError(RuntimeError):
     """Raised when OpenD or the SDK rejects a broker request."""
 
 
+def assert_opend_reachable(host: str, port: int, timeout: float = 3.0) -> None:
+    """Fast TCP preflight for the OpenD gateway.
+
+    The moomoo SDK retries a refused connection indefinitely instead of
+    raising (observed live: 300+ retries, cycle hung, no alert). Checking the
+    socket first turns a dead gateway into an immediate, alertable error and
+    lets the loop keep ticking until OpenD comes back.
+    """
+
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return
+    except OSError as exc:
+        raise MoomooBrokerError(
+            f"OpenD gateway is not reachable on {host}:{port} -- "
+            "start/log in the OpenD GUI"
+        ) from exc
+
+
 @dataclass(frozen=True)
 class MoomooConnection:
     host: str
