@@ -72,6 +72,18 @@ def test_approves_proposal_inside_mandate(tmp_path: Path) -> None:
     assert result.estimated_contract_cost_usd == 21
 
 
+def test_rejects_low_estimated_win_probability(tmp_path: Path) -> None:
+    # Paper mandate floor is 0.55; the proposal's confidence is the PM's win
+    # estimate, so 0.4 must be rejected even if everything else is fine.
+    low = _proposal().model_copy(update={"confidence": 0.4})
+    result = RiskGate(_mandate(), tmp_path).evaluate_open(
+        low, _quote(), _portfolio(), NOW
+    )
+
+    assert result.approved is False
+    assert "estimated win probability below mandate minimum" in result.reasons
+
+
 def test_rejects_wide_spread(tmp_path: Path) -> None:
     result = RiskGate(_mandate(), tmp_path).evaluate_open(
         _proposal(), _quote(bid=0.10, ask=0.21), _portfolio(), NOW

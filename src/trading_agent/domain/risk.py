@@ -52,6 +52,11 @@ class OptionsMandate(BaseModel):
     reject_auto_exercise: bool
     force_close_before_expiry_trading_days: int = Field(ge=0)
     fee_buffer_usd: float = Field(ge=0)
+    # Minimum estimated win probability for an entry. Both model lineages
+    # (committee analysts AND the cross-provider adversary roles) must estimate
+    # at least this probability of the trade reaching take-profit; the most
+    # pessimistic estimate is the binding one. 0 disables the check.
+    min_estimated_win_probability: float = Field(default=0.0, ge=0, le=1)
 
 
 class PortfolioMandate(BaseModel):
@@ -239,6 +244,13 @@ class RiskGate:
         dte = (quote.expiry - current_time.date()).days
         if not self.mandate.options.min_dte <= dte <= self.mandate.options.max_dte:
             reasons.append("days to expiry violate mandate")
+
+        # Deterministic backstop for the committee's own probability check: the
+        # proposal's confidence is the PM's estimated win probability, and a
+        # proposal below the mandate floor can never reach the broker even if
+        # the committee-side check were bypassed.
+        if proposal.confidence < self.mandate.options.min_estimated_win_probability:
+            reasons.append("estimated win probability below mandate minimum")
 
         if proposal.limit_price > proposal.max_limit_price:
             reasons.append("limit price exceeds proposal maximum")

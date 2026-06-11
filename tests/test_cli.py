@@ -46,14 +46,20 @@ def test_adversary_client_built_when_model_set(tmp_path: Path) -> None:
 
 
 def test_build_committee_wires_distinct_adversary(tmp_path: Path) -> None:
-    committee = _build_committee(_settings(tmp_path, llm_adversary_model="gemini-2.0-flash"))
+    # _build_committee reads the mandate (win-probability floor), so the
+    # settings must point at a root that has config/mandate.paper.yaml.
+    committee = _build_committee(
+        _settings(tmp_path, root_dir=ROOT, llm_adversary_model="gemini-2.0-flash")
+    )
     assert committee.adversary_client is not committee.client
     assert committee.adversary_client.model == "gemini-2.0-flash"
 
 
 def test_build_committee_falls_back_without_adversary(tmp_path: Path) -> None:
-    committee = _build_committee(_settings(tmp_path))
+    committee = _build_committee(_settings(tmp_path, root_dir=ROOT))
     assert committee.adversary_client is committee.client
+    # The mandate's win-probability floor is threaded into the committee.
+    assert committee.min_win_probability == 0.55
 
 
 def _offline_input(tmp_path: Path, *, bid: float = 0.19) -> Path:

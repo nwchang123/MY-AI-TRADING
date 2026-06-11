@@ -145,10 +145,12 @@ def _adversary_client(settings: Settings) -> OpenAICompatibleClient | None:
 
 
 def _build_committee(settings: Settings) -> Committee:
+    mandate = Mandate.load(settings.mandate_path)
     return Committee(
         _llm_client(settings, settings.llm_model),
         _llm_client(settings, settings.llm_model_pro),
         adversary_client=_adversary_client(settings),
+        min_win_probability=mandate.options.min_estimated_win_probability,
     )
 
 

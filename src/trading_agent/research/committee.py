@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -63,6 +64,16 @@ _PM_CANDIDATE_RULE = (
     " in the briefing. Do not invent or modify a contract code."
 )
 
+# Both adversary roles must end with an independent win-probability estimate.
+# It is parsed deterministically and the LOWEST estimate across both model
+# lineages must clear the mandate floor, so one optimistic model cannot trade.
+_WIN_PROB_RULE = (
+    "\nEnd your reply with a line 'WIN_PROB: 0.NN' -- your honest, independent"
+    " estimate of the probability that the proposed trade reaches its take-profit"
+    " before its stop-loss or time stop. Be calibrated: most short-dated OTM"
+    " option trades lose, so estimates above 0.6 should be rare."
+)
+
 _SKEPTIC_SYSTEM = (
     _COMMON_RULES
     + "\n\nRole: skeptic. Hunt for dilution, ATM shelves, insider selling, stale"
@@ -70,6 +81,7 @@ _SKEPTIC_SYSTEM = (
     " red flags already computed by code; treat them as confirmed facts and weigh"
     " them rather than re-deriving them. If the trade should not proceed, begin"
     f" your reply with '{VETO_PREFIX}:' followed by the reason."
+    + _WIN_PROB_RULE
 )
 
 _RISK_SYSTEM = (
@@ -78,6 +90,7 @@ _RISK_SYSTEM = (
     " bounded or the catalyst window is unclear. Weigh the deterministic red flags"
     " in the briefing. If risk is unacceptable, begin your reply with"
     f" '{VETO_PREFIX}:' followed by the reason."
+    + _WIN_PROB_RULE
 )
 
 _PM_SYSTEM = (
@@ -94,8 +107,32 @@ _PM_SYSTEM = (
     ' {"take_profit_pct", "stop_loss_pct", "time_stop": "YYYY-MM-DD"},'
     ' "invalidation": [..]}.\n'
     "Every evidence_id MUST come from the supplied evidence. If a skeptic or"
-    " risk_manager veto stands, do not open a position."
+    " risk_manager veto stands, do not open a position.\n"
+    "'confidence' is your honest estimated probability that the trade reaches"
+    " its take-profit before its stop-loss or time stop. Be calibrated: most"
+    " short-dated OTM option trades lose; do not inflate it."
 )
+
+
+_WIN_PROB_RE = re.compile(r"WIN_PROB\s*[:：]\s*(\d+(?:\.\d+)?)\s*(%?)", re.IGNORECASE)
+
+
+def parse_win_prob(text: str) -> float | None:
+    """Extract the last 'WIN_PROB: 0.NN' (or 'NN%') estimate from a role reply.
+
+    Returns None when the role failed to provide one; the caller treats a
+    missing estimate as 0.0 (most conservative) so forgetting the format can
+    never let a trade through.
+    """
+
+    matches = _WIN_PROB_RE.findall(text or "")
+    if not matches:
+        return None
+    raw, pct = matches[-1]
+    value = float(raw)
+    if pct or value > 1.0:
+        value /= 100.0
+    return max(0.0, min(1.0, value))
 
 
 class RoleNote(BaseModel):
@@ -117,6 +154,11 @@ class CommitteeOutput(BaseModel):
     vetoes: list[str]
     llm_calls: int
     red_flags: list[RedFlag] = []
+    # Per-role win-probability estimates (pm = proposal confidence) and the
+    # binding minimum across both model lineages. Audited for later
+    # calibration review: did high-estimate trades actually win more often?
+    win_estimates: dict[str, float | None] = {}
+    win_probability: float | None = None
 
 
 class Committee:
@@ -140,10 +182,14 @@ class Committee:
         client: LLMClient,
         pro_client: LLMClient | None = None,
         adversary_client: LLMClient | None = None,
+        min_win_probability: float = 0.0,
     ):
         self.client = client
         self.pro_client = pro_client or client
         self.adversary_client = adversary_client or client
+        # Floor for the LOWEST win-probability estimate across both model
+        # lineages (skeptic, risk_manager, PM confidence). 0 disables.
+        self.min_win_probability = min_win_probability
 
     def usage_total(self) -> LlmUsage:
         """Aggregate token/call usage across the distinct clients in use.
@@ -271,8 +317,19 @@ class Committee:
                 red_flags=red_flags,
             )
 
+        adversary_estimates = {
+            "skeptic": parse_win_prob(skeptic),
+            "risk_manager": parse_win_prob(risk),
+        }
         return self._finalize(
-            pm_raw, context, notes, vetoes, calls, red_flags, candidate_codes
+            pm_raw,
+            context,
+            notes,
+            vetoes,
+            calls,
+            red_flags,
+            candidate_codes,
+            adversary_estimates,
         )
 
     def _finalize(
@@ -284,6 +341,7 @@ class Committee:
         calls: int,
         red_flags: list[RedFlag],
         candidate_codes: set[str] | None = None,
+        adversary_estimates: dict[str, float | None] | None = None,
     ) -> CommitteeOutput:
         def reject(rationale: str) -> CommitteeOutput:
             return CommitteeOutput(
@@ -340,6 +398,27 @@ class Committee:
                 "candidate contract list"
             )
 
+        estimates: dict[str, float | None] = dict(adversary_estimates or {})
+        estimates["portfolio_manager"] = proposal.confidence
+        # The most pessimistic estimate across both lineages is binding; a role
+        # that failed to provide one counts as 0 so a formatting miss can never
+        # let a trade through.
+        win_probability = min(
+            (value if value is not None else 0.0) for value in estimates.values()
+        )
+        if self.min_win_probability > 0 and win_probability < self.min_win_probability:
+            detail = ", ".join(
+                f"{role}={'?' if value is None else value}"
+                for role, value in sorted(estimates.items())
+            )
+            output = reject(
+                f"estimated win probability {win_probability:.2f} is below the "
+                f"mandate minimum {self.min_win_probability:.2f} ({detail})"
+            )
+            output.win_estimates = estimates
+            output.win_probability = win_probability
+            return output
+
         return CommitteeOutput(
             decision="open_position",
             rationale=proposal.thesis,
@@ -348,6 +427,8 @@ class Committee:
             vetoes=vetoes,
             llm_calls=calls,
             red_flags=red_flags,
+            win_estimates=estimates,
+            win_probability=win_probability,
         )
 
     @staticmethod

@@ -3,7 +3,7 @@ from datetime import date, datetime, timezone
 
 from trading_agent.domain.evidence import CandidateContext, EvidenceItem
 from trading_agent.domain.proposals import OptionCandidate
-from trading_agent.research.committee import Committee
+from trading_agent.research.committee import Committee, parse_win_prob
 from trading_agent.research.llm import MockLLMClient
 from trading_agent.research.scoring import ScoreInputs, score_candidate
 
@@ -146,6 +146,79 @@ def test_json_code_fences_are_stripped() -> None:
     out = _run(["c", "o", "fine", "fine", fenced])
     assert out.decision == "open_position"
     assert out.proposal is not None
+
+
+def test_parse_win_prob_variants() -> None:
+    assert parse_win_prob("analysis...\nWIN_PROB: 0.55") == 0.55
+    assert parse_win_prob("win_prob: 55%") == 0.55
+    assert parse_win_prob("WIN_PROB: 70") == 0.70  # bare number above 1 -> percent
+    assert parse_win_prob("WIN_PROB：0.4") == 0.4  # full-width colon
+    assert parse_win_prob("first WIN_PROB: 0.3 then WIN_PROB: 0.6") == 0.6  # last wins
+    assert parse_win_prob("no estimate here") is None
+    assert parse_win_prob("") is None
+
+
+def _run_with_threshold(responses: list[str], threshold: float):
+    client = MockLLMClient(responses)
+    committee = Committee(client, min_win_probability=threshold)
+    return committee.run(_context(), _scores())
+
+
+def test_win_probability_floor_passes_confident_trade() -> None:
+    out = _run_with_threshold(
+        [
+            "catalyst",
+            "options",
+            "looks fine\nWIN_PROB: 0.65",
+            "acceptable\nWIN_PROB: 0.60",
+            json.dumps(_PROPOSAL),  # PM confidence 0.7
+        ],
+        threshold=0.55,
+    )
+    assert out.decision == "open_position"
+    assert out.win_probability == 0.60  # the lowest estimate binds
+    assert out.win_estimates["risk_manager"] == 0.60
+    assert out.win_estimates["portfolio_manager"] == 0.7
+
+
+def test_one_pessimistic_lineage_blocks_the_trade() -> None:
+    out = _run_with_threshold(
+        [
+            "catalyst",
+            "options",
+            "weak setup\nWIN_PROB: 0.30",  # skeptic (adversary lineage) says no
+            "acceptable\nWIN_PROB: 0.70",
+            json.dumps(_PROPOSAL),
+        ],
+        threshold=0.55,
+    )
+    assert out.decision == "reject"
+    assert "0.30" in out.rationale and "0.55" in out.rationale
+    assert out.win_probability == 0.30
+
+
+def test_missing_win_prob_counts_as_zero() -> None:
+    out = _run_with_threshold(
+        [
+            "catalyst",
+            "options",
+            "looks fine",  # forgot WIN_PROB -> treated as 0
+            "acceptable\nWIN_PROB: 0.70",
+            json.dumps(_PROPOSAL),
+        ],
+        threshold=0.55,
+    )
+    assert out.decision == "reject"
+    assert out.win_probability == 0.0
+    assert out.win_estimates["skeptic"] is None
+
+
+def test_zero_threshold_disables_the_check() -> None:
+    out = _run_with_threshold(
+        ["catalyst", "options", "fine", "fine", json.dumps(_PROPOSAL)],
+        threshold=0.0,
+    )
+    assert out.decision == "open_position"
 
 
 def test_candidate_mode_accepts_listed_code() -> None:

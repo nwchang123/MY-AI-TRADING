@@ -1,4 +1,4 @@
-account:
+﻿account:
   initial_capital_usd: 100
   live_mode_requires_operator_flag: true
   withdrawal_capability: forbidden
@@ -31,6 +31,8 @@ options:
   reject_auto_exercise: true
   force_close_before_expiry_trading_days: 2
   fee_buffer_usd: 1
+  # Both AI lineages must estimate at least this win probability (lowest binds).
+  min_estimated_win_probability: 0.55
 
 portfolio:
   max_open_positions: 1
