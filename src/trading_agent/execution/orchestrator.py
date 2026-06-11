@@ -14,8 +14,9 @@ from trading_agent.execution.orders import OrderManager
 from trading_agent.domain.proposals import OpenPositionProposal, OptionCandidate
 from trading_agent.domain.risk import Mandate, PortfolioState, QuoteSnapshot, RiskGate
 from trading_agent.research.catalysts import build_candidate_context, derive_score_inputs
-from trading_agent.research.committee import Committee
+from trading_agent.research.committee import Committee, CommitteeOutput
 from trading_agent.research.llm import usage_delta
+from trading_agent.storage.decisions import DecisionCache, decision_digest
 from trading_agent.research.scoring import score_candidate
 from trading_agent.storage.audit import AuditWriter
 from trading_agent.storage.positions import PositionStore
@@ -66,6 +67,7 @@ class PaperTradingCycle:
         order_poll_interval_seconds: float = 2.0,
         sleep_fn: Callable[[float], None] | None = None,
         news_client: Any | None = None,
+        decision_cache: DecisionCache | None = None,
     ):
         if trd_env not in {"SIMULATE", "REAL"}:
             raise ValueError("trd_env must be 'SIMULATE' or 'REAL'")
@@ -83,6 +85,7 @@ class PaperTradingCycle:
         self.trd_env = trd_env
         self.max_open_positions_override = max_open_positions_override
         self.news_client = news_client
+        self.decision_cache = decision_cache
         # Refreshed at the start of every cycle: when the account compounds,
         # these carry the equity-scaled risk caps; otherwise they alias the
         # injected gate/liquidity unchanged.
@@ -526,16 +529,43 @@ class PaperTradingCycle:
         evidence = self._gather_evidence(ticker, result)
         context = build_candidate_context(ticker, evidence, now)
         scores = score_candidate(derive_score_inputs(context.evidence, now))
-        before = self.committee.usage_total()
-        output = self.committee.run(
-            context, scores, candidates=candidates, market_snapshot=snapshot
+
+        # When the evidence and the eligible contract list are unchanged since
+        # the committee last reasoned about this ticker, reuse that decision
+        # instead of spending five LLM calls re-deriving it. Liquidity and the
+        # risk gate still re-validate fresh quotes downstream on every pass.
+        digest = decision_digest(
+            ticker,
+            [e.evidence_id for e in context.evidence],
+            [c.option_code for c in candidates],
         )
-        usage = usage_delta(before, self.committee.usage_total())
-        self.audit.append(
-            "committee_run",
-            {"ticker": ticker, "decision": output.decision, "output": output.model_dump(mode="json")},
-        )
-        self.audit.append("llm_usage", {"ticker": ticker, **usage.model_dump(mode="json")})
+        output: CommitteeOutput | None = None
+        if self.decision_cache is not None:
+            cached = self.decision_cache.get(ticker, digest, now)
+            if cached is not None:
+                try:
+                    output = CommitteeOutput.model_validate_json(cached)
+                except ValueError:
+                    output = None
+                if output is not None:
+                    self.audit.append(
+                        "committee_cache_hit",
+                        {"ticker": ticker, "decision": output.decision,
+                         "digest": digest[:16]},
+                    )
+        if output is None:
+            before = self.committee.usage_total()
+            output = self.committee.run(
+                context, scores, candidates=candidates, market_snapshot=snapshot
+            )
+            usage = usage_delta(before, self.committee.usage_total())
+            self.audit.append(
+                "committee_run",
+                {"ticker": ticker, "decision": output.decision, "output": output.model_dump(mode="json")},
+            )
+            self.audit.append("llm_usage", {"ticker": ticker, **usage.model_dump(mode="json")})
+            if self.decision_cache is not None:
+                self.decision_cache.put(ticker, digest, output.model_dump_json(), now)
         if output.decision != "open_position" or output.proposal is None:
             return None
 

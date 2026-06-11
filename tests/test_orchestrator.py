@@ -301,6 +301,34 @@ def test_take_profit_exit_closes_position(tmp_path: Path) -> None:
     assert store.open_positions() == []
 
 
+def test_decision_cache_skips_committee_on_unchanged_inputs(tmp_path: Path) -> None:
+    from trading_agent.storage.decisions import DecisionCache
+
+    cache = DecisionCache(tmp_path / "decisions.json")
+    # First cycle: committee runs (consumes the 5 mock responses), decision
+    # ("reject" via hold) is cached.
+    cycle1 = _cycle(
+        tmp_path,
+        broker=FakeBroker(),
+        market=FakeMarket(),
+        committee=_committee(
+            ["c", "o", "fine", "fine", json.dumps({"decision": "hold", "rationale": "wait"})]
+        ),
+    )
+    cycle1.decision_cache = cache
+    cycle1.run_once(["EXAMPLE"])
+
+    # Second cycle, same evidence + same candidates: an empty MockLLMClient
+    # would raise on any call, proving the committee was never invoked.
+    cycle2 = _cycle(
+        tmp_path, broker=FakeBroker(), market=FakeMarket(), committee=_committee([])
+    )
+    cycle2.decision_cache = cache
+    result = cycle2.run_once(["EXAMPLE"])
+
+    assert result.errors == []  # no committee call -> no mock exhaustion error
+
+
 def test_same_underlying_second_strike_is_rejected(tmp_path: Path) -> None:
     # Already long EXAMPLE at strike 5; the committee proposes ANOTHER EXAMPLE
     # strike. The concentration rule must block it even though the option code
