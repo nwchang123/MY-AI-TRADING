@@ -57,6 +57,7 @@ Write-Host ("  Telegram 机器人  : " + $(if ($bot) { "运行中 (pid $($bot.Pr
 Write-Host ("  交易循环         : " + $(if ($loop) { "运行中 (pid $($loop.ProcessId)) ✓" } else { "启动中..." }))
 Write-Host ""
 Write-Host "全部就绪。手机 Telegram 会收到上线通知;有交易动作会推送给你。"
+Write-Host "(各组件在后台隐藏运行;想看实时活动请双击 Watch-TradingAgent)"
 Write-Host "==========================================================="
 Write-Host ""
-Start-Sleep -Seconds 4
+Read-Host "按 Enter 键关闭此窗口（后台继续运行）"
