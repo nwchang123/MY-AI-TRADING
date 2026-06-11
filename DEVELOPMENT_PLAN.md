@@ -470,6 +470,44 @@ Exit criteria:
 - Increase to the mandate maximum of two positions only after execution,
   fee, and exit behavior are verified.
 
+### Phase 7: Hardening And Edge Measurement (added 2026-06-11)
+
+Delivered beyond the original plan (all live-verified, on
+`feature/agent-hardening`):
+
+- Free delayed option data (CBOE primary, Tradier fallback) decoupled from
+  Moomoo execution; Moomoo option-code and filter-field fixes found live.
+- Committee picks from liquidity-validated real-chain candidates; underlying
+  price/IV snapshot in the briefing; Google News RSS evidence; autonomous
+  universe selection (`--auto-universe`).
+- Compounding risk caps (equity-scaled, peak-referenced drawdown).
+- Triple probability gate: dual-lineage AI WIN_PROB floor (0.55) plus
+  deterministic Monte Carlo baseline POP floor (0.20).
+- Ops pack: Chinese Telegram alerts, loop crash absorption, heartbeat,
+  dated backups.
+
+Roadmap, in priority order (P0 before/at run start; P1 during the
+20-session run; P2 after first results):
+
+| # | Item | Why | Pri |
+|---|---|---|---|
+| 1 | Evidence-hash committee cache | run-loop re-runs the committee every 30 min on unchanged evidence; hashing evidence+candidates and reusing the last decision cuts most LLM spend of the run | P0 |
+| 2 | Decision review / calibration report | weekly: rejected vs taken candidates' subsequent moves; calibration of AI WIN_PROB and MC POP against outcomes — the run's true deliverable | P0 |
+| 3 | One-position-per-underlying rule | the duplicate check is per option code; two strikes on one ticker can double concentration | P1 |
+| 4 | Orphan position adoption | a fill recorded at the broker but missed by the ledger (crash window) is currently unmanaged; reconcile should adopt it | P1 |
+| 5 | Smart limit laddering | enter at mid, chase toward ask within max_limit_chase_pct on timeout; halves entry friction on $0.10-0.25 tickets | P1 |
+| 6 | Bull/bear debate round | one rebuttal round (analyst answers skeptic) before the PM; +2 LLM calls per candidate | P1 |
+| 7 | Earnings-calendar red flag | hard date for IV-crush detection instead of keyword heuristics | P1 |
+| 8 | quantstats-style performance page | equity curve, drawdown, per-catalyst attribution for the go/no-go review | P1 |
+| 9 | Self-built IV history | persist each scan's iv30 snapshots; ~20 sessions yields a proprietary IV-rank signal | P2 |
+| 10 | Historical options backtest | replay strategy on real history (e.g. Alpha Vantage HISTORICAL_OPTIONS, lumibot) to estimate EV before scaling capital | P2 |
+| 11 | Exit engine v2 | trailing stop / dynamic targets, tested against v1 in paper | P2 |
+| 12 | Kelly-fraction sizing | only meaningful once compounding lifts equity enough for multi-contract sizing | P2 |
+
+Operator items (not code): run the 20-session paper shadow (run-loop),
+apply for the live US options account, rotate the DeepSeek key and Telegram
+bot token that appeared in chat.
+
 ## 9. Test Strategy
 
 ### Unit Tests
