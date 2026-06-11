@@ -20,6 +20,7 @@ from trading_agent.domain.proposals import OpenPositionProposal
 from trading_agent.domain.risk import Mandate, PortfolioState, QuoteSnapshot, RiskGate
 from trading_agent.execution.live import LIVE_UNLOCK_CHECKLIST, live_position_cap
 from trading_agent.execution.lock import single_instance_lock
+from trading_agent.notify import TelegramNotifier, format_cycle_alert
 from trading_agent.execution.orchestrator import PaperTradingCycle
 from trading_agent.execution.scheduler import run_scheduler
 from trading_agent.reporting import build_daily_report, read_audit_events
@@ -323,7 +324,32 @@ def _run_cycle(settings: Settings, tickers: list[str]) -> None:
         )
     with single_instance_lock(_cycle_lock_path(settings)):
         result = _build_cycle(settings, trd_env="SIMULATE").run_once(tickers)
+    _alert_cycle(settings, result)
     _print_json(_cycle_payload(result))
+
+
+def _notifier(settings: Settings) -> TelegramNotifier | None:
+    if not settings.telegram_bot_token or not settings.telegram_chat_id:
+        return None
+    return TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
+
+
+def _alert_cycle(settings: Settings, result: Any) -> None:
+    notifier = _notifier(settings)
+    if notifier is None:
+        return
+    text = format_cycle_alert(result, mode=settings.mode)
+    if text:
+        notifier.send(text)
+
+
+def _write_heartbeat(settings: Settings, note: str) -> None:
+    """Liveness marker for the unattended loop (stale file = dead process)."""
+
+    path = settings.root_dir / "runtime" / "heartbeat.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"at": datetime.now(timezone.utc).isoformat(), "note": note}
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _auto_universe(settings: Settings, max_tickers: int) -> list[str]:
@@ -367,16 +393,41 @@ def _run_loop(
             "run-loop requires a pinned account: set TRADING_AGENT_ACCOUNT_ID."
         )
 
+    notifier = _notifier(settings)
+
     def run_cycle() -> None:
         # Resolved per tick so an auto universe follows the market day by day.
-        tickers = tickers_fn()
-        with single_instance_lock(_cycle_lock_path(settings)):
-            result = _build_cycle(settings, trd_env="SIMULATE").run_once(tickers)
+        # A crashed cycle is alerted and absorbed: one transient failure (OpenD
+        # restart, feed outage) must not kill a multi-week unattended run, and
+        # the fixed interval below means this cannot become a tight retry loop.
+        _write_heartbeat(settings, "cycle start")
+        try:
+            tickers = tickers_fn()
+            with single_instance_lock(_cycle_lock_path(settings)):
+                result = _build_cycle(settings, trd_env="SIMULATE").run_once(tickers)
+        except Exception as exc:  # noqa: BLE001
+            _audit_writer(settings).append("cycle_crashed", {"error": str(exc)})
+            print(f"cycle crashed: {exc}", file=sys.stderr)
+            if notifier is not None:
+                notifier.send(f"[{settings.mode}] cycle CRASHED: {exc}")
+            _write_heartbeat(settings, f"cycle crashed: {exc}")
+            return
+        _alert_cycle(settings, result)
+        _write_heartbeat(settings, "cycle done")
         _print_json(_cycle_payload(result))
 
     def is_halted() -> bool:
         return _halt_path(settings).exists()
 
+    def on_skip(reason: str) -> None:
+        _write_heartbeat(settings, f"skipped: {reason}")
+        print(f"skip cycle ({reason})", file=sys.stderr)
+
+    if notifier is not None:
+        notifier.send(
+            f"[{settings.mode}] run-loop started "
+            f"(interval {interval_seconds:.0f}s, account {settings.account_id})"
+        )
     ran = run_scheduler(
         run_cycle=run_cycle,
         is_halted=is_halted,
@@ -385,8 +436,10 @@ def _run_loop(
         now_fn=lambda: datetime.now(timezone.utc),
         max_iterations=max_iterations,
         market_hours_only=market_hours_only,
-        on_skip=lambda reason: print(f"skip cycle ({reason})", file=sys.stderr),
+        on_skip=on_skip,
     )
+    if notifier is not None:
+        notifier.send(f"[{settings.mode}] run-loop STOPPED after {ran} cycle(s)")
     print(f"run-loop finished: {ran} cycle(s) executed", file=sys.stderr)
 
 
@@ -414,7 +467,25 @@ def _run_live(settings: Settings, tickers: list[str]) -> None:
         result = _build_cycle(
             settings, trd_env="REAL", max_open_positions_override=cap
         ).run_once(tickers)
+    _alert_cycle(settings, result)
     _print_json(_cycle_payload(result))
+
+
+def _backup(settings: Settings) -> None:
+    """Copy the ledgers and audit log into a dated backup folder."""
+
+    import shutil
+
+    runtime = settings.root_dir / "runtime"
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    target = runtime / "backups" / stamp
+    target.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    for pattern in ("*.sqlite", "audit.jsonl", "heartbeat.json"):
+        for source in runtime.glob(pattern):
+            shutil.copy2(source, target / source.name)
+            copied.append(source.name)
+    _print_json({"backup_dir": str(target), "files": sorted(copied)})
 
 
 def _report(settings: Settings, on_date: date | None) -> None:
@@ -455,6 +526,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "news", help="Fetch recent headlines for a ticker (Google News RSS)"
     )
     news_parser.add_argument("--ticker", required=True)
+    subparsers.add_parser(
+        "backup", help="Copy ledgers and audit log to runtime/backups/<date>"
+    )
     validate_parser = subparsers.add_parser(
         "validate-contract",
         help="Validate an option quote against the deterministic liquidity rules",
@@ -565,6 +639,9 @@ def main() -> None:
     if args.command == "news":
         items = GoogleNewsClient().fetch_evidence(args.ticker)
         _print_json([i.model_dump(mode="json") for i in items])
+        return
+    if args.command == "backup":
+        _backup(settings)
         return
     if args.command == "validate-contract":
         if not _validate_contract(settings, args.input):
