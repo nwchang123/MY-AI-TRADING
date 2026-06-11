@@ -565,6 +565,9 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "backup", help="Copy ledgers and audit log to runtime/backups/<date>"
     )
+    subparsers.add_parser(
+        "bot", help="Run the Telegram control bot (commands + read-only AI Q&A)"
+    )
     validate_parser = subparsers.add_parser(
         "validate-contract",
         help="Validate an option quote against the deterministic liquidity rules",
@@ -678,6 +681,11 @@ def main() -> None:
         return
     if args.command == "backup":
         _backup(settings)
+        return
+    if args.command == "bot":
+        from trading_agent.bot import run_bot
+
+        run_bot(settings)
         return
     if args.command == "validate-contract":
         if not _validate_contract(settings, args.input):
