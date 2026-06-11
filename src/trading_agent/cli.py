@@ -409,6 +409,8 @@ def _run_loop(
         )
 
     notifier = _notifier(settings)
+    totals = {"entries": 0, "exits": 0, "errors": 0, "crashes": 0}
+    last_crash: list[str] = [""]
 
     def run_cycle() -> None:
         # Resolved per tick so an auto universe follows the market day by day.
@@ -423,13 +425,22 @@ def _run_loop(
         except Exception as exc:  # noqa: BLE001
             _audit_writer(settings).append("cycle_crashed", {"error": str(exc)})
             print(f"cycle crashed: {exc}", file=sys.stderr)
-            if notifier is not None:
+            totals["crashes"] += 1
+            # Only alert on a NEW failure: a gateway that stays down all night
+            # must not page the operator once per tick.
+            if notifier is not None and str(exc) != last_crash[0]:
                 mode_label = "模拟盘" if settings.mode == "paper" else "实盘"
                 notifier.send(
-                    f"【{mode_label}】⚠️ 本周期运行崩溃：{exc}\n循环未中断，下个周期自动继续"
+                    f"【{mode_label}】⚠️ 本周期运行崩溃：{exc}\n"
+                    "循环未中断，下个周期自动继续（相同故障不再重复通知）"
                 )
+            last_crash[0] = str(exc)
             _write_heartbeat(settings, f"cycle crashed: {exc}")
             return
+        last_crash[0] = ""
+        totals["entries"] += len(result.entries)
+        totals["exits"] += len(result.exits)
+        totals["errors"] += len(result.errors)
         _alert_cycle(settings, result)
         _write_heartbeat(settings, "cycle done")
         _print_json(_cycle_payload(result))
@@ -460,7 +471,11 @@ def _run_loop(
     )
     if notifier is not None:
         mode_label = "模拟盘" if settings.mode == "paper" else "实盘"
-        notifier.send(f"【{mode_label}】🔴 交易循环已停止，共执行 {ran} 个周期")
+        notifier.send(
+            f"【{mode_label}】🔴 今日交易循环结束，共执行 {ran} 个周期\n"
+            f"开仓 {totals['entries']} | 平仓 {totals['exits']} | "
+            f"错误 {totals['errors']} | 崩溃 {totals['crashes']}"
+        )
     print(f"run-loop finished: {ran} cycle(s) executed", file=sys.stderr)
 
 
