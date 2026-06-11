@@ -35,6 +35,10 @@ options:
   # least this win probability; the LOWEST estimate is binding. Breakeven at
   # TP+100/SL-50 with ~20% friction is ~0.47, so 0.55 leaves a margin.
   min_estimated_win_probability: 0.55
+  # Deterministic Monte Carlo baseline (no-edge GBM): rejects tickets so
+  # hopeless that no catalyst edge could plausibly rescue them. Deliberately
+  # far below the AI floor -- the AIs claim the edge, the math sets the floor.
+  min_monte_carlo_pop: 0.2
 
 portfolio:
   max_open_positions: 2

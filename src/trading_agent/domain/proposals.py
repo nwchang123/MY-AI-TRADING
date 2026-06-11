@@ -25,6 +25,9 @@ class OptionCandidate(BaseModel):
     iv: float = Field(ge=0, default=0.0)
     dte: int
     estimated_contract_cost_usd: float = Field(ge=0)
+    # Deterministic Monte Carlo baseline POP at the standard +100/-50 exit
+    # grid (no-edge GBM). None when the underlying spot or IV was unavailable.
+    mc_pop: float | None = Field(default=None, ge=0, le=1)
 
 
 class ExitPlan(BaseModel):

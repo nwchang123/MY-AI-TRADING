@@ -471,14 +471,17 @@ class Committee:
             return ""
         lines = [
             "CANDIDATE CONTRACTS (already pass the mandate's liquidity/DTE/cost "
-            "limits; choose option_code from THIS list only):"
+            "limits; choose option_code from THIS list only). mc_pop is the "
+            "no-edge Monte Carlo baseline P(hit +100% before -50%): your "
+            "WIN_PROB above it is a claim that the catalyst adds real edge."
         ]
         for c in candidates:
+            mc = "n/a" if c.mc_pop is None else f"{c.mc_pop}"
             lines.append(
                 f"  {c.option_code} {c.option_side} strike={c.strike} "
                 f"expiry={c.expiry.isoformat()} DTE={c.dte} bid={c.bid} ask={c.ask} "
                 f"OI={c.open_interest} vol={c.daily_volume} iv={c.iv} "
-                f"est_cost=${c.estimated_contract_cost_usd}"
+                f"est_cost=${c.estimated_contract_cost_usd} mc_pop={mc}"
             )
         return "\n".join(lines)
 

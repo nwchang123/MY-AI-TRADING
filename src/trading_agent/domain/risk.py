@@ -57,6 +57,10 @@ class OptionsMandate(BaseModel):
     # at least this probability of the trade reaching take-profit; the most
     # pessimistic estimate is the binding one. 0 disables the check.
     min_estimated_win_probability: float = Field(default=0.0, ge=0, le=1)
+    # Floor for the deterministic Monte Carlo baseline POP (no-edge GBM with
+    # sticky IV). Set LOW: it only rejects structurally hopeless tickets that
+    # no plausible catalyst edge could rescue. 0 disables the check.
+    min_monte_carlo_pop: float = Field(default=0.0, ge=0, le=1)
 
 
 class PortfolioMandate(BaseModel):

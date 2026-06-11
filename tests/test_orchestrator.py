@@ -39,6 +39,8 @@ class FakeMarket:
         bid: float = 0.19,
         ask: float = 0.21,
         chain_codes: list[str] | None = None,
+        spot: float = 0.0,
+        iv: float = 0.5,
     ):
         self.bid = bid
         self.ask = ask
@@ -46,6 +48,13 @@ class FakeMarket:
         # eligible candidate. Set to a different code to simulate the committee
         # naming a contract that is not actually tradeable.
         self.chain_codes = [OPTION_CODE] if chain_codes is None else chain_codes
+        # spot=0 means "no underlying snapshot": the Monte Carlo check is
+        # skipped, matching markets where the price feed is unavailable.
+        self.spot = spot
+        self.iv = iv
+
+    def underlying_snapshot(self, underlying):
+        return {"price": self.spot} if self.spot else {}
 
     def option_chain(self, underlying, start, end, option_type="ALL"):
         rows = []
@@ -61,7 +70,7 @@ class FakeMarket:
                     "ask": self.ask,
                     "open_interest": 200,
                     "daily_volume": 30,
-                    "iv": 0.5,
+                    "iv": self.iv,
                 }
             )
         return rows
@@ -424,6 +433,58 @@ def test_news_failure_is_nonfatal_entry_still_proceeds(tmp_path: Path) -> None:
 
     # The dead feed is recorded but the SEC-backed entry still goes through.
     assert any(e["stage"] == "news_fetch" for e in result.errors)
+    assert broker.placed == [("buy", OPTION_CODE)]
+
+
+def test_monte_carlo_floor_blocks_hopeless_ticket(tmp_path: Path) -> None:
+    # Spot $2 vs strike $5 with iv 0.5 and 24 DTE: doubling the option before
+    # halving is ~impossible, so the deterministic baseline (floor 0.2 in the
+    # paper mandate) rejects it even though the committee approved.
+    broker = FakeBroker()
+    cycle = _cycle(
+        tmp_path,
+        broker=broker,
+        market=FakeMarket(spot=2.0),
+        committee=_committee(_open_responses()),
+    )
+
+    result = cycle.run_once(["EXAMPLE"])
+
+    assert broker.placed == []
+    assert any(r["stage"] == "monte_carlo_pop" for r in result.rejected)
+
+
+def test_monte_carlo_passes_underpriced_atm_ticket(tmp_path: Path) -> None:
+    # ATM, high vol, entry far below model value: baseline POP is high, the
+    # trade flows through to the broker.
+    broker = FakeBroker()
+    cycle = _cycle(
+        tmp_path,
+        broker=broker,
+        market=FakeMarket(spot=5.0, iv=1.0),
+        committee=_committee(_open_responses()),
+    )
+
+    result = cycle.run_once(["EXAMPLE"])
+
+    assert broker.placed == [("buy", OPTION_CODE)]
+    assert result.entries
+
+
+def test_missing_spot_skips_monte_carlo_check(tmp_path: Path) -> None:
+    # No underlying snapshot (spot=0): the MC gate must skip, not block, so a
+    # data outage cannot freeze trading. The default FakeMarket has spot=0 and
+    # this is the same path every pre-existing entry test exercises.
+    broker = FakeBroker()
+    cycle = _cycle(
+        tmp_path,
+        broker=broker,
+        market=FakeMarket(),
+        committee=_committee(_open_responses()),
+    )
+
+    result = cycle.run_once(["EXAMPLE"])
+
     assert broker.placed == [("buy", OPTION_CODE)]
 
 

@@ -7,6 +7,7 @@ from typing import Any, Callable
 from trading_agent.data.moomoo_market import US_OPTION_LOT_SIZE, parse_us_option_code
 from trading_agent.data.sec_edgar import SecEdgarClient
 from trading_agent.domain.calendar import market_date
+from trading_agent.domain.montecarlo import MAX_USABLE_IV, stable_seed, win_probability
 from trading_agent.domain.liquidity import LiquidityValidator
 from trading_agent.domain.positions import MonitoredPosition
 from trading_agent.execution.orders import OrderManager
@@ -342,7 +343,7 @@ class PaperTradingCycle:
                 held_codes.add(opened_code)
 
     def _eligible_candidates(
-        self, now: datetime, ticker: str, result: CycleResult
+        self, now: datetime, ticker: str, result: CycleResult, spot: float = 0.0
     ) -> list[OptionCandidate]:
         """Mandate-eligible contracts from the live chain, for the committee.
 
@@ -382,6 +383,27 @@ class PaperTradingCycle:
             )
             if not verdict.passed:
                 continue
+            iv = float(row.get("iv") or 0.0)
+            # Baseline math POP at the standard +100/-50 grid, shown to the
+            # committee alongside each candidate so the AIs see what the math
+            # says before claiming an edge. Fewer paths: a guide, not the gate.
+            mc_pop: float | None = None
+            if spot > 0 and 0 < iv <= MAX_USABLE_IV:
+                mc_pop = round(
+                    win_probability(
+                        side=row["side"],
+                        spot=spot,
+                        strike=row["strike"],
+                        dte_days=verdict.dte,
+                        iv=iv,
+                        entry_price=ask,
+                        take_profit_pct=100.0,
+                        stop_loss_pct=50.0,
+                        paths=500,
+                        seed=stable_seed(row["code"]),
+                    ),
+                    3,
+                )
             candidates.append(
                 OptionCandidate(
                     option_code=row["code"],
@@ -392,9 +414,10 @@ class PaperTradingCycle:
                     ask=ask,
                     open_interest=quote.open_interest,
                     daily_volume=quote.daily_volume,
-                    iv=float(row.get("iv") or 0.0),
+                    iv=iv,
                     dte=verdict.dte,
                     estimated_contract_cost_usd=verdict.estimated_contract_cost_usd,
+                    mc_pop=mc_pop,
                 )
             )
         candidates.sort(key=lambda c: c.open_interest, reverse=True)
@@ -434,7 +457,11 @@ class PaperTradingCycle:
     ) -> str | None:
         # Build the real, mandate-eligible contract shortlist FIRST: if nothing is
         # tradeable, skip the SEC fetch and the committee entirely (saves tokens).
-        candidates = self._eligible_candidates(now, ticker, result)
+        # The underlying snapshot comes from the same cached chain payload, so
+        # fetching it up front for the MC annotation costs no extra request.
+        snapshot = self._underlying_snapshot(ticker, result)
+        spot = float((snapshot or {}).get("price") or 0.0)
+        candidates = self._eligible_candidates(now, ticker, result, spot=spot)
         if not candidates:
             self.audit.append(
                 "no_eligible_contracts", {"ticker": ticker, "at": now.isoformat()}
@@ -451,7 +478,6 @@ class PaperTradingCycle:
         evidence = self._gather_evidence(ticker, result)
         context = build_candidate_context(ticker, evidence, now)
         scores = score_candidate(derive_score_inputs(context.evidence, now))
-        snapshot = self._underlying_snapshot(ticker, result)
         before = self.committee.usage_total()
         output = self.committee.run(
             context, scores, candidates=candidates, market_snapshot=snapshot
@@ -485,6 +511,58 @@ class PaperTradingCycle:
             )
             return None
         expiry = candidate.expiry
+
+        # Deterministic third vote: the no-edge Monte Carlo baseline with the
+        # proposal's ACTUAL exit plan and limit price. The AI floor (0.55) asks
+        # "do you believe in the edge"; this low floor asks "is the ticket
+        # structurally hopeless even with one". Skipped (and audited) when the
+        # spot or a usable IV is unavailable rather than blocking on missing data.
+        mc_floor = self.active_mandate.options.min_monte_carlo_pop
+        if mc_floor > 0:
+            if spot > 0 and 0 < candidate.iv <= MAX_USABLE_IV:
+                hold_days = (proposal.exit_plan.time_stop - now.date()).days
+                pop = win_probability(
+                    side=candidate.option_side,
+                    spot=spot,
+                    strike=candidate.strike,
+                    dte_days=candidate.dte,
+                    iv=candidate.iv,
+                    entry_price=proposal.limit_price,
+                    take_profit_pct=proposal.exit_plan.take_profit_pct,
+                    stop_loss_pct=proposal.exit_plan.stop_loss_pct,
+                    hold_days=hold_days if hold_days > 0 else None,
+                    seed=stable_seed(proposal.option_code),
+                )
+                self.audit.append(
+                    "monte_carlo_pop",
+                    {
+                        "ticker": ticker,
+                        "option_code": proposal.option_code,
+                        "pop": round(pop, 4),
+                        "floor": mc_floor,
+                        "spot": spot,
+                        "iv": candidate.iv,
+                        "dte": candidate.dte,
+                        "entry": proposal.limit_price,
+                    },
+                )
+                if pop < mc_floor:
+                    result.rejected.append(
+                        {
+                            "ticker": ticker,
+                            "stage": "monte_carlo_pop",
+                            "reasons": [
+                                f"baseline POP {pop:.2f} below floor {mc_floor:.2f}"
+                            ],
+                        }
+                    )
+                    return None
+            else:
+                self.audit.append(
+                    "monte_carlo_pop_unavailable",
+                    {"ticker": ticker, "option_code": proposal.option_code,
+                     "spot": spot, "iv": candidate.iv},
+                )
 
         quote = self.market.option_quote(
             option_code=proposal.option_code,

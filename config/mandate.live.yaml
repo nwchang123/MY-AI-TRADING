@@ -33,6 +33,8 @@ options:
   fee_buffer_usd: 1
   # Both AI lineages must estimate at least this win probability (lowest binds).
   min_estimated_win_probability: 0.55
+  # Deterministic Monte Carlo no-edge baseline floor (see paper mandate).
+  min_monte_carlo_pop: 0.2
 
 portfolio:
   max_open_positions: 1
