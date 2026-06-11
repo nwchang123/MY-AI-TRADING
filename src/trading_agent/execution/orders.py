@@ -68,7 +68,56 @@ class OrderManager:
         self.sleep_fn = sleep_fn or time.sleep
 
     def place_and_await(
-        self, *, option_code: str, contracts: int, limit_price: float, side: str
+        self,
+        *,
+        option_code: str,
+        contracts: int,
+        limit_price: float,
+        side: str,
+        price_ladder: list[float] | None = None,
+    ) -> FillResult:
+        """Work a limit order through a price ladder until it fills.
+
+        ``price_ladder`` lists prices from best-for-us to most-aggressive (a
+        buy climbs toward the ask, a sell descends toward the bid); each rung
+        gets an equal share of ``cancel_after_seconds`` and is cancelled
+        before the next is placed, so at most one order is ever live. A rung
+        the broker rejects (e.g. an off-tick price) falls through to the next
+        rung instead of aborting -- the final rung is always the caller's
+        quote-derived ``limit_price``, which is a valid tick. Without a
+        ladder, behavior is the original single-price place-poll-cancel.
+        """
+
+        rungs: list[float] = []
+        for price in price_ladder or [limit_price]:
+            price = round(float(price), 2)
+            if price > 0 and (not rungs or abs(price - rungs[-1]) >= 0.005):
+                rungs.append(price)
+        if not rungs:
+            rungs = [round(limit_price, 2)]
+        budget = self.cancel_after_seconds / len(rungs)
+
+        result = FillResult(filled=False, status="no_order_id")
+        for price in rungs:
+            result = self._place_one_rung(
+                option_code=option_code,
+                contracts=contracts,
+                limit_price=price,
+                side=side,
+                budget_seconds=budget,
+            )
+            if result.filled:
+                return result
+        return result
+
+    def _place_one_rung(
+        self,
+        *,
+        option_code: str,
+        contracts: int,
+        limit_price: float,
+        side: str,
+        budget_seconds: float,
     ) -> FillResult:
         record = self.broker.place_limit_order(
             account_id=self.account_id,
@@ -101,7 +150,7 @@ class OrderManager:
                 )
             if classification == "dead":
                 return FillResult(filled=False, status=status, order_id=order_id)
-            if elapsed >= self.cancel_after_seconds:
+            if elapsed >= budget_seconds:
                 break
             self.sleep_fn(self.poll_interval_seconds)
             elapsed += self.poll_interval_seconds

@@ -332,15 +332,23 @@ class PaperTradingCycle:
             monitored.append(position)
             marks[code] = position.mark_price()
 
+        position_by_code = {p.option_code: p for p in monitored}
         for signal in monitor.evaluate(monitored, now):
             ledger = ledger_by_code[signal.option_code]
             limit = signal.mark_price if signal.mark_price > 0 else ledger["entry_price"]
+            # Sell ladder: try the mid first, fall back to the bid -- recovers
+            # roughly half the spread on fills that would happen anyway.
+            position = position_by_code.get(signal.option_code)
+            ladder = [limit]
+            if position is not None and position.ask > position.bid > 0:
+                ladder = [round((position.bid + position.ask) / 2, 2), limit]
             try:
                 fill = self.orders.place_and_await(
                     option_code=signal.option_code,
                     contracts=ledger["contracts"],
                     limit_price=limit,
                     side="sell",
+                    price_ladder=ladder,
                 )
             except Exception as exc:  # noqa: BLE001
                 self._record_error(result, "exit_order", signal.option_code, exc)
@@ -672,11 +680,20 @@ class PaperTradingCycle:
             )
             return None
 
+        # Buy ladder: bid at the mid first, then chase to the proposal limit.
+        # Half-spread on a $0.10-0.25 ticket is ~5% of the position -- fills
+        # captured at the mid go straight into expectancy.
+        buy_ladder = [proposal.limit_price]
+        if quote.ask > quote.bid > 0:
+            mid = round((quote.bid + quote.ask) / 2, 2)
+            if mid < proposal.limit_price:
+                buy_ladder = [mid, proposal.limit_price]
         fill = self.orders.place_and_await(
             option_code=proposal.option_code,
             contracts=proposal.contracts,
             limit_price=proposal.limit_price,
             side="buy",
+            price_ladder=buy_ladder,
         )
         self.audit.append("order_placed", {"option_code": proposal.option_code, "side": "buy"})
         if not fill.filled:
