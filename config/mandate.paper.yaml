@@ -1,4 +1,4 @@
-account:
+﻿account:
   initial_capital_usd: 100
   live_mode_requires_operator_flag: true
   withdrawal_capability: forbidden
@@ -48,6 +48,8 @@ portfolio:
   hard_drawdown_stop_usd: 25
   consecutive_loss_stop: 3
   cooldown_after_consecutive_losses_hours: 24
+  # No new entries when the VIX is above this (panic regime guard); exits still run.
+  max_vix_for_entries: 35
 
 execution:
   stale_quote_seconds: 15
@@ -56,4 +58,9 @@ execution:
   cancel_unfilled_order_seconds: 60
   max_limit_chase_pct: 5
   kill_switch_file: runtime/HALT
+  # No new entries in the first N minutes after the open (widest spreads).
+  no_entry_minutes_after_open: 15
+  # Hard daily LLM token budget; committee skipped once exceeded. ~10-15k
+  # tokens per committee pass, so this allows ~20-30 passes/day.
+  max_daily_llm_tokens: 300000
 

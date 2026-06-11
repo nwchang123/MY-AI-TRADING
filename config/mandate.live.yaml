@@ -44,6 +44,8 @@ portfolio:
   hard_drawdown_stop_usd: 25
   consecutive_loss_stop: 3
   cooldown_after_consecutive_losses_hours: 24
+  # No new entries when the VIX is above this (panic regime guard).
+  max_vix_for_entries: 35
 
 execution:
   stale_quote_seconds: 15
@@ -53,4 +55,6 @@ execution:
   cancel_unfilled_order_seconds: 60
   max_limit_chase_pct: 5
   kill_switch_file: runtime/HALT
+  no_entry_minutes_after_open: 15
+  max_daily_llm_tokens: 300000
 

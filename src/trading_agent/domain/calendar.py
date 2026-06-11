@@ -109,6 +109,24 @@ def is_market_hours(now: datetime) -> bool:
     return MARKET_OPEN <= eastern.time() <= MARKET_CLOSE
 
 
+def minutes_since_open(now: datetime) -> float | None:
+    """Minutes elapsed since the 9:30 ET open, or None outside the session.
+
+    Used to keep new entries out of the opening auction window, where option
+    spreads are at their widest.
+    """
+
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    if not is_market_hours(now):
+        return None
+    eastern = now.astimezone(MARKET_TZ) if MARKET_TZ is not None else now
+    open_moment = eastern.replace(
+        hour=MARKET_OPEN.hour, minute=MARKET_OPEN.minute, second=0, microsecond=0
+    )
+    return (eastern - open_moment).total_seconds() / 60.0
+
+
 def trading_days_until(expiry: date, now: date | datetime) -> int:
     """Trading days from the day after ``now`` through ``expiry`` inclusive.
 

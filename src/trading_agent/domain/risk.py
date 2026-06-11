@@ -73,6 +73,10 @@ class PortfolioMandate(BaseModel):
     hard_drawdown_stop_usd: float = Field(gt=0)
     consecutive_loss_stop: int = Field(gt=0)
     cooldown_after_consecutive_losses_hours: int = Field(gt=0)
+    # Market-regime guard: no NEW entries while the VIX is above this level
+    # (panic regimes blow out small-cap option spreads and inflate IV; buying
+    # premium into them is structurally bad). Exits still run. 0 disables.
+    max_vix_for_entries: float = Field(default=0.0, ge=0)
 
 
 class ExecutionMandate(BaseModel):
@@ -86,6 +90,13 @@ class ExecutionMandate(BaseModel):
     cancel_unfilled_order_seconds: int = Field(gt=0)
     max_limit_chase_pct: float = Field(ge=0)
     kill_switch_file: str = Field(min_length=1)
+    # No NEW entries during the first N minutes after the open, where option
+    # spreads are at their widest. Exits still run. 0 disables.
+    no_entry_minutes_after_open: int = Field(default=0, ge=0)
+    # Hard daily LLM token budget: once today's metered usage crosses this,
+    # the committee is skipped until the next market day. Protects the API
+    # balance from a runaway loop. 0 disables.
+    max_daily_llm_tokens: int = Field(default=0, ge=0)
 
     def max_quote_age_seconds(self, is_delayed: bool) -> int:
         """Staleness ceiling for a quote, widened for delayed data feeds."""

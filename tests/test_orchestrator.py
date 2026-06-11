@@ -301,6 +301,70 @@ def test_take_profit_exit_closes_position(tmp_path: Path) -> None:
     assert store.open_positions() == []
 
 
+def test_opening_window_blocks_new_entries(tmp_path: Path) -> None:
+    # 13:35 UTC = 9:35 ET, inside the paper mandate's 15-minute no-entry
+    # window. The committee (empty mock) must never be invoked.
+    broker = FakeBroker()
+    mandate = _mandate()
+    cycle = PaperTradingCycle(
+        mandate=mandate,
+        account_id=123,
+        market=FakeMarket(),
+        broker=broker,
+        sec_client=FakeSec(),
+        committee=_committee([]),
+        gate=RiskGate(mandate, tmp_path),
+        liquidity=LiquidityValidator(mandate.options, mandate.execution),
+        position_store=PositionStore(tmp_path / "positions.sqlite"),
+        audit=AuditWriter(tmp_path / "audit.jsonl"),
+        now_fn=lambda: datetime(2026, 6, 2, 13, 35, tzinfo=timezone.utc),
+        order_poll_interval_seconds=0.1,
+        sleep_fn=lambda _s: None,
+    )
+
+    result = cycle.run_once(["EXAMPLE"])
+
+    assert broker.placed == []
+    regime = [r for r in result.rejected if r["stage"] == "regime"]
+    assert regime and "open" in regime[0]["reasons"][0]
+
+
+def test_vix_above_cap_blocks_new_entries(tmp_path: Path) -> None:
+    # FakeMarket reports its spot for every symbol including _VIX; spot=40
+    # exceeds the mandate's 35 entry cap, so all entries are skipped.
+    broker = FakeBroker()
+    cycle = _cycle(
+        tmp_path,
+        broker=broker,
+        market=FakeMarket(spot=40.0),
+        committee=_committee([]),
+    )
+
+    result = cycle.run_once(["EXAMPLE"])
+
+    assert broker.placed == []
+    regime = [r for r in result.rejected if r["stage"] == "regime"]
+    assert regime and "VIX" in regime[0]["reasons"][0]
+
+
+def test_exhausted_llm_budget_skips_committee(tmp_path: Path) -> None:
+    from trading_agent.domain.calendar import market_date as _md
+    from trading_agent.storage.budget import DailyTokenBudget
+
+    budget = DailyTokenBudget(tmp_path / "budget.json", limit_tokens=100)
+    budget.add(100, _md(NOW))  # today's budget already spent
+    broker = FakeBroker()
+    cycle = _cycle(
+        tmp_path, broker=broker, market=FakeMarket(), committee=_committee([])
+    )
+    cycle.llm_budget = budget
+
+    result = cycle.run_once(["EXAMPLE"])
+
+    assert broker.placed == []
+    assert any(r["stage"] == "llm_budget" for r in result.rejected)
+
+
 def test_decision_cache_skips_committee_on_unchanged_inputs(tmp_path: Path) -> None:
     from trading_agent.storage.decisions import DecisionCache
 

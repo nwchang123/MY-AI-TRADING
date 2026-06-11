@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 from trading_agent.data.moomoo_market import US_OPTION_LOT_SIZE, parse_us_option_code
 from trading_agent.data.sec_edgar import SecEdgarClient
-from trading_agent.domain.calendar import market_date
+from trading_agent.domain.calendar import market_date, minutes_since_open
 from trading_agent.domain.montecarlo import MAX_USABLE_IV, stable_seed, win_probability
 from trading_agent.domain.liquidity import LiquidityValidator
 from trading_agent.domain.positions import MonitoredPosition
@@ -16,6 +16,7 @@ from trading_agent.domain.risk import Mandate, PortfolioState, QuoteSnapshot, Ri
 from trading_agent.research.catalysts import build_candidate_context, derive_score_inputs
 from trading_agent.research.committee import Committee, CommitteeOutput
 from trading_agent.research.llm import usage_delta
+from trading_agent.storage.budget import DailyTokenBudget
 from trading_agent.storage.decisions import DecisionCache, decision_digest
 from trading_agent.research.scoring import score_candidate
 from trading_agent.storage.audit import AuditWriter
@@ -68,6 +69,7 @@ class PaperTradingCycle:
         sleep_fn: Callable[[float], None] | None = None,
         news_client: Any | None = None,
         decision_cache: DecisionCache | None = None,
+        llm_budget: DailyTokenBudget | None = None,
     ):
         if trd_env not in {"SIMULATE", "REAL"}:
             raise ValueError("trd_env must be 'SIMULATE' or 'REAL'")
@@ -86,6 +88,7 @@ class PaperTradingCycle:
         self.max_open_positions_override = max_open_positions_override
         self.news_client = news_client
         self.decision_cache = decision_cache
+        self.llm_budget = llm_budget
         # Refreshed at the start of every cycle: when the account compounds,
         # these carry the equity-scaled risk caps; otherwise they alias the
         # injected gate/liquidity unchanged.
@@ -387,9 +390,39 @@ class PaperTradingCycle:
         return marks
 
     # --- entries --------------------------------------------------------
+    def _entry_regime_block(self, now: datetime) -> str | None:
+        """Cycle-wide reason to skip ALL new entries, or None. Exits still run."""
+
+        window = self.active_mandate.execution.no_entry_minutes_after_open
+        if window > 0:
+            minutes = minutes_since_open(now)
+            if minutes is not None and minutes < window:
+                return f"first {window} minutes after the open (widest spreads)"
+
+        vix_cap = self.active_mandate.portfolio.max_vix_for_entries
+        if vix_cap > 0:
+            method = getattr(self.market, "underlying_snapshot", None)
+            if method is not None:
+                try:
+                    vix = float((method("_VIX") or {}).get("price") or 0.0)
+                except Exception:  # noqa: BLE001 - missing data never blocks
+                    vix = 0.0
+                if vix > vix_cap:
+                    return f"VIX {vix:.1f} above the {vix_cap:.0f} entry cap"
+        return None
+
     def _run_entries(
         self, now: datetime, tickers: list[str], held_codes: set[str], result: CycleResult
     ) -> None:
+        block = self._entry_regime_block(now)
+        if block is not None:
+            self.audit.append(
+                "entries_skipped", {"reason": block, "at": now.isoformat()}
+            )
+            result.rejected.append(
+                {"ticker": "*", "stage": "regime", "reasons": [block]}
+            )
+            return
         for ticker in tickers:
             if len(held_codes) >= self._max_positions():
                 break
@@ -562,6 +595,22 @@ class PaperTradingCycle:
                          "digest": digest[:16]},
                     )
         if output is None:
+            # Hard daily token ceiling: once exhausted, no more committee
+            # passes until the next market day (cache hits still work).
+            today = market_date(now)
+            if self.llm_budget is not None and self.llm_budget.remaining(today) <= 0:
+                self.audit.append(
+                    "llm_budget_exhausted",
+                    {"ticker": ticker, "used": self.llm_budget.used(today)},
+                )
+                result.rejected.append(
+                    {
+                        "ticker": ticker,
+                        "stage": "llm_budget",
+                        "reasons": ["daily LLM token budget exhausted"],
+                    }
+                )
+                return None
             before = self.committee.usage_total()
             output = self.committee.run(
                 context, scores, candidates=candidates, market_snapshot=snapshot
@@ -572,6 +621,8 @@ class PaperTradingCycle:
                 {"ticker": ticker, "decision": output.decision, "output": output.model_dump(mode="json")},
             )
             self.audit.append("llm_usage", {"ticker": ticker, **usage.model_dump(mode="json")})
+            if self.llm_budget is not None:
+                self.llm_budget.add(usage.total_tokens, today)
             if self.decision_cache is not None:
                 self.decision_cache.put(ticker, digest, output.model_dump_json(), now)
         if output.decision != "open_position" or output.proposal is None:

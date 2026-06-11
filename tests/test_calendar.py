@@ -3,9 +3,23 @@ from datetime import date, datetime, timezone
 from trading_agent.domain.calendar import (
     is_trading_day,
     market_date,
+    minutes_since_open,
     trading_days_until,
     us_market_holidays,
 )
+
+
+def test_minutes_since_open_inside_session() -> None:
+    # 2026-06-02 is a Tuesday; 13:35 UTC = 9:35 ET during daylight time.
+    now = datetime(2026, 6, 2, 13, 35, tzinfo=timezone.utc)
+    assert minutes_since_open(now) == 5.0
+
+
+def test_minutes_since_open_outside_session_is_none() -> None:
+    pre_open = datetime(2026, 6, 2, 12, 0, tzinfo=timezone.utc)  # 8:00 ET
+    saturday = datetime(2026, 6, 6, 15, 0, tzinfo=timezone.utc)
+    assert minutes_since_open(pre_open) is None
+    assert minutes_since_open(saturday) is None
 
 
 def test_known_2026_holidays() -> None:

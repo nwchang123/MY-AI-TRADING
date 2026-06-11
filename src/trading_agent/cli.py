@@ -31,6 +31,7 @@ from trading_agent.research.llm import OpenAICompatibleClient, usage_delta
 from trading_agent.research.scoring import ScoreInputs, score_candidate
 from trading_agent.settings import Settings
 from trading_agent.storage.audit import AuditWriter
+from trading_agent.storage.budget import DailyTokenBudget
 from trading_agent.storage.decisions import DecisionCache
 from trading_agent.storage.positions import PositionStore
 from trading_agent.storage.sqlite import SnapshotStore
@@ -303,6 +304,14 @@ def _build_cycle(
         news_client=GoogleNewsClient(),
         decision_cache=DecisionCache(
             settings.root_dir / "runtime" / f"decisions.{settings.mode}.json"
+        ),
+        llm_budget=(
+            DailyTokenBudget(
+                settings.root_dir / "runtime" / f"llm_budget.{settings.mode}.json",
+                mandate.execution.max_daily_llm_tokens,
+            )
+            if mandate.execution.max_daily_llm_tokens > 0
+            else None
         ),
     )
 
