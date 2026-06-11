@@ -409,7 +409,10 @@ def _run_loop(
             _audit_writer(settings).append("cycle_crashed", {"error": str(exc)})
             print(f"cycle crashed: {exc}", file=sys.stderr)
             if notifier is not None:
-                notifier.send(f"[{settings.mode}] cycle CRASHED: {exc}")
+                mode_label = "模拟盘" if settings.mode == "paper" else "实盘"
+                notifier.send(
+                    f"【{mode_label}】⚠️ 本周期运行崩溃：{exc}\n循环未中断，下个周期自动继续"
+                )
             _write_heartbeat(settings, f"cycle crashed: {exc}")
             return
         _alert_cycle(settings, result)
@@ -424,9 +427,11 @@ def _run_loop(
         print(f"skip cycle ({reason})", file=sys.stderr)
 
     if notifier is not None:
+        mode_label = "模拟盘" if settings.mode == "paper" else "实盘"
         notifier.send(
-            f"[{settings.mode}] run-loop started "
-            f"(interval {interval_seconds:.0f}s, account {settings.account_id})"
+            f"【{mode_label}】🟢 自主交易循环已启动\n"
+            f"间隔 {interval_seconds:.0f} 秒 | 账户 {settings.account_id}\n"
+            f"开仓/平仓/熔断/错误时会通知你，安静周期不打扰"
         )
     ran = run_scheduler(
         run_cycle=run_cycle,
@@ -439,7 +444,8 @@ def _run_loop(
         on_skip=on_skip,
     )
     if notifier is not None:
-        notifier.send(f"[{settings.mode}] run-loop STOPPED after {ran} cycle(s)")
+        mode_label = "模拟盘" if settings.mode == "paper" else "实盘"
+        notifier.send(f"【{mode_label}】🔴 交易循环已停止，共执行 {ran} 个周期")
     print(f"run-loop finished: {ran} cycle(s) executed", file=sys.stderr)
 
 

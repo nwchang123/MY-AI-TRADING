@@ -54,8 +54,25 @@ class TelegramNotifier:
             return False
 
 
+# Operator-facing alert text is Chinese by operator preference; audit logs and
+# ledger strings stay English (they are data, matched by code and tests).
+_MODE_LABELS = {"paper": "模拟盘", "live": "实盘"}
+
+_BREAKER_LABELS = {
+    "daily loss stop": "触发单日亏损上限",
+    "hard drawdown stop": "触发硬回撤上限",
+}
+
+_EXIT_REASON_LABELS = {
+    "take profit": "止盈",
+    "stop loss": "止损",
+    "time stop reached": "到达时间止损",
+    "forced close before expiry": "临近到期强制平仓",
+}
+
+
 def format_cycle_alert(result: Any, *, mode: str) -> str | None:
-    """Human-readable alert for a finished cycle, or None when nothing notable.
+    """Operator alert (Chinese) for a finished cycle; None when nothing notable.
 
     Notable means money moved or something needs the operator: entries, exits,
     a tripped circuit breaker, errors, or an unexpected HALT. Routine quiet
@@ -64,16 +81,22 @@ def format_cycle_alert(result: Any, *, mode: str) -> str | None:
     """
 
     lines: list[str] = []
-    if getattr(result, "circuit_breaker", None):
-        lines.append(f"CIRCUIT BREAKER: {result.circuit_breaker} -> HALT written")
+    breaker = getattr(result, "circuit_breaker", None)
+    if breaker:
+        label = _BREAKER_LABELS.get(breaker, breaker)
+        lines.append(f"⛔ 熔断：{label}，已写入 HALT，交易暂停待人工复查")
     if getattr(result, "halted", False):
-        lines.append("cycle skipped: HALT kill switch is active")
+        lines.append("本周期跳过：HALT 停机开关处于激活状态")
     for entry in getattr(result, "entries", []) or []:
-        lines.append(f"OPENED {entry.get('option_code')} ({entry.get('ticker')})")
+        lines.append(f"📈 开仓 {entry.get('option_code')}（{entry.get('ticker')}）")
     for exit_ in getattr(result, "exits", []) or []:
-        lines.append(f"CLOSED {exit_.get('option_code')}: {exit_.get('reason')}")
+        reason = _EXIT_REASON_LABELS.get(str(exit_.get("reason")), exit_.get("reason"))
+        lines.append(f"📉 平仓 {exit_.get('option_code')}：{reason}")
     for error in getattr(result, "errors", []) or []:
-        lines.append(f"error [{error.get('stage')}] {error.get('ref')}: {error.get('error')}")
+        lines.append(
+            f"⚠️ 错误 [{error.get('stage')}] {error.get('ref')}：{error.get('error')}"
+        )
     if not lines:
         return None
-    return f"[{mode}] trading agent\n" + "\n".join(lines)
+    mode_label = _MODE_LABELS.get(mode, mode)
+    return f"【{mode_label}】交易代理\n" + "\n".join(lines)

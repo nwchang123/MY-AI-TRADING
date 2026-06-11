@@ -44,21 +44,31 @@ def test_quiet_cycle_produces_no_alert() -> None:
     assert format_cycle_alert(result, mode="paper") is None
 
 
-def test_actionable_cycle_is_formatted() -> None:
+def test_actionable_cycle_is_formatted_in_chinese() -> None:
     result = CycleResult()
     result.entries.append({"ticker": "BULL", "option_code": "US.BULL260717C5000"})
     result.exits.append({"option_code": "US.KEEL260717C2500", "reason": "take profit"})
     result.errors.append({"stage": "exit_quote", "ref": "US.X", "error": "feed down"})
     text = format_cycle_alert(result, mode="paper")
     assert text is not None
-    assert "[paper]" in text
-    assert "OPENED US.BULL260717C5000 (BULL)" in text
-    assert "CLOSED US.KEEL260717C2500: take profit" in text
-    assert "error [exit_quote]" in text
+    assert "【模拟盘】" in text
+    assert "开仓 US.BULL260717C5000（BULL）" in text
+    # Ledger reasons stay English internally; the alert shows the Chinese label.
+    assert "平仓 US.KEEL260717C2500：止盈" in text
+    assert "错误 [exit_quote]" in text
+
+
+def test_unknown_exit_reason_falls_back_to_raw_text() -> None:
+    result = CycleResult()
+    result.exits.append({"option_code": "US.X", "reason": "reconciled: not held"})
+    text = format_cycle_alert(result, mode="live")
+    assert text is not None
+    assert "【实盘】" in text
+    assert "reconciled: not held" in text
 
 
 def test_circuit_breaker_leads_the_alert() -> None:
     result = CycleResult(circuit_breaker="hard drawdown stop")
     text = format_cycle_alert(result, mode="paper")
     assert text is not None
-    assert "CIRCUIT BREAKER: hard drawdown stop" in text
+    assert "熔断：触发硬回撤上限" in text
