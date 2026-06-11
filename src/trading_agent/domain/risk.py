@@ -187,6 +187,10 @@ class PortfolioState(BaseModel):
     total_drawdown_usd: float = Field(ge=0)
     consecutive_losses: int = Field(ge=0)
     duplicate_order_exists: bool = False
+    # True when any open position is on the proposal's underlying (different
+    # strike/expiry included): with a 2-position book, two contracts on one
+    # name concentrates the whole account in a single ticker.
+    underlying_already_held: bool = False
 
 
 class RiskDecision(BaseModel):
@@ -281,6 +285,8 @@ class RiskGate:
             reasons.append("consecutive-loss cooldown is active")
         if portfolio.duplicate_order_exists:
             reasons.append("duplicate order already exists")
+        if portfolio.underlying_already_held:
+            reasons.append("an open position already exists on this underlying")
 
         return RiskDecision(
             approved=not reasons,

@@ -301,6 +301,64 @@ def test_take_profit_exit_closes_position(tmp_path: Path) -> None:
     assert store.open_positions() == []
 
 
+def test_same_underlying_second_strike_is_rejected(tmp_path: Path) -> None:
+    # Already long EXAMPLE at strike 5; the committee proposes ANOTHER EXAMPLE
+    # strike. The concentration rule must block it even though the option code
+    # differs (no duplicate), keeping the 2-position book on distinct names.
+    other_strike = "US.EXAMPLE260626C00007000"
+    broker = FakeBroker(positions=[{"code": other_strike, "qty": 1}])
+    store = PositionStore(tmp_path / "positions.sqlite")
+    _seed_open(store, other_strike)
+    cycle = _cycle(
+        tmp_path,
+        broker=broker,
+        market=FakeMarket(),
+        committee=_committee(_open_responses()),  # proposes OPTION_CODE (strike 5)
+        store=store,
+    )
+
+    result = cycle.run_once(["EXAMPLE"])
+
+    assert broker.placed == []
+    rejected = [r for r in result.rejected if r["stage"] == "risk_gate"]
+    assert rejected and any(
+        "underlying" in reason for reason in rejected[0]["reasons"]
+    )
+
+
+def test_orphan_broker_position_is_adopted(tmp_path: Path) -> None:
+    # Broker holds an option the ledger has no record of (crash between fill
+    # and ledger write): reconcile must adopt it so the exit engine manages it.
+    broker = FakeBroker(
+        positions=[{"code": OPTION_CODE, "qty": 1, "cost_price": 0.25}]
+    )
+    store = PositionStore(tmp_path / "positions.sqlite")
+    cycle = _cycle(
+        tmp_path, broker=broker, market=FakeMarket(), committee=_committee([]), store=store
+    )
+
+    result = cycle.run_once([])
+
+    assert result.adopted == [OPTION_CODE]
+    adopted = store.get(OPTION_CODE)
+    assert adopted is not None and adopted["status"] == "open"
+    assert adopted["entry_price"] == 0.25
+    assert adopted["take_profit_pct"] == 100.0 and adopted["stop_loss_pct"] == 50.0
+
+
+def test_stock_holdings_are_not_adopted(tmp_path: Path) -> None:
+    broker = FakeBroker(positions=[{"code": "US.AAPL", "qty": 10, "cost_price": 200}])
+    store = PositionStore(tmp_path / "positions.sqlite")
+    cycle = _cycle(
+        tmp_path, broker=broker, market=FakeMarket(), committee=_committee([]), store=store
+    )
+
+    result = cycle.run_once([])
+
+    assert result.adopted == []
+    assert store.get("US.AAPL") is None
+
+
 def test_reconcile_closes_ledger_position_not_held(tmp_path: Path) -> None:
     broker = FakeBroker(positions=[])  # broker holds nothing
     store = PositionStore(tmp_path / "positions.sqlite")

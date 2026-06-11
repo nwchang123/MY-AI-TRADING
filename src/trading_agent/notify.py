@@ -87,6 +87,8 @@ def format_cycle_alert(result: Any, *, mode: str) -> str | None:
         lines.append(f"⛔ 熔断：{label}，已写入 HALT，交易暂停待人工复查")
     if getattr(result, "halted", False):
         lines.append("本周期跳过：HALT 停机开关处于激活状态")
+    for code in getattr(result, "adopted", []) or []:
+        lines.append(f"🩹 收养孤儿持仓 {code}（账本缺失，已补默认退出计划）")
     for entry in getattr(result, "entries", []) or []:
         lines.append(f"📈 开仓 {entry.get('option_code')}（{entry.get('ticker')}）")
     for exit_ in getattr(result, "exits", []) or []:

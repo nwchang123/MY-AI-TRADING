@@ -31,6 +31,7 @@ class CycleResult:
     circuit_breaker: str | None = None
     cooldown: bool = False
     reconciled_closed: list[str] = field(default_factory=list)
+    adopted: list[str] = field(default_factory=list)
     exits: list[dict[str, Any]] = field(default_factory=list)
     entries: list[dict[str, Any]] = field(default_factory=list)
     rejected: list[dict[str, Any]] = field(default_factory=list)
@@ -217,11 +218,12 @@ class PaperTradingCycle:
     # --- reconciliation -------------------------------------------------
     def _reconcile(self, now: datetime, result: CycleResult) -> set[str]:
         broker_positions = self.broker.positions_query(self.account_id, self.trd_env)
-        held_codes = {
-            row["code"]
+        held_rows = [
+            row
             for row in broker_positions
             if row.get("code") and float(row.get("qty") or 0) > 0
-        }
+        ]
+        held_codes = {row["code"] for row in held_rows}
         for ledger in self.position_store.open_positions():
             if ledger["option_code"] not in held_codes:
                 self.position_store.mark_closed(
@@ -234,7 +236,53 @@ class PaperTradingCycle:
                     "position_reconciled_closed",
                     {"option_code": ledger["option_code"], "at": now.isoformat()},
                 )
+        self._adopt_orphans(now, held_rows, result)
         return held_codes
+
+    def _adopt_orphans(
+        self, now: datetime, held_rows: list[dict[str, Any]], result: CycleResult
+    ) -> None:
+        """Adopt broker option positions missing from the local ledger.
+
+        A crash between order fill and ledger write leaves a position the exit
+        engine would otherwise never manage. Adopted positions get the mandate's
+        standard exit plan (+100/-50, time stop at expiry -- the forced-close
+        window still fires first). Non-option holdings are ignored.
+        """
+
+        ledger_open = {r["option_code"] for r in self.position_store.open_positions()}
+        for row in held_rows:
+            code = row["code"]
+            if code in ledger_open:
+                continue
+            try:
+                _, expiry, side, _ = parse_us_option_code(code)
+            except ValueError:
+                continue  # stock or non-US-option holding: not ours to manage
+            entry = float(row.get("cost_price") or 0.0)
+            if entry <= 0:
+                # No usable cost basis: mark from the nominal price so the exit
+                # engine at least has a reference; worst case the stop fires.
+                entry = float(row.get("nominal_price") or 0.0)
+            if entry <= 0:
+                continue
+            self.position_store.open_position(
+                option_code=code,
+                ticker=parse_us_option_code(code)[0],
+                option_side=side,
+                entry_price=entry,
+                contracts=int(float(row.get("qty") or 1)),
+                lot_size=US_OPTION_LOT_SIZE,
+                expiry=expiry,
+                take_profit_pct=100.0,
+                stop_loss_pct=50.0,
+                time_stop=expiry,
+            )
+            result.adopted.append(code)
+            self.audit.append(
+                "position_adopted",
+                {"option_code": code, "entry_price": entry, "at": now.isoformat()},
+            )
 
     # --- exits ----------------------------------------------------------
     def _run_exits(
@@ -731,7 +779,28 @@ class PaperTradingCycle:
             total_drawdown_usd=drawdown,
             consecutive_losses=consecutive_losses,
             duplicate_order_exists=proposal.option_code in held_codes,
+            underlying_already_held=self._same_underlying_held(
+                proposal.option_code, held_codes
+            ),
         )
+
+    @staticmethod
+    def _same_underlying_held(option_code: str, held_codes: set[str]) -> bool:
+        """True when any held option shares the proposal's underlying ticker."""
+
+        try:
+            proposal_root = parse_us_option_code(option_code)[0]
+        except ValueError:
+            return False
+        for held in held_codes:
+            if held == option_code:
+                continue
+            try:
+                if parse_us_option_code(held)[0] == proposal_root:
+                    return True
+            except ValueError:
+                continue  # non-option holdings (e.g. stock) never conflict
+        return False
 
     @staticmethod
     def _date_of(iso: str) -> date:
