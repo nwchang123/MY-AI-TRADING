@@ -39,10 +39,15 @@ _HELP = """可用命令（动作只认命令，AI 无执行权）：
 其他消息会由 AI 助手根据系统状态回答（只读）。"""
 
 _AI_SYSTEM = (
-    "你是一个交易代理系统的运维助手。仅根据提供的系统状态上下文回答操作者的问题，"
-    "用华语，简短直接（最多5句）。你没有任何执行能力：如果操作者想执行动作，"
-    "提示对应命令（/run /halt /resume /status /positions /report）。"
-    "不知道的事情就说不知道，不要编造。"
+    "你是一个自主期权交易代理系统的分析助手，用华语回答操作者的问题。"
+    "你能看到：系统状态、当前持仓、最近的交易记录（进出价格、盈亏、平仓原因），"
+    "以及审计日志摘要——里面有 AI 委员会每次决策的理由、双 AI 的胜率估计、"
+    "蒙特卡洛基线概率、被拒绝的提案和原因。"
+    "回答『交易了什么』『为什么买』『为什么亏』这类问题时，引用这些真实数据："
+    "比如用入场论点+平仓原因+价格变化解释一笔亏损。数据里没有的就直说不知道，"
+    "绝不编造。保持简短（最多8句）。"
+    "你没有任何执行能力：操作者想执行动作时，提示对应命令"
+    "（/run /halt /resume /status /positions /report）。"
 )
 
 
@@ -68,6 +73,9 @@ class TelegramBot:
             settings.root_dir / "runtime" / "llm_budget.bot.json",
             BOT_LLM_DAILY_TOKENS,
         )
+        # Short in-memory chat history so follow-up questions ("那为什么亏?")
+        # keep their referent. Lost on restart by design.
+        self.history: list[tuple[str, str]] = []
 
     # --- plumbing --------------------------------------------------------
     def _http_request(self, method: str, payload: dict[str, Any] | None) -> dict[str, Any]:
@@ -155,6 +163,102 @@ class TelegramBot:
             )
         return "\n".join(lines)
 
+    def _trades_text(self, limit: int = 15) -> str:
+        rows = self._store().all_positions()
+        closed = [
+            r
+            for r in rows
+            if r["status"] == "closed" and r["exit_price"] is not None
+        ]
+        closed.sort(key=lambda r: str(r.get("closed_at") or ""))
+        reconciled = sum(
+            1 for r in rows if r["status"] == "closed" and r["exit_price"] is None
+        )
+        if not closed and not reconciled:
+            return "最近交易记录：还没有任何已平仓的交易。"
+        lines = ["最近交易记录（已平仓，按时间）："]
+        for r in closed[-limit:]:
+            pnl = (r["exit_price"] - r["entry_price"]) * r["contracts"] * r["lot_size"]
+            lines.append(
+                f"{str(r.get('closed_at') or '')[:10]} {r['option_code']}"
+                f"（{r['ticker']} {r['option_side']}）"
+                f" 入 {r['entry_price']} → 出 {r['exit_price']}"
+                f" 盈亏 ${pnl:+.2f} 平仓原因: {r.get('close_reason')}"
+            )
+        if reconciled:
+            lines.append(f"另有 {reconciled} 笔对账平仓（无成交价记录）。")
+        return "\n".join(lines)
+
+    def _audit_digest(self, limit: int = 50) -> str:
+        """Compact recent-decision trail for the Q&A context.
+
+        Committee rationales and probability estimates are what let the AI
+        answer "why did it buy/lose" with the system's own reasoning instead
+        of guessing.
+        """
+
+        events = read_audit_events(self._runtime() / "audit.jsonl")
+        lines: list[str] = []
+        for event in events[-400:]:
+            etype = event.get("event_type", "")
+            payload = event.get("payload", {}) or {}
+            at = str(event.get("recorded_at", ""))[:16]
+            if etype in {"committee_run", "committee_cache_hit"}:
+                output = payload.get("output", {}) or {}
+                rationale = str(output.get("rationale", ""))[:180]
+                wp = output.get("win_probability")
+                tag = "委员会" if etype == "committee_run" else "委员会(缓存)"
+                lines.append(
+                    f"{at} {tag}[{payload.get('ticker')}] {payload.get('decision')}"
+                    + (f" 胜率估计={wp}" if wp is not None else "")
+                    + (f" 理由: {rationale}" if rationale else "")
+                )
+            elif etype == "monte_carlo_pop":
+                lines.append(
+                    f"{at} 蒙特卡洛[{payload.get('option_code')}]"
+                    f" 基线概率={payload.get('pop')}（门槛 {payload.get('floor')}）"
+                )
+            elif etype == "order_filled":
+                lines.append(
+                    f"{at} 成交 {payload.get('option_code')}"
+                    f" {payload.get('side')} @ {payload.get('price')}"
+                )
+            elif etype == "position_closed":
+                lines.append(
+                    f"{at} 平仓 {payload.get('option_code')}"
+                    f" 原因: {payload.get('reason')}"
+                    f" 盈亏 ${payload.get('realized_pnl_usd')}"
+                )
+            elif etype in {
+                "universe_selected",
+                "no_eligible_contracts",
+                "entries_skipped",
+                "proposal_rejected",
+                "order_cancelled",
+                "position_adopted",
+                "circuit_breaker_tripped",
+                "kill_switch_activated",
+                "kill_switch_cleared",
+                "cycle_crashed",
+                "llm_budget_exhausted",
+                "risk_caps_scaled",
+            }:
+                detail = json.dumps(payload, ensure_ascii=False)[:140]
+                lines.append(f"{at} {etype}: {detail}")
+        if not lines:
+            return "审计日志：还没有任何决策记录。"
+        return "审计日志摘要（最近的决策轨迹）：\n" + "\n".join(lines[-limit:])
+
+    def _qa_context(self) -> str:
+        return "\n\n".join(
+            [
+                self._status_text(),
+                self._positions_text(),
+                self._trades_text(),
+                self._audit_digest(),
+            ]
+        )
+
     def _report_text(self) -> str:
         events = read_audit_events(self._runtime() / "audit.jsonl")
         report = build_daily_report(events, market_date(self._now()))
@@ -239,18 +343,28 @@ class TelegramBot:
         today = market_date(self._now())
         if self.llm_budget.remaining(today) <= 0:
             return "今天 AI 问答的 token 预算用完了，明天恢复。命令仍然可用。"
-        context = self._status_text() + "\n\n" + self._positions_text()
+        context = self._qa_context()
+        history = "\n".join(
+            f"操作者: {q}\n助手: {a}" for q, a in self.history[-4:]
+        )
+        history_block = f"\n\n[之前的对话]\n{history}" if history else ""
         try:
             before = getattr(self.llm, "usage", None)
             before_total = before.total_tokens if before is not None else 0
             answer = self.llm.complete(
                 system=_AI_SYSTEM,
-                user=f"系统状态：\n{context}\n\n操作者的问题：{question}",
+                user=(
+                    f"[系统数据]\n{context}{history_block}\n\n"
+                    f"操作者的问题：{question}"
+                ),
             )
             after = getattr(self.llm, "usage", None)
             if after is not None:
                 self.llm_budget.add(after.total_tokens - before_total, today)
-            return answer.strip()[:3500]
+            answer = answer.strip()[:3500]
+            self.history.append((question, answer))
+            del self.history[:-8]
+            return answer
         except Exception as exc:  # noqa: BLE001
             return f"AI 回答失败：{exc}\n命令仍然可用（/help）。"
 

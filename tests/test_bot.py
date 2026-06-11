@@ -108,6 +108,77 @@ def test_plain_text_goes_to_ai_with_context(tmp_path: Path) -> None:
     assert "没有任何执行能力" in llm.calls[0]["system"]
 
 
+def _seed_losing_trade(tmp_path: Path) -> None:
+    from datetime import date
+
+    from trading_agent.storage.audit import AuditWriter
+    from trading_agent.storage.positions import PositionStore
+
+    store = PositionStore(tmp_path / "runtime" / "positions.paper.sqlite")
+    store.open_position(
+        option_code="US.DEMO260717C5000",
+        ticker="DEMO",
+        option_side="call",
+        entry_price=0.20,
+        contracts=1,
+        lot_size=100,
+        expiry=date(2026, 7, 17),
+        take_profit_pct=100,
+        stop_loss_pct=50,
+        time_stop=date(2026, 7, 10),
+    )
+    store.mark_closed(
+        "US.DEMO260717C5000", close_reason="stop loss", exit_price=0.10
+    )
+    audit = AuditWriter(tmp_path / "runtime" / "audit.jsonl")
+    audit.append(
+        "committee_run",
+        {
+            "ticker": "DEMO",
+            "decision": "open_position",
+            "output": {
+                "rationale": "8-K披露重大供货协议，预期两周内放量",
+                "win_probability": 0.62,
+            },
+        },
+    )
+    audit.append(
+        "position_closed",
+        {
+            "option_code": "US.DEMO260717C5000",
+            "reason": "stop loss",
+            "realized_pnl_usd": -10.0,
+        },
+    )
+
+
+def test_ai_context_includes_trades_and_committee_rationale(tmp_path: Path) -> None:
+    # The user must be able to ask "what did it trade and why did it lose":
+    # the AI's context carries the trade P/L, the close reason, and the
+    # committee's own entry rationale from the audit log.
+    _seed_losing_trade(tmp_path)
+    llm = FakeLLM()
+    _bot(tmp_path, llm=llm).handle_text("今天交易了哪只股票？为什么会亏？")
+
+    prompt = llm.calls[0]["user"]
+    assert "US.DEMO260717C5000" in prompt
+    assert "$-10.00" in prompt  # trade P/L from the ledger
+    assert "stop loss" in prompt  # close reason
+    assert "8-K披露重大供货协议" in prompt  # committee's entry rationale
+    assert "胜率估计=0.62" in prompt
+
+
+def test_followup_questions_carry_conversation_history(tmp_path: Path) -> None:
+    llm = FakeLLM(reply="买了 DEMO 的看涨期权")
+    bot = _bot(tmp_path, llm=llm)
+    bot.handle_text("今天交易了什么？")
+    bot.handle_text("那为什么亏了？")
+
+    second_prompt = llm.calls[1]["user"]
+    assert "今天交易了什么" in second_prompt  # previous question
+    assert "买了 DEMO 的看涨期权" in second_prompt  # previous answer
+
+
 def test_plain_text_without_llm_points_to_commands(tmp_path: Path) -> None:
     reply = _bot(tmp_path).handle_text("随便聊聊")
     assert "AI 助手未配置" in reply
