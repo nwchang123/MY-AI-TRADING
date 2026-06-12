@@ -98,6 +98,11 @@ class ExecutionMandate(BaseModel):
     # the committee is skipped until the next market day. Protects the API
     # balance from a runaway loop. 0 disables.
     max_daily_llm_tokens: int = Field(default=0, ge=0)
+    # Broker commission per contract PER SIDE, deducted from realized ledger
+    # P/L (a round trip costs 2x this). Keep 0 in paper -- Moomoo SIMULATE
+    # charges no fees, and the local ledger must mirror the broker sim. Set it
+    # for live so compounding, the loss stops, and reports reflect NET P/L.
+    commission_per_contract_usd: float = Field(default=0.0, ge=0)
 
     def max_quote_age_seconds(self, is_delayed: bool) -> int:
         """Staleness ceiling for a quote, widened for delayed data feeds."""

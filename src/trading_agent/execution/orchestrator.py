@@ -95,6 +95,7 @@ class PaperTradingCycle:
         decision_cache: DecisionCache | None = None,
         llm_budget: DailyTokenBudget | None = None,
         moomoo_market: Any | None = None,
+        earnings_client: Any | None = None,
     ):
         if trd_env not in {"SIMULATE", "REAL"}:
             raise ValueError("trd_env must be 'SIMULATE' or 'REAL'")
@@ -115,6 +116,7 @@ class PaperTradingCycle:
         self.decision_cache = decision_cache
         self.llm_budget = llm_budget
         self.moomoo_market = moomoo_market
+        self.earnings_client = earnings_client
         # Refreshed at the start of every cycle: when the account compounds,
         # these carry the equity-scaled risk caps; otherwise they alias the
         # injected gate/liquidity unchanged.
@@ -394,7 +396,10 @@ class PaperTradingCycle:
                 continue
             exit_price = fill.dealt_avg_price
             realized = round(
-                (exit_price - ledger["entry_price"]) * ledger["contracts"] * ledger["lot_size"],
+                self._net_pnl(
+                    ledger["entry_price"], exit_price,
+                    ledger["contracts"], ledger["lot_size"],
+                ),
                 4,
             )
             self.position_store.mark_closed(
@@ -613,6 +618,13 @@ class PaperTradingCycle:
                 )
             except Exception as exc:  # noqa: BLE001
                 self._record_error(result, "news_fetch", ticker, exc)
+        if self.earnings_client is not None:
+            # Upcoming earnings inside the holding window: feeds the existing
+            # earnings_iv_crush red flag BEFORE the print, not after it.
+            try:
+                evidence.extend(self.earnings_client.fetch_evidence(ticker))
+            except Exception as exc:  # noqa: BLE001
+                self._record_error(result, "earnings_fetch", ticker, exc)
         return evidence
 
     def _underlying_snapshot(
@@ -926,9 +938,23 @@ class PaperTradingCycle:
         closed.sort(key=lambda r: str(r.get("closed_at") or ""))
         return closed
 
-    @staticmethod
-    def _row_pnl(row: dict[str, Any]) -> float:
-        return (row["exit_price"] - row["entry_price"]) * row["contracts"] * row["lot_size"]
+    def _net_pnl(
+        self, entry_price: float, exit_price: float, contracts: int, lot_size: int
+    ) -> float:
+        """Realized P/L net of broker commissions (a round trip = 2 sides).
+
+        Paper keeps commission at 0 so the ledger mirrors the broker sim; live
+        sets it so compounding, the loss stops, and reports see NET results.
+        """
+
+        gross = (exit_price - entry_price) * contracts * lot_size
+        fees = 2 * self.mandate.execution.commission_per_contract_usd * contracts
+        return gross - fees
+
+    def _row_pnl(self, row: dict[str, Any]) -> float:
+        return self._net_pnl(
+            row["entry_price"], row["exit_price"], row["contracts"], row["lot_size"]
+        )
 
     def _equity_and_peak(self) -> tuple[float, float]:
         """Realized equity and its high-water mark, replayed from the ledger.

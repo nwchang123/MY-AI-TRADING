@@ -3,9 +3,11 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from functools import lru_cache
 
-# Regular U.S. equity/option session in Eastern time (ignores early-close days).
+# Regular U.S. equity/option session in Eastern time.
 MARKET_OPEN = time(9, 30)
 MARKET_CLOSE = time(16, 0)
+# NYSE half days (July 3, day after Thanksgiving, Christmas Eve) close at 13:00.
+EARLY_CLOSE = time(13, 0)
 
 try:
     from zoneinfo import ZoneInfo
@@ -93,12 +95,36 @@ def is_trading_day(day: date) -> bool:
     return day.weekday() < 5 and day not in us_market_holidays(day.year)
 
 
-def is_market_hours(now: datetime) -> bool:
-    """True if ``now`` is within the regular U.S. session (9:30-16:00 ET) on a
-    trading day. Requires a timezone-aware datetime.
+@lru_cache(maxsize=32)
+def us_early_close_dates(year: int) -> frozenset[date]:
+    """NYSE/Nasdaq 13:00 ET half days (observed dates).
 
-    Does not model early-close half-days; it is a coarse gate for the autonomous
-    loop, not an execution-timing guarantee.
+    July 3 and Christmas Eve count only when they are themselves trading days
+    (e.g. 2026's July 3 is the observed Independence Day holiday, not a half
+    day); the day after Thanksgiving is always a trading Friday.
+    """
+
+    days: set[date] = set()
+    july3 = date(year, 7, 3)
+    if is_trading_day(july3):
+        days.add(july3)
+    thanksgiving = _nth_weekday(year, 11, 3, 4)
+    days.add(thanksgiving + timedelta(days=1))
+    dec24 = date(year, 12, 24)
+    if is_trading_day(dec24):
+        days.add(dec24)
+    return frozenset(days)
+
+
+def market_close_time(day: date) -> time:
+    """The session close for a date: 13:00 ET on half days, 16:00 otherwise."""
+
+    return EARLY_CLOSE if day in us_early_close_dates(day.year) else MARKET_CLOSE
+
+
+def is_market_hours(now: datetime) -> bool:
+    """True if ``now`` is within the U.S. session on a trading day, honoring
+    13:00 ET early closes. Requires a timezone-aware datetime.
     """
 
     if now.tzinfo is None:
@@ -106,7 +132,7 @@ def is_market_hours(now: datetime) -> bool:
     eastern = now.astimezone(MARKET_TZ) if MARKET_TZ is not None else now
     if not is_trading_day(eastern.date()):
         return False
-    return MARKET_OPEN <= eastern.time() <= MARKET_CLOSE
+    return MARKET_OPEN <= eastern.time() <= market_close_time(eastern.date())
 
 
 def minutes_since_open(now: datetime) -> float | None:

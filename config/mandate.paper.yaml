@@ -67,6 +67,9 @@ portfolio:
   max_vix_for_entries: 35
 
 execution:
+  # 0 on purpose: Moomoo SIMULATE charges no fees, and the local ledger must
+  # mirror the broker sim. Live sets a real per-side commission.
+  commission_per_contract_usd: 0
   stale_quote_seconds: 15
   # Wider age limit applied only to delayed free-feed quotes (CBOE/Tradier ~15min).
   delayed_quote_max_age_seconds: 1200

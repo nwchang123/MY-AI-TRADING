@@ -1,10 +1,13 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 
 from trading_agent.domain.calendar import (
+    is_market_hours,
     is_trading_day,
+    market_close_time,
     market_date,
     minutes_since_open,
     trading_days_until,
+    us_early_close_dates,
     us_market_holidays,
 )
 
@@ -49,3 +52,29 @@ def test_market_date_uses_eastern() -> None:
     # 02:00 UTC on 2026-06-02 is still 2026-06-01 in New York.
     moment = datetime(2026, 6, 2, 2, 0, tzinfo=timezone.utc)
     assert market_date(moment) == date(2026, 6, 1)
+
+
+def test_early_close_dates_2026() -> None:
+    half_days = us_early_close_dates(2026)
+    assert date(2026, 11, 27) in half_days  # day after Thanksgiving
+    assert date(2026, 12, 24) in half_days  # Christmas Eve (Thursday)
+    # July 3 2026 is the OBSERVED July-4 holiday (full close), not a half day.
+    assert date(2026, 7, 3) not in half_days
+
+
+def test_early_close_july3_when_it_trades() -> None:
+    # 2025: July 4 is a Friday holiday; July 3 (Thursday) trades and closes early.
+    assert date(2025, 7, 3) in us_early_close_dates(2025)
+    assert market_close_time(date(2025, 7, 3)) == time(13, 0)
+    assert market_close_time(date(2025, 7, 2)) == time(16, 0)
+
+
+def test_is_market_hours_honors_early_close() -> None:
+    # Fri 2026-11-27 (half day): 12:30 ET open, 14:00 ET closed.
+    open_moment = datetime(2026, 11, 27, 17, 30, tzinfo=timezone.utc)  # 12:30 ET (EST)
+    closed_moment = datetime(2026, 11, 27, 19, 0, tzinfo=timezone.utc)  # 14:00 ET
+    assert is_market_hours(open_moment) is True
+    assert is_market_hours(closed_moment) is False
+    # A normal Friday at 14:00 ET is open.
+    normal = datetime(2026, 11, 20, 19, 0, tzinfo=timezone.utc)
+    assert is_market_hours(normal) is True

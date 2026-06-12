@@ -14,6 +14,7 @@ from trading_agent.brokers.moomoo import (
     MoomooConnection,
     assert_opend_reachable,
 )
+from trading_agent.data.earnings import YahooEarningsCalendar
 from trading_agent.data.moomoo_market import MoomooMarket
 from trading_agent.data.news_feeds import GoogleNewsClient
 from trading_agent.data.option_data import OptionDataProvider, build_option_provider
@@ -328,6 +329,7 @@ def _build_cycle(
             else None
         ),
         moomoo_market=_market(settings),
+        earnings_client=YahooEarningsCalendar(),
     )
 
 

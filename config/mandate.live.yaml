@@ -51,6 +51,10 @@ portfolio:
   max_vix_for_entries: 35
 
 execution:
+  # Per contract PER SIDE, deducted from realized ledger P/L (~ commission
+  # USD0.65 + platform USD0.30 per contract on Moomoo; VERIFY against your
+  # actual fee schedule before going live).
+  commission_per_contract_usd: 0.95
   stale_quote_seconds: 15
   # Live should ideally trade on a real-time feed; this delayed ceiling is a
   # safety net for delayed-data quotes. Tighten or pay for real-time before live.

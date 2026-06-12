@@ -56,6 +56,51 @@ def _bot(tmp_path: Path, llm=None, spawned=None) -> TelegramBot:
     )
 
 
+def _write_heartbeat(tmp_path: Path, at: datetime) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(exist_ok=True)
+    (runtime / "heartbeat.json").write_text(
+        json.dumps({"at": at.isoformat(), "note": "cycle done"}), encoding="utf-8"
+    )
+
+
+def test_deadman_alerts_on_stale_heartbeat_during_market_hours(tmp_path: Path) -> None:
+    from datetime import timedelta
+
+    bot = _bot(tmp_path)  # NOW = 2026-06-11 15:00 UTC = 11:00 ET Thursday (open)
+    _write_heartbeat(tmp_path, NOW - timedelta(minutes=90))
+
+    alert = bot.maybe_alert_dead_loop()
+
+    assert alert is not None and "死人开关" in alert
+    # Re-alert is throttled: a second check inside the hour stays silent.
+    assert bot.maybe_alert_dead_loop() is None
+
+
+def test_deadman_alerts_when_heartbeat_missing(tmp_path: Path) -> None:
+    bot = _bot(tmp_path)
+    alert = bot.maybe_alert_dead_loop()
+    assert alert is not None and "心跳文件不存在" in alert
+
+
+def test_deadman_quiet_with_fresh_heartbeat(tmp_path: Path) -> None:
+    from datetime import timedelta
+
+    bot = _bot(tmp_path)
+    _write_heartbeat(tmp_path, NOW - timedelta(minutes=10))
+    assert bot.maybe_alert_dead_loop() is None
+
+
+def test_deadman_quiet_when_market_closed(tmp_path: Path) -> None:
+    closed = datetime(2026, 6, 13, 15, 0, tzinfo=timezone.utc)  # Saturday
+    bot = TelegramBot(
+        _settings(tmp_path),
+        http_fn=lambda method, payload: {"ok": True, "result": []},
+        now_fn=lambda: closed,
+    )
+    assert bot.maybe_alert_dead_loop() is None  # no heartbeat, but market shut
+
+
 def test_help_lists_commands(tmp_path: Path) -> None:
     reply = _bot(tmp_path).handle_text("/help")
     for cmd in ("/status", "/run", "/halt", "/resume", "/positions", "/report"):

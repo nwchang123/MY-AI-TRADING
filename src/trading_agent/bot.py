@@ -28,6 +28,14 @@ _API = "https://api.telegram.org/bot{token}/{method}"
 # Daily token ceiling for bot Q&A, separate from the trading committee budget.
 BOT_LLM_DAILY_TOKENS = 50_000
 
+# Dead-man's switch: the run-loop touches heartbeat.json every tick (~30 min),
+# even on skipped cycles. If the market is OPEN and the heartbeat is older than
+# this, the loop is dead or never started -- and since the loop announces its
+# own start/stop, a loop that never starts produces NO message at all. This is
+# the alarm for that silence. Re-alerts at most once per hour.
+DEADMAN_STALE_SECONDS = 45 * 60
+DEADMAN_REALERT_SECONDS = 60 * 60
+
 _HELP = """可用命令（动作只认命令，AI 无执行权）：
 /status — 系统状态（心跳/HALT/持仓/权益）
 /run — 立即启动今天的交易循环
@@ -76,6 +84,7 @@ class TelegramBot:
         # Short in-memory chat history so follow-up questions ("那为什么亏?")
         # keep their referent. Lost on restart by design.
         self.history: list[tuple[str, str]] = []
+        self._last_deadman_alert: datetime | None = None
 
     # --- plumbing --------------------------------------------------------
     def _http_request(self, method: str, payload: dict[str, Any] | None) -> dict[str, Any]:
@@ -264,14 +273,52 @@ class TelegramBot:
         report = build_daily_report(events, market_date(self._now()))
         return "今日报告：\n" + json.dumps(report, ensure_ascii=False, indent=1)[:3500]
 
-    def _loop_running(self) -> bool:
+    def _heartbeat_age_seconds(self) -> float | None:
+        """Seconds since the loop last touched heartbeat.json; None if absent."""
+
         heartbeat = self._runtime() / "heartbeat.json"
         try:
             beat = json.loads(heartbeat.read_text(encoding="utf-8"))
             at = datetime.fromisoformat(beat["at"])
         except (FileNotFoundError, ValueError, KeyError):
-            return False
-        return (self._now() - at).total_seconds() < 45 * 60
+            return None
+        return (self._now() - at).total_seconds()
+
+    def _loop_running(self) -> bool:
+        age = self._heartbeat_age_seconds()
+        return age is not None and age < DEADMAN_STALE_SECONDS
+
+    def maybe_alert_dead_loop(self) -> str | None:
+        """Dead-man's switch: alert when the market is open but the loop is silent.
+
+        Returns the alert text when one was sent (for tests), else None. The
+        HALT switch does not suppress this -- a halted loop still heartbeats on
+        every skipped tick, so a stale heartbeat always means a dead process.
+        """
+
+        now = self._now()
+        if not is_market_hours(now):
+            return None
+        age = self._heartbeat_age_seconds()
+        if age is not None and age < DEADMAN_STALE_SECONDS:
+            return None
+        if (
+            self._last_deadman_alert is not None
+            and (now - self._last_deadman_alert).total_seconds() < DEADMAN_REALERT_SECONDS
+        ):
+            return None
+        self._last_deadman_alert = now
+        detail = "心跳文件不存在" if age is None else f"心跳已 {age / 60:.0f} 分钟没有更新"
+        mode_label = "模拟盘" if self.settings.mode == "paper" else "实盘"
+        text = (
+            f"【{mode_label}】🚨 死人开关报警：美股开市中，但交易循环{detail}。\n"
+            "循环可能没有启动或已挂死。用 /run 启动，/status 查看详情。"
+        )
+        self._audit().append(
+            "deadman_alert", {"heartbeat_age_seconds": age, "at": now.isoformat()}
+        )
+        self.send(text)
+        return text
 
     def _spawn_loop(self) -> None:
         script = self.settings.root_dir / "scripts" / "run_paper_loop.ps1"
@@ -410,6 +457,9 @@ def run_bot(settings: Settings) -> None:
     while True:
         try:
             bot.poll_once()
+            # Dead-man's switch rides the poll cadence (one long-poll ~50s):
+            # market open + stale heartbeat -> alert the operator.
+            bot.maybe_alert_dead_loop()
         except KeyboardInterrupt:
             bot.send("🤖 控制台已下线。")
             raise

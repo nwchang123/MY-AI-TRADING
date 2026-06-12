@@ -779,6 +779,43 @@ def _seed_closed(store: PositionStore, code: str, entry: float, exit_price: floa
             )
 
 
+def test_commission_reduces_realized_ledger_pnl(tmp_path: Path) -> None:
+    # Live sets a per-side commission; equity replay must be NET of fees: a
+    # +$100 gross win at $0.95/side nets 100 - 1.90 = 98.10.
+    store = PositionStore(tmp_path / "positions.sqlite")
+    _seed_closed(store, "US.WIN260626C00005000", entry=0.20, exit_price=1.20)
+
+    mandate = _mandate()
+    execution = mandate.execution.model_copy(
+        update={"commission_per_contract_usd": 0.95}
+    )
+    mandate = mandate.model_copy(update={"execution": execution})
+    cycle = PaperTradingCycle(
+        mandate=mandate,
+        account_id=123,
+        market=FakeMarket(),
+        broker=FakeBroker(),
+        sec_client=FakeSec(),
+        committee=_committee([]),
+        gate=RiskGate(mandate, tmp_path),
+        liquidity=LiquidityValidator(mandate.options, mandate.execution),
+        position_store=store,
+        audit=AuditWriter(tmp_path / "audit.jsonl"),
+        now_fn=lambda: NOW,
+        order_poll_interval_seconds=0.1,
+        sleep_fn=lambda _seconds: None,
+    )
+
+    equity, peak = cycle._equity_and_peak()
+    assert equity == 198.1  # 100 initial + 100 gross - 1.90 round-trip fees
+    assert peak == 198.1
+
+
+def test_paper_mandate_keeps_zero_commission(tmp_path: Path) -> None:
+    # Paper must mirror the broker sim (which charges nothing); the yaml pins 0.
+    assert _mandate().execution.commission_per_contract_usd == 0
+
+
 def test_compounding_win_unlocks_bigger_contracts(tmp_path: Path) -> None:
     # A realized +$100 win doubles equity; the $65 contract cap scales to $130,
     # so a $0.80-ask contract (cost ~$81, rejected at the $65 base) becomes
