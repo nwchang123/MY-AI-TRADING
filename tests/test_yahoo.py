@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -27,11 +27,19 @@ class FakeChain:
 
 
 class FakeTicker:
-    def __init__(self, options: list[str], chains: dict[str, FakeChain]):
+    def __init__(
+        self,
+        options: list[str],
+        chains: dict[str, FakeChain],
+        fast_info: dict | None = None,
+    ):
         self.options = options
         self._chains = chains
+        self.fast_info = fast_info
+        self.option_chain_calls = 0
 
     def option_chain(self, exp: str) -> FakeChain:
+        self.option_chain_calls += 1
         return self._chains[exp]
 
 
@@ -157,6 +165,74 @@ def test_is_listed_option_checks_only_the_contract_expiry() -> None:
     assert provider.is_listed_option("US.AAPL260626C125000") is True
     assert provider.is_listed_option("US.AAPL260626C999000") is False
     assert provider.is_listed_option("garbage") is False
+
+
+# --- caching --------------------------------------------------------------
+
+
+def test_chain_is_fetched_once_per_expiry_within_ttl() -> None:
+    chains = {"2026-06-26": FakeChain(calls=[_row("AAPL260626C00125000", 125.0)], puts=[])}
+    ticker = FakeTicker(["2026-06-26"], chains)
+    provider = _provider(ticker)  # fixed clock at NOW -> never expires
+
+    # is_optionable -> probe -> eligible -> quote all touch the same expiry; the
+    # network fetch must happen once, not four times.
+    provider.is_optionable("AAPL")
+    provider.option_chain("AAPL", date(2026, 6, 16), date(2026, 7, 16))
+    provider.option_chain("AAPL", date(2026, 6, 16), date(2026, 7, 16))
+    provider.option_quote(option_code="US.AAPL260626C125000", expiry=date(2026, 6, 26))
+
+    assert ticker.option_chain_calls == 1
+
+
+def test_cache_expires_after_ttl() -> None:
+    chains = {"2026-06-26": FakeChain(calls=[_row("AAPL260626C00125000", 125.0)], puts=[])}
+    ticker = FakeTicker(["2026-06-26"], chains)
+    clock = [NOW]
+    provider = YahooOptionData(
+        now_fn=lambda: clock[0], ticker_factory=lambda s: ticker, cache_ttl_seconds=30.0
+    )
+
+    provider.option_chain("AAPL", date(2026, 6, 16), date(2026, 7, 16))
+    clock[0] = NOW + timedelta(seconds=31)  # past the TTL
+    provider.option_chain("AAPL", date(2026, 6, 16), date(2026, 7, 16))
+
+    assert ticker.option_chain_calls == 2  # refetched after expiry
+
+
+# --- underlying_snapshot (restores the VIX guard) -------------------------
+
+
+def test_underlying_snapshot_maps_vix_symbol_and_reads_price() -> None:
+    seen: list[str] = []
+    ticker = FakeTicker(
+        [], {}, fast_info={"last_price": 18.5, "previous_close": 17.0,
+                           "day_high": 19.0, "day_low": 16.5}
+    )
+
+    def factory(symbol: str):
+        seen.append(symbol)
+        return ticker
+
+    snap = YahooOptionData(ticker_factory=factory).underlying_snapshot("_VIX")
+
+    assert seen == ["^VIX"]  # CBOE-style _VIX mapped to yfinance ^VIX
+    assert snap["price"] == 18.5
+    assert snap["day_high"] == 19.0
+    assert snap["day_low"] == 16.5
+    assert snap["change_pct"] == round((18.5 - 17.0) / 17.0 * 100, 2)
+
+
+def test_underlying_snapshot_plain_ticker_strips_us_prefix() -> None:
+    seen: list[str] = []
+    ticker = FakeTicker([], {}, fast_info={"last_price": 5.0})
+    YahooOptionData(ticker_factory=lambda s: seen.append(s) or ticker).underlying_snapshot("US.AAPL")
+    assert seen == ["AAPL"]
+
+
+def test_underlying_snapshot_empty_when_no_data() -> None:
+    ticker = FakeTicker([], {}, fast_info=None)
+    assert YahooOptionData(ticker_factory=lambda s: ticker).underlying_snapshot("_VIX") == {}
 
 
 def test_provider_normalizes_yfinance_errors() -> None:

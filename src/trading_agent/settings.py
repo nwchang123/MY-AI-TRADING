@@ -34,7 +34,8 @@ class Settings:
     sec_user_agent: str = ""
     live_account_allowlist: tuple[int, ...] = ()
     # Option data comes from a free delayed feed (Moomoo does not entitle US
-    # option quotes); execution stays on Moomoo. Source: cboe | tradier | cboe+tradier.
+    # option quotes); execution stays on Moomoo. Source is one of yahoo | cboe |
+    # tradier, or a '+'-joined fallback chain like yahoo+cboe (tried in order).
     option_data_source: str = "cboe"
     tradier_token: str = ""
     tradier_base_url: str = "https://sandbox.tradier.com/v1"

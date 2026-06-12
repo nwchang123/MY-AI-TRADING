@@ -212,6 +212,53 @@ def _fake_sdk(ctx: FakeQuoteContext) -> SimpleNamespace:
     )
 
 
+class FakeStockSnapshotContext:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def subscribe(self, *args, **kwargs):
+        return 0, None
+
+    def get_market_snapshot(self, codes):
+        return 0, FakeFrame(
+            [
+                {
+                    "last_price": 18.5,
+                    "prev_close_price": 17.0,
+                    "open": 17.2,
+                    "high_price": 19.0,
+                    "low_price": 16.5,
+                    "volume": 1_000_000,
+                    "turnover": 5_000_000.0,
+                }
+            ]
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_stock_snapshot_uses_cboe_shaped_keys(monkeypatch) -> None:
+    ctx = FakeStockSnapshotContext()
+    sdk = SimpleNamespace(
+        RET_OK=0,
+        OpenQuoteContext=lambda **kwargs: ctx,
+        SubType=SimpleNamespace(QUOTE="QUOTE"),
+    )
+    monkeypatch.setattr(MoomooMarket, "_sdk", staticmethod(lambda: sdk))
+    market = MoomooMarket(MoomooConnection(host="127.0.0.1", port=11111))
+
+    snap = market.stock_snapshot("AAPL")
+
+    # day_high/day_low (not high/low) so the committee briefing reads them.
+    assert snap["day_high"] == 19.0
+    assert snap["day_low"] == 16.5
+    assert "high" not in snap and "low" not in snap
+    assert snap["price"] == 18.5
+    assert snap["change_pct"] == round((18.5 - 17.0) / 17.0 * 100, 2)
+    assert ctx.closed is True
+
+
 def test_scan_small_caps_parses_and_closes(monkeypatch) -> None:
     ctx = FakeQuoteContext()
     monkeypatch.setattr(MoomooMarket, "_sdk", staticmethod(lambda: _fake_sdk(ctx)))

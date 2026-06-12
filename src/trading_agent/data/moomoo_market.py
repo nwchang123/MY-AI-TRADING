@@ -395,12 +395,16 @@ class MoomooMarket:
             if prev_close > 0:
                 change_pct = ((last_price - prev_close) / prev_close) * 100
 
+            # Keys mirror the CBOE underlying snapshot (parse_cboe_underlying) so
+            # this is a drop-in for the committee briefing, which reads
+            # day_high/day_low. iv30 is not available from a stock snapshot, so
+            # the committee simply omits the IV line under this source.
             return {
                 "price": last_price,
                 "prev_close": prev_close,
                 "open": open_price,
-                "high": high,
-                "low": low,
+                "day_high": high,
+                "day_low": low,
                 "volume": volume,
                 "turnover": turnover,
                 "change_pct": round(change_pct, 2),

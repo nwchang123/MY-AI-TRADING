@@ -7,6 +7,11 @@ dependency. The critical detail: yfinance returns OCC ``contractSymbol`` strings
 (``AAPL260612C00125000`` -- no ``US.`` prefix, 8-digit padded strike), which
 ``parse_us_option_code`` rejects and the Moomoo broker will not place. Every row
 is converted with ``occ_to_moomoo_code`` so the codes parse and trade unchanged.
+
+Per-symbol results are cached for ``cache_ttl_seconds`` because one ticker is
+touched several times per cycle (is_optionable -> probe -> eligible -> quote);
+without the cache each touch re-fetched the chain, hammering Yahoo's unofficial
+endpoint hard enough to get throttled in an unattended loop.
 """
 from __future__ import annotations
 
@@ -73,14 +78,19 @@ class YahooOptionData:
         self,
         *,
         timeout: float = 20.0,
+        cache_ttl_seconds: float = 30.0,
         now_fn: Callable[[], datetime] | None = None,
         ticker_factory: Callable[[str], Any] | None = None,
     ):
         self.timeout = timeout
+        self.cache_ttl_seconds = cache_ttl_seconds
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         # Injectable so the parsing/format logic is unit-testable without hitting
         # Yahoo over the network.
         self._ticker_factory = ticker_factory or self._yfinance_ticker
+        # symbol -> (fetched_at, expiration strings); (symbol, exp) -> (fetched_at, contracts)
+        self._exp_cache: dict[str, tuple[datetime, list[str]]] = {}
+        self._chain_cache: dict[tuple[str, str], tuple[datetime, list[dict[str, Any]]]] = {}
 
     @staticmethod
     def _yfinance_ticker(symbol: str) -> Any:
@@ -92,20 +102,44 @@ class YahooOptionData:
             ) from exc
         return yf.Ticker(symbol)
 
-    def _get_ticker(self, underlying: str) -> Any:
-        return self._ticker_factory(underlying_symbol(underlying))
+    def _fresh(self, fetched_at: datetime) -> bool:
+        return (self._now_fn() - fetched_at).total_seconds() < self.cache_ttl_seconds
+
+    def _expiry_strings(self, symbol: str) -> list[str]:
+        cached = self._exp_cache.get(symbol)
+        if cached and self._fresh(cached[0]):
+            return cached[1]
+        options = list(self._ticker_factory(symbol).options or [])
+        self._exp_cache[symbol] = (self._now_fn(), options)
+        return options
+
+    def _contracts_for_expiry(
+        self, symbol: str, exp_str: str, expiry: date
+    ) -> list[dict[str, Any]]:
+        key = (symbol, exp_str)
+        cached = self._chain_cache.get(key)
+        if cached and self._fresh(cached[0]):
+            return cached[1]
+        chain = self._ticker_factory(symbol).option_chain(exp_str)
+        rows: list[dict[str, Any]] = []
+        for side, frame in (("call", chain.calls), ("put", chain.puts)):
+            for _, row in frame.iterrows():
+                contract = yahoo_row_to_contract(row, side, expiry)
+                if contract is not None:
+                    rows.append(contract)
+        self._chain_cache[key] = (self._now_fn(), rows)
+        return rows
 
     def is_optionable(self, underlying: str) -> bool:
         try:
-            return bool(self._get_ticker(underlying).options)
+            return bool(self._expiry_strings(underlying_symbol(underlying)))
         except Exception:  # noqa: BLE001 - optionability probe is best-effort
             return False
 
     def option_expirations(self, underlying: str) -> list[date]:
         try:
-            ticker = self._get_ticker(underlying)
             out: list[date] = []
-            for exp in ticker.options or []:
+            for exp in self._expiry_strings(underlying_symbol(underlying)):
                 try:
                     out.append(datetime.strptime(exp, "%Y-%m-%d").date())
                 except ValueError:
@@ -119,28 +153,20 @@ class YahooOptionData:
     def option_chain(
         self, underlying: str, start: date, end: date, option_type: str = "ALL"
     ) -> list[dict[str, Any]]:
+        symbol = underlying_symbol(underlying)
         wanted = option_type.upper()
         try:
-            ticker = self._get_ticker(underlying)
             rows: list[dict[str, Any]] = []
-            for exp_str in ticker.options or []:
+            for exp_str in self._expiry_strings(symbol):
                 try:
                     expiry = datetime.strptime(exp_str, "%Y-%m-%d").date()
                 except ValueError:
                     continue
                 if not (start <= expiry <= end):
                     continue
-                chain = ticker.option_chain(exp_str)
-                if wanted in ("ALL", "CALL"):
-                    for _, row in chain.calls.iterrows():
-                        contract = yahoo_row_to_contract(row, "call", expiry)
-                        if contract is not None:
-                            rows.append(contract)
-                if wanted in ("ALL", "PUT"):
-                    for _, row in chain.puts.iterrows():
-                        contract = yahoo_row_to_contract(row, "put", expiry)
-                        if contract is not None:
-                            rows.append(contract)
+                for contract in self._contracts_for_expiry(symbol, exp_str, expiry):
+                    if wanted == "ALL" or contract["side"] == wanted.lower():
+                        rows.append(contract)
             rows.sort(key=lambda c: (c["expiry"], c["side"], c["strike"]))
             return rows
         except OptionDataError:
@@ -169,8 +195,16 @@ class YahooOptionData:
         now: datetime | None = None,
     ) -> QuoteSnapshot:
         underlying, _, _, _ = parse_us_option_code(option_code)
-        chain = self.option_chain(underlying, expiry, expiry)
-        match = next((c for c in chain if c["code"] == option_code), None)
+        symbol = underlying_symbol(underlying)
+        try:
+            contracts = self._contracts_for_expiry(
+                symbol, expiry.strftime("%Y-%m-%d"), expiry
+            )
+        except OptionDataError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - normalize provider errors
+            raise OptionDataError(f"Yahoo request failed: {exc}") from exc
+        match = next((c for c in contracts if c["code"] == option_code), None)
         if match is None:
             raise OptionDataError(f"{option_code} not found in Yahoo chain")
         if match["ask"] <= 0:
@@ -188,6 +222,61 @@ class YahooOptionData:
             observed_at=now or self._now_fn(),
             is_delayed=True,
         )
+
+    @staticmethod
+    def _index_symbol(underlying: str) -> str:
+        """Map a feed-neutral symbol to the yfinance form.
+
+        The cycle's regime guard asks for the VIX as ``_VIX`` (CBOE's index
+        convention, leading underscore); yfinance spells indices with a caret
+        (``^VIX``). Plain tickers just lose any ``US.`` prefix.
+        """
+
+        symbol = underlying.strip().upper()
+        if symbol.startswith("_"):
+            return "^" + symbol[1:]
+        return underlying_symbol(symbol)
+
+    def underlying_snapshot(self, underlying: str) -> dict[str, Any]:
+        """Delayed price context for an underlying or index (best-effort, {} on fail).
+
+        Restores the VIX panic-regime guard under the Yahoo feed: the guard calls
+        ``underlying_snapshot('_VIX')`` and reads ``price``. Returns the CBOE-shaped
+        keys (price/prev_close/day_high/day_low/change_pct) the committee briefing
+        also reads, so a Yahoo-sourced snapshot is a drop-in for the CBOE one.
+        """
+
+        symbol = self._index_symbol(underlying)
+        try:
+            info = getattr(self._ticker_factory(symbol), "fast_info", None)
+            if not info:
+                return {}
+        except Exception:  # noqa: BLE001 - snapshot is best-effort, never blocks
+            return {}
+
+        def field(*names: str) -> float:
+            for name in names:
+                value = None
+                try:
+                    value = info[name]
+                except (KeyError, TypeError, IndexError):
+                    value = getattr(info, name, None)
+                if value is not None:
+                    return _num(value)
+            return 0.0
+
+        price = field("last_price", "lastPrice")
+        if price <= 0:
+            return {}
+        prev_close = field("previous_close", "previousClose")
+        change_pct = ((price - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
+        return {
+            "price": price,
+            "prev_close": prev_close,
+            "day_high": field("day_high", "dayHigh"),
+            "day_low": field("day_low", "dayLow"),
+            "change_pct": round(change_pct, 2),
+        }
 
 
 def build_yahoo_provider() -> YahooOptionData:

@@ -24,7 +24,7 @@ class LLMUsage(BaseModel):
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
 
-    def add(self, other: "LlmUsage") -> None:
+    def add(self, other: "LLMUsage") -> None:
         self.calls += other.calls
         self.prompt_tokens += other.prompt_tokens
         self.completion_tokens += other.completion_tokens

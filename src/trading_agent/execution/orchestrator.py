@@ -429,14 +429,20 @@ class PaperTradingCycle:
 
         vix_cap = self.active_mandate.portfolio.max_vix_for_entries
         if vix_cap > 0:
+            vix = 0.0
             method = getattr(self.market, "underlying_snapshot", None)
             if method is not None:
                 try:
                     vix = float((method("_VIX") or {}).get("price") or 0.0)
                 except Exception:  # noqa: BLE001 - missing data never blocks
                     vix = 0.0
-                if vix > vix_cap:
-                    return f"VIX {vix:.1f} above the {vix_cap:.0f} entry cap"
+            if vix <= 0:
+                # Fail loud: a panic-regime guard that silently can't read the
+                # VIX is worse than no guard -- it looks active but isn't. Audit
+                # it so the gap is visible (the feed may lack an index snapshot).
+                self.audit.append("vix_unavailable", {"at": now.isoformat()})
+            elif vix > vix_cap:
+                return f"VIX {vix:.1f} above the {vix_cap:.0f} entry cap"
         return None
 
     def _run_entries(
