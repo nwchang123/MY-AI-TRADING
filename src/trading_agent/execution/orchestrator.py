@@ -96,6 +96,7 @@ class PaperTradingCycle:
         llm_budget: DailyTokenBudget | None = None,
         moomoo_market: Any | None = None,
         earnings_client: Any | None = None,
+        price_history: Any | None = None,
     ):
         if trd_env not in {"SIMULATE", "REAL"}:
             raise ValueError("trd_env must be 'SIMULATE' or 'REAL'")
@@ -117,6 +118,7 @@ class PaperTradingCycle:
         self.llm_budget = llm_budget
         self.moomoo_market = moomoo_market
         self.earnings_client = earnings_client
+        self.price_history = price_history
         # Refreshed at the start of every cycle: when the account compounds,
         # these carry the equity-scaled risk caps; otherwise they alias the
         # injected gate/liquidity unchanged.
@@ -661,6 +663,17 @@ class PaperTradingCycle:
             self._record_error(result, "underlying_snapshot", ticker, exc)
             return None
 
+    def _price_context(self, ticker: str, result: CycleResult) -> dict[str, Any] | None:
+        """Delayed daily-bar technical context for the committee (best-effort)."""
+
+        if self.price_history is None:
+            return None
+        try:
+            return self.price_history.context(ticker) or None
+        except Exception as exc:  # noqa: BLE001 - context never blocks an entry
+            self._record_error(result, "price_context", ticker, exc)
+            return None
+
     def _try_enter(
         self, now: datetime, ticker: str, held_codes: set[str], result: CycleResult
     ) -> str | None:
@@ -680,7 +693,10 @@ class PaperTradingCycle:
             )
             return None
 
-        output = self._get_or_run_committee(now, ticker, candidates, snapshot, result)
+        price_context = self._price_context(ticker, result)
+        output = self._get_or_run_committee(
+            now, ticker, candidates, snapshot, price_context, result
+        )
         if output is None or output.decision != "open_position" or output.proposal is None:
             return None
 
@@ -700,6 +716,7 @@ class PaperTradingCycle:
         ticker: str,
         candidates: list,
         snapshot: dict | None,
+        price_context: dict | None,
         result: CycleResult,
     ):
         """Return committee decision from cache or a fresh LLM run."""
@@ -746,7 +763,8 @@ class PaperTradingCycle:
 
         before = self.committee.usage_total()
         output = self.committee.run(
-            context, scores, candidates=candidates, market_snapshot=snapshot
+            context, scores, candidates=candidates, market_snapshot=snapshot,
+            price_context=price_context,
         )
         usage = usage_delta(before, self.committee.usage_total())
         self.audit.append(

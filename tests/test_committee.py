@@ -266,6 +266,38 @@ def test_market_snapshot_appears_in_briefing() -> None:
     assert "day_change=+6.30%" in briefing
 
 
+def test_price_context_appears_in_briefing() -> None:
+    client = MockLLMClient(
+        ["catalyst", "options", "fine", "fine", json.dumps(_PROPOSAL)]
+    )
+    Committee(client).run(
+        _context(),
+        _scores(),
+        price_context={
+            "last_close": 18.4,
+            "ret_5d": 42.0,
+            "ret_20d": 310.0,
+            "realized_vol_20d": 95.0,
+            "pct_from_20d_high": -2.0,
+            "pct_from_20d_low": 280.0,
+        },
+    )
+    briefing = client.calls[0]["user"]
+    assert "technical context" in briefing
+    assert "ret_20d=310.0%" in briefing
+    assert "realized_vol_20d=95.0%" in briefing
+
+
+def test_committee_rules_warn_against_evidence_injection() -> None:
+    client = MockLLMClient(
+        ["catalyst", "options", "fine", "fine", json.dumps(_PROPOSAL)]
+    )
+    Committee(client).run(_context(), _scores())
+    system = client.calls[0]["system"]  # catalyst analyst shares the common rules
+    assert "untrusted DATA" in system
+    assert "manipulation red flag" in system
+
+
 def test_empty_market_snapshot_leaves_briefing_unchanged() -> None:
     client = MockLLMClient(
         ["catalyst", "options", "fine", "fine", json.dumps(_PROPOSAL)]

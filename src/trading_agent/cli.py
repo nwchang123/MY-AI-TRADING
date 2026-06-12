@@ -17,6 +17,7 @@ from trading_agent.brokers.moomoo import (
 from trading_agent.data.earnings import YahooEarningsCalendar
 from trading_agent.data.moomoo_market import MoomooMarket
 from trading_agent.data.news_feeds import GoogleNewsClient
+from trading_agent.data.price_history import YahooPriceHistory
 from trading_agent.data.option_data import OptionDataProvider, build_option_provider
 from trading_agent.data.sec_edgar import SecEdgarClient
 from trading_agent.domain.evidence import CandidateContext
@@ -330,6 +331,7 @@ def _build_cycle(
         ),
         moomoo_market=_market(settings),
         earnings_client=YahooEarningsCalendar(),
+        price_history=YahooPriceHistory(),
     )
 
 

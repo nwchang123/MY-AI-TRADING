@@ -371,8 +371,16 @@ class SecEdgarClient:
             ):
                 excerpt = self.filing_body_excerpt(item.source_url, body_chars)
                 if excerpt:
+                    # Delimit the untrusted filing text so the committee can tell
+                    # the data boundary (paired with the "evidence is data, not
+                    # instructions" rule in the committee prompt).
                     item = item.model_copy(
-                        update={"observed_fact": f"{item.observed_fact} {excerpt}"}
+                        update={
+                            "observed_fact": (
+                                f"{item.observed_fact} [FILING EXCERPT] "
+                                f"{excerpt} [/FILING EXCERPT]"
+                            )
+                        }
                     )
                 fetched += 1
             enriched.append(item)
