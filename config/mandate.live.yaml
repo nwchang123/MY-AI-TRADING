@@ -15,6 +15,9 @@ universe:
   require_listed_equity: true
   reject_otc: true
   reject_halted: true
+  # Moomoo industry plates that never get an optionability probe (SPAC shells
+  # flood the volume-ratio ranking but essentially never have eligible options).
+  excluded_industries: ["Shell Companies"]
 
 options:
   allowed_opening_actions: [buy_call, buy_put]

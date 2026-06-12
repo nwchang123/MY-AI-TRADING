@@ -73,7 +73,7 @@ def test_approves_proposal_inside_mandate(tmp_path: Path) -> None:
 
 
 def test_rejects_low_estimated_win_probability(tmp_path: Path) -> None:
-    # Paper mandate floor is 0.55; the proposal's confidence is the PM's win
+    # Paper mandate floor is 0.60; the proposal's confidence is the PM's win
     # estimate, so 0.4 must be rejected even if everything else is fine.
     low = _proposal().model_copy(update={"confidence": 0.4})
     result = RiskGate(_mandate(), tmp_path).evaluate_open(
@@ -94,9 +94,10 @@ def test_rejects_wide_spread(tmp_path: Path) -> None:
 
 
 def test_rejects_cost_above_contract_limit(tmp_path: Path) -> None:
-    proposal = _proposal().model_copy(update={"limit_price": 0.25, "max_limit_price": 0.25})
+    # 0.70*100 + 1 = 71 > the $65 cap.
+    proposal = _proposal().model_copy(update={"limit_price": 0.70, "max_limit_price": 0.70})
     result = RiskGate(_mandate(), tmp_path).evaluate_open(
-        proposal, _quote(ask=0.25), _portfolio(), NOW
+        proposal, _quote(bid=0.69, ask=0.70), _portfolio(), NOW
     )
 
     assert result.approved is False
@@ -130,7 +131,7 @@ def test_rejects_stale_quote(tmp_path: Path) -> None:
 
 def test_rejects_hard_drawdown(tmp_path: Path) -> None:
     result = RiskGate(_mandate(), tmp_path).evaluate_open(
-        _proposal(), _quote(), _portfolio(total_drawdown_usd=25), NOW
+        _proposal(), _quote(), _portfolio(total_drawdown_usd=50), NOW
     )
 
     assert result.approved is False

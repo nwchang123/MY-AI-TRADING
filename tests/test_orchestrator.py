@@ -2,11 +2,15 @@ import json
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from trading_agent.data.moomoo_market import parse_us_option_code
+from trading_agent.data.moomoo_market import build_us_option_code, parse_us_option_code
 from trading_agent.domain.evidence import EvidenceItem
 from trading_agent.domain.liquidity import LiquidityValidator
 from trading_agent.domain.risk import Mandate, QuoteSnapshot, RiskGate
-from trading_agent.execution.orchestrator import PaperTradingCycle
+from trading_agent.execution.orchestrator import (
+    CycleResult,
+    PaperTradingCycle,
+    _parse_window_end,
+)
 from trading_agent.research.committee import Committee
 from trading_agent.research.llm import MockLLMClient
 from trading_agent.storage.audit import AuditWriter
@@ -125,7 +129,10 @@ class FakeBroker:
 
 
 class FakeSec:
-    def fetch_evidence(self, ticker, *, forms=None, limit=20):
+    def fetch_evidence(
+        self, ticker, *, forms=None, limit=20, fetch_bodies=False,
+        body_limit=2, body_chars=1500,
+    ):
         return [
             EvidenceItem(
                 evidence_id="e1",
@@ -137,6 +144,9 @@ class FakeSec:
                 retrieved_at=NOW,
             )
         ]
+
+    def company_name(self, ticker):
+        return f"{ticker.title()} Inc."
 
 
 def _mandate() -> Mandate:
@@ -221,6 +231,52 @@ def test_entry_routes_through_gate_and_places_order(tmp_path: Path) -> None:
     assert broker.placed == [("buy", OPTION_CODE)]
     assert result.entries == [{"ticker": "EXAMPLE", "option_code": OPTION_CODE}]
     assert len(cycle.position_store.open_positions()) == 1
+
+
+def test_entry_persists_catalyst_window_end(tmp_path: Path) -> None:
+    cycle = _cycle(
+        tmp_path, broker=FakeBroker(), market=FakeMarket(),
+        committee=_committee(_open_responses()),
+    )
+    cycle.run_once(["EXAMPLE"])
+    row = cycle.position_store.open_positions()[0]
+    # _PROPOSAL's window is "2026-06-10/2026-06-20".
+    assert row["catalyst_window_end"] == "2026-06-20"
+
+
+def test_parse_window_end_variants() -> None:
+    assert _parse_window_end("2026-06-10/2026-06-20") == date(2026, 6, 20)
+    assert _parse_window_end("2026-06-20") == date(2026, 6, 20)  # single date
+    assert _parse_window_end("not a date") is None
+    assert _parse_window_end("") is None
+    assert _parse_window_end(None) is None
+
+
+def test_eligible_candidates_keeps_ten_per_side(tmp_path: Path) -> None:
+    expiry = date(2026, 6, 26)
+    codes = [build_us_option_code("EXAMPLE", expiry, "call", 3.0 + 0.5 * i) for i in range(12)]
+    codes += [build_us_option_code("EXAMPLE", expiry, "put", 3.0 + 0.5 * i) for i in range(12)]
+    market = FakeMarket(chain_codes=codes)
+    cycle = _cycle(tmp_path, broker=FakeBroker(), market=market, committee=_committee([]))
+
+    cands = cycle._eligible_candidates(NOW, "EXAMPLE", CycleResult(), spot=0.0)
+
+    calls = [c for c in cands if c.option_side == "call"]
+    puts = [c for c in cands if c.option_side == "put"]
+    assert len(calls) == 10  # capped per side, not 12
+    assert len(puts) == 10  # the put side is never starved out
+
+
+def test_eligible_candidates_annotate_delta_and_breakeven(tmp_path: Path) -> None:
+    code = build_us_option_code("EXAMPLE", date(2026, 6, 26), "call", 5.0)
+    market = FakeMarket(chain_codes=[code], spot=5.0, iv=0.5, bid=0.19, ask=0.21)
+    cycle = _cycle(tmp_path, broker=FakeBroker(), market=market, committee=_committee([]))
+
+    cand = cycle._eligible_candidates(NOW, "EXAMPLE", CycleResult(), spot=5.0)[0]
+
+    assert cand.delta is not None and 0 < cand.delta < 1  # ATM call ~0.5
+    # Call breakeven = strike + ask = 5.21, a +4.2% move from spot 5.0.
+    assert cand.breakeven_move_pct == 4.2
 
 
 def test_gate_rejection_blocks_order_no_bypass(tmp_path: Path) -> None:
@@ -544,7 +600,7 @@ class FakeNews:
     def __init__(self, fail: bool = False):
         self.fail = fail
 
-    def fetch_evidence(self, ticker):
+    def fetch_evidence(self, ticker, query_name=None):
         if self.fail:
             raise RuntimeError("feed down")
         return [
@@ -677,7 +733,7 @@ def test_position_cap_override_blocks_new_entries(tmp_path: Path) -> None:
 
 def test_cooldown_blocks_entries_after_consecutive_losses(tmp_path: Path) -> None:
     store = PositionStore(tmp_path / "positions.sqlite")
-    # Three small losses (-$3 each): below the $10 daily stop, but they hit the
+    # Three small losses (-$3 each): below the $35 daily stop, but they hit the
     # 3-loss consecutive stop, so the cooldown blocks new entries.
     for code in (
         "US.AAA260626C00005000",
@@ -724,9 +780,9 @@ def _seed_closed(store: PositionStore, code: str, entry: float, exit_price: floa
 
 
 def test_compounding_win_unlocks_bigger_contracts(tmp_path: Path) -> None:
-    # A realized +$100 win doubles equity; the $25 contract cap scales to $50,
-    # so a $0.40-ask contract (cost ~$41) becomes tradeable. The paper mandate
-    # has compounding: true.
+    # A realized +$100 win doubles equity; the $65 contract cap scales to $130,
+    # so a $0.80-ask contract (cost ~$81, rejected at the $65 base) becomes
+    # tradeable. The paper mandate has compounding: true.
     store = PositionStore(tmp_path / "positions.sqlite")
     _seed_closed(store, "US.WIN260626C00005000", entry=0.20, exit_price=1.20)  # +100
 
@@ -734,7 +790,7 @@ def test_compounding_win_unlocks_bigger_contracts(tmp_path: Path) -> None:
     cycle = _cycle(
         tmp_path,
         broker=broker,
-        market=FakeMarket(bid=0.38, ask=0.40),
+        market=FakeMarket(bid=0.78, ask=0.80),
         committee=_committee(_open_responses()),
         store=store,
     )
@@ -742,12 +798,12 @@ def test_compounding_win_unlocks_bigger_contracts(tmp_path: Path) -> None:
 
     assert broker.placed == [("buy", OPTION_CODE)]
     assert result.entries
-    assert cycle.active_mandate.options.max_contract_cost_usd == 50.0
+    assert cycle.active_mandate.options.max_contract_cost_usd == 130.0
 
 
 def test_fixed_mandate_rejects_what_compounding_allows(tmp_path: Path) -> None:
-    # Same +$100 win and same $0.40-ask contract, but compounding off: the
-    # static $25 cap rejects it at the liquidity stage.
+    # Same +$100 win and same $0.80-ask contract, but compounding off: the
+    # static $65 cap rejects it at the liquidity stage.
     store = PositionStore(tmp_path / "positions.sqlite")
     _seed_closed(store, "US.WIN260626C00005000", entry=0.20, exit_price=1.20)
 
@@ -758,7 +814,7 @@ def test_fixed_mandate_rejects_what_compounding_allows(tmp_path: Path) -> None:
     cycle = PaperTradingCycle(
         mandate=mandate,
         account_id=123,
-        market=FakeMarket(bid=0.38, ask=0.40),
+        market=FakeMarket(bid=0.78, ask=0.80),
         broker=broker,
         sec_client=FakeSec(),
         committee=_committee([]),  # never reached: no candidate passes the cap
@@ -777,16 +833,17 @@ def test_fixed_mandate_rejects_what_compounding_allows(tmp_path: Path) -> None:
 
 
 def test_compounding_drawdown_measured_from_peak(tmp_path: Path) -> None:
-    # Win +$100 (peak 200) then lose $60 back (equity 140). Versus initial
-    # capital that is a GAIN, but versus the peak it is a $60 drawdown, beyond
-    # the scaled stop (25 x 2 = 50): the circuit breaker must halt. Both closes
-    # happened "yesterday" relative to the cycle clock, so the daily stop stays
-    # quiet and the drawdown logic is what trips.
+    # Win +$100 (peak 200) then lose $120 back (equity 80). Versus initial
+    # capital that is still a GAIN... no, equity 80 < 100; the point is the stop
+    # is measured from the PEAK: a $120 drawdown is beyond the scaled stop
+    # (50 x 2 = 100), so the circuit breaker must halt. Both closes happened
+    # "yesterday" relative to the cycle clock, so the daily stop stays quiet and
+    # the drawdown logic is what trips.
     from datetime import timedelta
 
     store = PositionStore(tmp_path / "positions.sqlite")
     _seed_closed(store, "US.WIN260626C00005000", entry=0.20, exit_price=1.20)  # +100
-    _seed_closed(store, "US.LOSS260626C00005000", entry=0.80, exit_price=0.20)  # -60
+    _seed_closed(store, "US.LOSS260626C00005000", entry=1.40, exit_price=0.20)  # -120
 
     broker = FakeBroker()
     mandate = _mandate()
@@ -814,9 +871,13 @@ def test_compounding_drawdown_measured_from_peak(tmp_path: Path) -> None:
 
 def test_circuit_breaker_trips_halt_and_blocks_entries(tmp_path: Path) -> None:
     store = PositionStore(tmp_path / "positions.sqlite")
-    # Two realized losses of -$15 each, closed today => daily P/L -$30 trips the
-    # $10 daily loss stop (checked before the $25 drawdown stop).
-    for code in ("US.AAA260626C00005000", "US.BBB260626C00005000"):
+    # Three realized losses of -$15 each, closed today => daily P/L -$45 trips
+    # the $35 daily loss stop (checked before the $50 drawdown stop).
+    for code in (
+        "US.AAA260626C00005000",
+        "US.BBB260626C00005000",
+        "US.CCC260626C00005000",
+    ):
         _seed_open(store, code)
         store.mark_closed(code, close_reason="stop loss", exit_price=0.05)
     broker = FakeBroker()

@@ -23,6 +23,11 @@ class MonitoredPosition(BaseModel):
     take_profit_pct: float = Field(gt=0)
     stop_loss_pct: float = Field(gt=0, le=100)
     time_stop: date
+    # The committee's own estimate of when the catalyst resolves. Once it has
+    # passed without hitting take-profit, the edge the thesis rested on is gone,
+    # so the position exits rather than bleeding theta to the time stop. None
+    # keeps the legacy behavior (time stop only).
+    catalyst_window_end: date | None = None
     bid: float = Field(ge=0)
     ask: float = Field(ge=0)
     observed_at: datetime

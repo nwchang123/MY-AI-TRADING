@@ -1,11 +1,14 @@
-# Launched by the "TradingAgent-PaperLoop" scheduled task before the U.S. open,
+﻿# Launched by the "TradingAgent-PaperLoop" scheduled task before the U.S. open,
 # and by start_all.ps1 (one-touch). The run-loop process skips ticks while the
 # market is closed, trades the session autonomously, and exits after
 # MaxIterations ticks. This wrapper SELF-HEALS: if run-loop dies mid-session
 # (e.g. an accidental taskkill, a sleep/resume, an SDK abort) while the U.S.
 # market is still open, it restarts it -- so one killed process no longer ends
-# the trading day. Output is logged via cmd.exe redirection (PowerShell 5.1's
-# *>> mangles native stderr into UTF-16 error records).
+# the trading day.
+#
+# Output logging uses .NET Process with file streams (robust with Unicode paths
+# like the full-width ！ in the project folder name; avoids cmd.exe and
+# PowerShell 5.1 stderr-mangling issues).
 param(
     [int]$MaxIterations = 18,
     [int]$IntervalSeconds = 1800
@@ -31,14 +34,64 @@ if ($existing) {
 # single-instance guard makes this a no-op when it is already running).
 Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
     "-NoProfile", "-ExecutionPolicy", "Bypass",
-    "-File", (Join-Path $PSScriptRoot "run_bot.ps1")
+    "-File", ('"' + (Join-Path $PSScriptRoot "run_bot.ps1") + '"')
 )
+
+# Helper: run python and merge stdout+stderr into the log file using .NET
+# Process API. This avoids cmd.exe (which can mishandle Unicode paths in
+# hidden-window contexts) and PowerShell 5.1's stderr-to-ErrorRecord mangling.
+function Run-PythonLogged {
+    param([string]$Arguments, [string]$LogFile)
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "python"
+    $psi.Arguments = $Arguments
+    $psi.WorkingDirectory = $root
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $psi
+
+    # Collect output asynchronously to avoid deadlocks
+    $outBuf = [System.Text.StringBuilder]::new()
+    $errBuf = [System.Text.StringBuilder]::new()
+
+    $outHandler = { if ($EventArgs.Data -ne $null) { $Event.MessageData.AppendLine($EventArgs.Data) } }
+    $errHandler = { if ($EventArgs.Data -ne $null) { $Event.MessageData.AppendLine($EventArgs.Data) } }
+
+    $outEvent = Register-ObjectEvent -InputObject $p -EventName OutputDataReceived -Action $outHandler -MessageData $outBuf
+    $errEvent = Register-ObjectEvent -InputObject $p -EventName ErrorDataReceived -Action $errHandler -MessageData $errBuf
+
+    $p.Start() | Out-Null
+    $p.BeginOutputReadLine()
+    $p.BeginErrorReadLine()
+
+    # Wait for process to exit — this blocks until python finishes all iterations
+    $p.WaitForExit()
+
+    # Ensure all async output is flushed
+    Start-Sleep -Milliseconds 500
+    Unregister-Event -SourceIdentifier $outEvent.Name
+    Unregister-Event -SourceIdentifier $errEvent.Name
+
+    # Append captured output to log
+    $combined = ($errBuf.ToString() + $outBuf.ToString()).TrimEnd()
+    if ($combined) {
+        Add-Content -Path $LogFile -Value $combined -Encoding UTF8
+    }
+
+    return $p.ExitCode
+}
 
 while ($true) {
     Add-Content -Path $log -Value "=== loop start $(Get-Date -Format o) (max $MaxIterations ticks @ ${IntervalSeconds}s) ==="
 
-    cmd /c "python -m trading_agent run-loop --auto-universe --interval-seconds $IntervalSeconds --max-iterations $MaxIterations >> `"$log`" 2>&1"
-    $code = $LASTEXITCODE
+    $code = Run-PythonLogged `
+        -Arguments "-m trading_agent run-loop --auto-universe --interval-seconds $IntervalSeconds --max-iterations $MaxIterations" `
+        -LogFile $log
 
     Add-Content -Path $log -Value "=== loop exited $(Get-Date -Format o) code=$code ==="
 

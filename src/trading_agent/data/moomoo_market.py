@@ -84,6 +84,14 @@ def build_universe_filters(universe: UniverseMandate, sdk: Any) -> list[Any]:
     TURNOVER is an accumulate-class field: passing it via SimpleFilter makes
     get_stock_filter fail with "This filter field is not supported" (verified
     live 2026-06-11), so it goes through AccumulateFilter with a 1-day window.
+
+    VOLUME_RATIO is included unconstrained (is_no_filter) purely to retrieve the
+    value and to have OpenD sort the FULL match set by it server-side, so the
+    first page already holds the names with the most abnormal activity today --
+    the catalyst signal this strategy trades, unlike raw turnover whose ranking
+    barely changes day to day. CHANGE_RATE rides along the same way for context.
+    Verified live 2026-06-12: OpenD accepts both no-filter fields, returns rows
+    sorted by volume_ratio descending, and CHANGE_RATE days=1 populates.
     """
 
     simple_filter = sdk.SimpleFilter
@@ -105,6 +113,16 @@ def build_universe_filters(universe: UniverseMandate, sdk: Any) -> list[Any]:
     turnover.filter_min = universe.min_average_daily_turnover_usd
     turnover.days = 1
 
+    volume_ratio = simple_filter()
+    volume_ratio.stock_field = field.VOLUME_RATIO
+    volume_ratio.is_no_filter = True
+    volume_ratio.sort = sdk.SortDir.DESCEND
+
+    change_rate = sdk.AccumulateFilter()
+    change_rate.stock_field = field.CHANGE_RATE
+    change_rate.is_no_filter = True
+    change_rate.days = 1
+
     return [
         make(field.CUR_PRICE, fmin=universe.min_underlying_price_usd),
         make(
@@ -113,6 +131,8 @@ def build_universe_filters(universe: UniverseMandate, sdk: Any) -> list[Any]:
             fmax=universe.max_market_cap_usd,
         ),
         turnover,
+        volume_ratio,
+        change_rate,
     ]
 
 
@@ -144,6 +164,8 @@ def parse_filter_rows(rows: list[Any]) -> list[dict[str, Any]]:
                 "cur_price": getattr(row, "cur_price", None),
                 "market_val": getattr(row, "market_val", None),
                 "turnover": _accumulate_value(row, "turnover"),
+                "volume_ratio": getattr(row, "volume_ratio", None),
+                "change_rate": _accumulate_value(row, "change_rate"),
             }
         )
     return parsed
@@ -194,18 +216,65 @@ class MoomooMarket:
         self.connection = connection
 
     def scan_small_caps(
-        self, universe: UniverseMandate, begin: int = 0, num: int = 200
+        self, universe: UniverseMandate, *, page_size: int = 200, max_rows: int = 1000
     ) -> list[dict[str, Any]]:
+        """All mandate-passing rows, paginated past OpenD's 200-row page limit.
+
+        The US small-cap mandate matches far more than one page, so stopping at
+        the first page would rank within an arbitrary slice of the universe.
+        ``max_rows`` bounds the walk (get_stock_filter is rate-limited to 10
+        requests per 30s; 1000 rows = 5 calls) -- combined with the server-side
+        VOLUME_RATIO sort the cap drops only the quietest tail.
+        """
+
+        sdk = self._sdk()
+        quote_ctx = self._quote_context(sdk)
+        parsed: list[dict[str, Any]] = []
+        begin = 0
+        try:
+            filters = build_universe_filters(universe, sdk)
+            while len(parsed) < max_rows:
+                ret, data = quote_ctx.get_stock_filter(
+                    market=sdk.Market.US,
+                    filter_list=filters,
+                    begin=begin,
+                    num=page_size,
+                )
+                self._require_ok(sdk, ret, data, "get_stock_filter")
+                last_page, _all_count, rows = data
+                parsed.extend(parse_filter_rows(rows))
+                begin += len(rows)
+                if last_page or not rows:
+                    break
+            return parsed[:max_rows]
+        finally:
+            quote_ctx.close()
+
+    def industry_plates(self, codes: list[str]) -> dict[str, str]:
+        """Industry plate name per stock code, from one batched get_owner_plate.
+
+        Used by universe selection to keep one hot theme from monopolizing the
+        candidate list. Codes get_owner_plate cannot resolve are simply absent
+        (the caller treats unknown-industry names as uncapped). The API accepts
+        at most 200 codes per call, which the probe-limit-sized input respects.
+        """
+
+        if not codes:
+            return {}
         sdk = self._sdk()
         quote_ctx = self._quote_context(sdk)
         try:
-            filters = build_universe_filters(universe, sdk)
-            ret, data = quote_ctx.get_stock_filter(
-                market=sdk.Market.US, filter_list=filters, begin=begin, num=num
-            )
-            self._require_ok(sdk, ret, data, "get_stock_filter")
-            _last_page, _all_count, rows = data
-            return parse_filter_rows(rows)
+            ret, data = quote_ctx.get_owner_plate(code_list=codes)
+            self._require_ok(sdk, ret, data, "get_owner_plate")
+            plates: dict[str, str] = {}
+            for row in data.to_dict(orient="records"):
+                if str(row.get("plate_type") or "").upper() != "INDUSTRY":
+                    continue
+                code = row.get("code")
+                name = row.get("plate_name")
+                if code and name and code not in plates:
+                    plates[str(code)] = str(name)
+            return plates
         finally:
             quote_ctx.close()
 
@@ -287,6 +356,56 @@ class MoomooMarket:
                 expiry=expiry,
                 observed_at=observed_at,
             )
+        finally:
+            quote_ctx.close()
+
+    def stock_snapshot(self, ticker: str) -> dict[str, Any]:
+        """Get real-time stock snapshot from Moomoo OpenD.
+
+        Returns price, volume, change, and other market data.
+        This is REAL-TIME data, unlike CBOE/Yahoo which are delayed ~15 min.
+        """
+        sdk = self._sdk()
+        quote_ctx = self._quote_context(sdk)
+        try:
+            # Add US. prefix if not present
+            code = ticker.upper() if ticker.upper().startswith("US.") else f"US.{ticker.upper()}"
+
+            # Subscribe to get real-time quotes
+            ret, data = quote_ctx.subscribe([code], [sdk.SubType.QUOTE])
+            self._require_ok(sdk, ret, data, "subscribe")
+
+            # Get market snapshot
+            ret, snapshot = quote_ctx.get_market_snapshot([code])
+            self._require_ok(sdk, ret, snapshot, "get_market_snapshot")
+
+            row = snapshot.to_dict(orient="records")[0]
+
+            # Extract relevant fields
+            last_price = float(row.get("last_price") or 0)
+            prev_close = float(row.get("prev_close_price") or 0)
+            open_price = float(row.get("open") or 0)
+            high = float(row.get("high_price") or 0)
+            low = float(row.get("low_price") or 0)
+            volume = int(row.get("volume") or 0)
+            turnover = float(row.get("turnover") or 0)
+
+            # Calculate change
+            change_pct = 0.0
+            if prev_close > 0:
+                change_pct = ((last_price - prev_close) / prev_close) * 100
+
+            return {
+                "price": last_price,
+                "prev_close": prev_close,
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "volume": volume,
+                "turnover": turnover,
+                "change_pct": round(change_pct, 2),
+                "source": "moomoo_realtime",
+            }
         finally:
             quote_ctx.close()
 

@@ -6,13 +6,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-# The run-loop rebuilds the whole cycle every tick, so the cache must live on
-# disk to survive process boundaries. Committee decisions are keyed by a digest
-# of the INPUTS THAT MATTER to the reasoning: the evidence items and the
-# candidate contract codes. Quote drift (bid/ask) deliberately does not change
-# the digest -- fresh quotes are re-validated downstream by the liquidity
-# check and the risk gate on every pass anyway.
-
 DEFAULT_TTL_HOURS = 6.0
 
 
@@ -27,30 +20,39 @@ def decision_digest(
 
 
 class DecisionCache:
-    """Per-ticker cache of the last committee decision, keyed by input digest.
+    """Per-ticker cache of the last committee decision with in-memory layer.
 
-    A cache hit means the SEC/news evidence and the eligible contract list are
-    unchanged since the committee last reasoned about this ticker, so the
-    decision is reused instead of spending five LLM calls re-deriving it.
-    Entries expire after ``ttl_hours`` so a stale conviction cannot persist
-    across sessions.
+    Uses in-memory cache to avoid repeated disk reads within a single cycle.
+    Data is flushed to disk on put() calls and can be explicitly flushed.
     """
 
     def __init__(self, path: Path, *, ttl_hours: float = DEFAULT_TTL_HOURS):
         self.path = path
         self.ttl = timedelta(hours=ttl_hours)
+        self._data: dict[str, Any] | None = None
 
-    def _load(self) -> dict[str, Any]:
+    def _ensure_loaded(self) -> dict[str, Any]:
+        """Lazy-load from disk on first access."""
+        if self._data is None:
+            self._data = self._load_from_disk()
+        return self._data
+
+    def _load_from_disk(self) -> dict[str, Any]:
         try:
             return json.loads(self.path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
 
+    def flush(self) -> None:
+        """Write in-memory cache to disk."""
+        if self._data is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self._data), encoding="utf-8")
+
     def get(self, ticker: str, digest: str, now: datetime | None = None) -> str | None:
         """Return the cached CommitteeOutput JSON, or None on miss/expiry."""
-
         current = now or datetime.now(timezone.utc)
-        entry = self._load().get(ticker.upper())
+        entry = self._ensure_loaded().get(ticker.upper())
         if not entry or entry.get("digest") != digest:
             return None
         try:
@@ -61,6 +63,30 @@ class DecisionCache:
             return None
         return entry.get("output")
 
+    def fresh_rejections(
+        self, now: datetime | None = None, *, within_hours: float | None = None
+    ) -> set[str]:
+        """Tickers whose recently cached decision was anything but an open."""
+        current = now or datetime.now(timezone.utc)
+        bench = self.ttl
+        if within_hours is not None:
+            bench = min(bench, timedelta(hours=within_hours))
+        rejected: set[str] = set()
+        for ticker, entry in self._ensure_loaded().items():
+            try:
+                cached_at = datetime.fromisoformat(entry["at"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if current - cached_at > bench:
+                continue
+            try:
+                decision = json.loads(entry.get("output") or "{}").get("decision")
+            except json.JSONDecodeError:
+                continue
+            if decision and decision != "open_position":
+                rejected.add(ticker.upper())
+        return rejected
+
     def put(
         self,
         ticker: str,
@@ -69,11 +95,10 @@ class DecisionCache:
         now: datetime | None = None,
     ) -> None:
         current = now or datetime.now(timezone.utc)
-        data = self._load()
+        data = self._ensure_loaded()
         data[ticker.upper()] = {
             "digest": digest,
             "at": current.isoformat(),
             "output": output_json,
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data), encoding="utf-8")
+        self.flush()

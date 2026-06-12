@@ -61,8 +61,8 @@ def test_rejects_dte_out_of_range() -> None:
 
 
 def test_rejects_premium_above_cost_cap() -> None:
-    result = _validator().validate(_quote(bid=0.30, ask=0.30), now=NOW)
-    assert "contract cost exceeds mandate" in result.reasons  # 0.30*100 + 1 = 31 > 25
+    result = _validator().validate(_quote(bid=0.69, ask=0.70), now=NOW)
+    assert "contract cost exceeds mandate" in result.reasons  # 0.70*100 + 1 = 71 > 65
 
 
 def test_rejects_zero_bid() -> None:

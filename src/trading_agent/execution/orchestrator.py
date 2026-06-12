@@ -7,7 +7,12 @@ from typing import Any, Callable
 from trading_agent.data.moomoo_market import US_OPTION_LOT_SIZE, parse_us_option_code
 from trading_agent.data.sec_edgar import SecEdgarClient
 from trading_agent.domain.calendar import market_date, minutes_since_open
-from trading_agent.domain.montecarlo import MAX_USABLE_IV, stable_seed, win_probability
+from trading_agent.domain.montecarlo import (
+    MAX_USABLE_IV,
+    black_scholes_delta,
+    stable_seed,
+    win_probability,
+)
 from trading_agent.domain.liquidity import LiquidityValidator
 from trading_agent.domain.positions import MonitoredPosition
 from trading_agent.execution.orders import OrderManager
@@ -22,9 +27,28 @@ from trading_agent.research.scoring import score_candidate
 from trading_agent.storage.audit import AuditWriter
 from trading_agent.storage.positions import PositionStore
 
-# Upper bound on contracts shown to the committee per ticker, so the prompt stays
-# small. The $25 cost cap already filters most chains to well under this.
-_MAX_CANDIDATES = 20
+# Upper bound on contracts shown to the committee per ticker, so the prompt
+# stays small. Split per side so a directional thesis always has contracts to
+# express: a bearish name with only calls in the list would force a hold even
+# though the put side is exactly what the catalyst calls for.
+_MAX_CANDIDATES_PER_SIDE = 10
+
+
+def _parse_window_end(window: str | None) -> date | None:
+    """End date of a committee 'YYYY-MM-DD/YYYY-MM-DD' catalyst window.
+
+    Tolerates a single date (no slash) and any malformed string (returns None),
+    so a model formatting slip degrades to "no catalyst exit" rather than
+    raising during entry.
+    """
+
+    if not window:
+        return None
+    candidate = window.split("/")[-1].strip()
+    try:
+        return date.fromisoformat(candidate)
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -70,6 +94,7 @@ class PaperTradingCycle:
         news_client: Any | None = None,
         decision_cache: DecisionCache | None = None,
         llm_budget: DailyTokenBudget | None = None,
+        moomoo_market: Any | None = None,
     ):
         if trd_env not in {"SIMULATE", "REAL"}:
             raise ValueError("trd_env must be 'SIMULATE' or 'REAL'")
@@ -89,6 +114,7 @@ class PaperTradingCycle:
         self.news_client = news_client
         self.decision_cache = decision_cache
         self.llm_budget = llm_budget
+        self.moomoo_market = moomoo_market
         # Refreshed at the start of every cycle: when the account compounds,
         # these carry the equity-scaled risk caps; otherwise they alias the
         # injected gate/liquidity unchanged.
@@ -317,6 +343,7 @@ class PaperTradingCycle:
                 self._record_error(result, "exit_quote", code, exc)
                 continue
             ledger_by_code[code] = ledger
+            window_end = ledger.get("catalyst_window_end")
             position = MonitoredPosition(
                 option_code=code,
                 option_side=ledger["option_side"],
@@ -327,6 +354,7 @@ class PaperTradingCycle:
                 take_profit_pct=ledger["take_profit_pct"],
                 stop_loss_pct=ledger["stop_loss_pct"],
                 time_stop=date.fromisoformat(ledger["time_stop"]),
+                catalyst_window_end=date.fromisoformat(window_end) if window_end else None,
                 bid=quote.bid,
                 ask=quote.ask,
                 observed_at=quote.observed_at,
@@ -441,8 +469,9 @@ class PaperTradingCycle:
 
         Pulls the option chain in the mandate DTE window and keeps only contracts
         that pass the deterministic liquidity validator, so the committee can only
-        ever choose a real, tradeable contract instead of guessing one blind.
-        Bounded to the most liquid ``_MAX_CANDIDATES`` to keep the prompt small.
+        ever choose a real, tradeable contract instead of guessing one blind. The
+        list keeps the most liquid ``_MAX_CANDIDATES_PER_SIDE`` calls AND puts so
+        a bearish thesis is never starved of a contract to express it.
         """
 
         today = now.date()
@@ -476,10 +505,12 @@ class PaperTradingCycle:
             if not verdict.passed:
                 continue
             iv = float(row.get("iv") or 0.0)
-            # Baseline math POP at the standard +100/-50 grid, shown to the
-            # committee alongside each candidate so the AIs see what the math
-            # says before claiming an edge. Fewer paths: a guide, not the gate.
+            # Baseline math POP at the standard +100/-50 grid, plus delta and the
+            # breakeven move, shown to the committee alongside each candidate so
+            # the AIs see what the math says before claiming an edge. Fewer
+            # paths: a guide, not the gate.
             mc_pop: float | None = None
+            delta: float | None = None
             if spot > 0 and 0 < iv <= MAX_USABLE_IV:
                 mc_pop = round(
                     win_probability(
@@ -493,6 +524,16 @@ class PaperTradingCycle:
                         stop_loss_pct=50.0,
                         paths=500,
                         seed=stable_seed(row["code"]),
+                    ),
+                    3,
+                )
+                delta = round(
+                    black_scholes_delta(
+                        side=row["side"],
+                        spot=spot,
+                        strike=row["strike"],
+                        t_years=max(verdict.dte, 1) / 365.0,
+                        iv=iv,
                     ),
                     3,
                 )
@@ -510,22 +551,60 @@ class PaperTradingCycle:
                     dte=verdict.dte,
                     estimated_contract_cost_usd=verdict.estimated_contract_cost_usd,
                     mc_pop=mc_pop,
+                    delta=delta,
+                    breakeven_move_pct=self._breakeven_move_pct(
+                        row["side"], spot, row["strike"], ask
+                    ),
                 )
             )
-        candidates.sort(key=lambda c: c.open_interest, reverse=True)
-        return candidates[:_MAX_CANDIDATES]
+        return self._top_per_side(candidates)
 
-    def _gather_evidence(self, ticker: str, result: CycleResult) -> list[Any]:
-        """SEC filings plus (optional) news headlines for one ticker.
+    @staticmethod
+    def _breakeven_move_pct(
+        side: str, spot: float, strike: float, ask: float
+    ) -> float | None:
+        """Signed % the underlying must move by expiry to break even (None w/o spot).
 
-        A news-feed failure is recorded but never blocks the entry: filings are
-        the primary evidence and headlines are an enrichment.
+        A long call breaks even at strike+premium (needs an up move); a long put
+        at strike-premium (needs a down move). The sign tells the committee the
+        required direction, the magnitude how far OTM the strike is.
         """
 
-        evidence = list(self.sec_client.fetch_evidence(ticker))
+        if spot <= 0:
+            return None
+        breakeven = strike + ask if side == "call" else strike - ask
+        return round((breakeven - spot) / spot * 100.0, 2)
+
+    @staticmethod
+    def _top_per_side(candidates: list[OptionCandidate]) -> list[OptionCandidate]:
+        """Most-liquid N calls + N puts, each ranked by open interest."""
+
+        by_oi = sorted(candidates, key=lambda c: c.open_interest, reverse=True)
+        calls = [c for c in by_oi if c.option_side == "call"][:_MAX_CANDIDATES_PER_SIDE]
+        puts = [c for c in by_oi if c.option_side == "put"][:_MAX_CANDIDATES_PER_SIDE]
+        return calls + puts
+
+    def _gather_evidence(self, ticker: str, result: CycleResult) -> list[Any]:
+        """SEC filings (with 8-K bodies) plus news headlines for one ticker.
+
+        A news-feed failure is recorded but never blocks the entry: filings are
+        the primary evidence and headlines are an enrichment. 8-K bodies are
+        fetched so the committee reads what the filing SAYS, not just that it
+        exists. News is queried by the registered company name when available,
+        so single-word tickers (TE, BULL) stop pulling unrelated headlines.
+        """
+
+        evidence = list(self.sec_client.fetch_evidence(ticker, fetch_bodies=True))
         if self.news_client is not None:
+            query_name = None
             try:
-                evidence.extend(self.news_client.fetch_evidence(ticker))
+                query_name = self.sec_client.company_name(ticker)
+            except Exception:  # noqa: BLE001 - name lookup is best-effort
+                query_name = None
+            try:
+                evidence.extend(
+                    self.news_client.fetch_evidence(ticker, query_name=query_name)
+                )
             except Exception as exc:  # noqa: BLE001
                 self._record_error(result, "news_fetch", ticker, exc)
         return evidence
@@ -533,13 +612,33 @@ class PaperTradingCycle:
     def _underlying_snapshot(
         self, ticker: str, result: CycleResult
     ) -> dict[str, Any] | None:
-        """Delayed price/IV context for the committee briefing (best-effort)."""
+        """Get real-time stock price from Moomoo, fallback to delayed CBOE/Yahoo."""
 
+        # Try Moomoo first (real-time)
+        if self.moomoo_market is not None:
+            try:
+                snapshot = self.moomoo_market.stock_snapshot(ticker)
+                if snapshot and snapshot.get("price"):
+                    self.audit.append(
+                        "stock_snapshot_source",
+                        {"ticker": ticker, "source": "moomoo_realtime"},
+                    )
+                    return snapshot
+            except Exception as exc:  # noqa: BLE001
+                self._record_error(result, "moomoo_stock_snapshot", ticker, exc)
+
+        # Fallback to option data provider (delayed)
         method = getattr(self.market, "underlying_snapshot", None)
         if method is None:
             return None
         try:
-            return method(ticker) or None
+            snapshot = method(ticker) or None
+            if snapshot:
+                self.audit.append(
+                    "stock_snapshot_source",
+                    {"ticker": ticker, "source": "cboe_delayed"},
+                )
+            return snapshot
         except Exception as exc:  # noqa: BLE001
             self._record_error(result, "underlying_snapshot", ticker, exc)
             return None
@@ -547,10 +646,6 @@ class PaperTradingCycle:
     def _try_enter(
         self, now: datetime, ticker: str, held_codes: set[str], result: CycleResult
     ) -> str | None:
-        # Build the real, mandate-eligible contract shortlist FIRST: if nothing is
-        # tradeable, skip the SEC fetch and the committee entirely (saves tokens).
-        # The underlying snapshot comes from the same cached chain payload, so
-        # fetching it up front for the MC annotation costs no extra request.
         snapshot = self._underlying_snapshot(ticker, result)
         spot = float((snapshot or {}).get("price") or 0.0)
         candidates = self._eligible_candidates(now, ticker, result, spot=spot)
@@ -567,20 +662,39 @@ class PaperTradingCycle:
             )
             return None
 
+        output = self._get_or_run_committee(now, ticker, candidates, snapshot, result)
+        if output is None or output.decision != "open_position" or output.proposal is None:
+            return None
+
+        candidate, expiry = self._validate_proposal(
+            ticker, output, candidates, now, spot, result
+        )
+        if candidate is None:
+            return None
+
+        return self._execute_entry(
+            now, ticker, held_codes, output.proposal, candidate, expiry, spot, result
+        )
+
+    def _get_or_run_committee(
+        self,
+        now: datetime,
+        ticker: str,
+        candidates: list,
+        snapshot: dict | None,
+        result: CycleResult,
+    ):
+        """Return committee decision from cache or a fresh LLM run."""
         evidence = self._gather_evidence(ticker, result)
         context = build_candidate_context(ticker, evidence, now)
         scores = score_candidate(derive_score_inputs(context.evidence, now))
 
-        # When the evidence and the eligible contract list are unchanged since
-        # the committee last reasoned about this ticker, reuse that decision
-        # instead of spending five LLM calls re-deriving it. Liquidity and the
-        # risk gate still re-validate fresh quotes downstream on every pass.
         digest = decision_digest(
             ticker,
             [e.evidence_id for e in context.evidence],
             [c.option_code for c in candidates],
         )
-        output: CommitteeOutput | None = None
+        output = None
         if self.decision_cache is not None:
             cached = self.decision_cache.get(ticker, digest, now)
             if cached is not None:
@@ -594,43 +708,54 @@ class PaperTradingCycle:
                         {"ticker": ticker, "decision": output.decision,
                          "digest": digest[:16]},
                     )
-        if output is None:
-            # Hard daily token ceiling: once exhausted, no more committee
-            # passes until the next market day (cache hits still work).
-            today = market_date(now)
-            if self.llm_budget is not None and self.llm_budget.remaining(today) <= 0:
-                self.audit.append(
-                    "llm_budget_exhausted",
-                    {"ticker": ticker, "used": self.llm_budget.used(today)},
-                )
-                result.rejected.append(
-                    {
-                        "ticker": ticker,
-                        "stage": "llm_budget",
-                        "reasons": ["daily LLM token budget exhausted"],
-                    }
-                )
-                return None
-            before = self.committee.usage_total()
-            output = self.committee.run(
-                context, scores, candidates=candidates, market_snapshot=snapshot
-            )
-            usage = usage_delta(before, self.committee.usage_total())
+        if output is not None:
+            return output
+
+        today = market_date(now)
+        if self.llm_budget is not None and self.llm_budget.remaining(today) <= 0:
             self.audit.append(
-                "committee_run",
-                {"ticker": ticker, "decision": output.decision, "output": output.model_dump(mode="json")},
+                "llm_budget_exhausted",
+                {"ticker": ticker, "used": self.llm_budget.used(today)},
             )
-            self.audit.append("llm_usage", {"ticker": ticker, **usage.model_dump(mode="json")})
-            if self.llm_budget is not None:
-                self.llm_budget.add(usage.total_tokens, today)
-            if self.decision_cache is not None:
-                self.decision_cache.put(ticker, digest, output.model_dump_json(), now)
-        if output.decision != "open_position" or output.proposal is None:
+            result.rejected.append(
+                {
+                    "ticker": ticker,
+                    "stage": "llm_budget",
+                    "reasons": ["daily LLM token budget exhausted"],
+                }
+            )
             return None
 
+        before = self.committee.usage_total()
+        output = self.committee.run(
+            context, scores, candidates=candidates, market_snapshot=snapshot
+        )
+        usage = usage_delta(before, self.committee.usage_total())
+        self.audit.append(
+            "committee_run",
+            {"ticker": ticker, "decision": output.decision, "output": output.model_dump(mode="json")},
+        )
+        self.audit.append("llm_usage", {"ticker": ticker, **usage.model_dump(mode="json")})
+        if self.llm_budget is not None:
+            self.llm_budget.add(usage.total_tokens, today)
+        if self.decision_cache is not None:
+            self.decision_cache.put(ticker, digest, output.model_dump_json(), now)
+        return output
+
+    def _validate_proposal(
+        self,
+        ticker: str,
+        output,
+        candidates: list,
+        now: datetime,
+        spot: float,
+        result: CycleResult,
+    ):
+        """Validate proposal against candidate list and Monte Carlo POP.
+
+        Returns (candidate, expiry) on success, (None, "") on rejection.
+        """
         proposal = output.proposal
-        # The committee constrains the code to the candidate list; this backstops
-        # against a contract that is not real/tradeable.
         candidate = next(
             (c for c in candidates if c.option_code == proposal.option_code), None
         )
@@ -646,14 +771,8 @@ class PaperTradingCycle:
                     "reasons": ["chosen contract not in candidate list"],
                 }
             )
-            return None
-        expiry = candidate.expiry
+            return None, ""
 
-        # Deterministic third vote: the no-edge Monte Carlo baseline with the
-        # proposal's ACTUAL exit plan and limit price. The AI floor (0.55) asks
-        # "do you believe in the edge"; this low floor asks "is the ticket
-        # structurally hopeless even with one". Skipped (and audited) when the
-        # spot or a usable IV is unavailable rather than blocking on missing data.
         mc_floor = self.active_mandate.options.min_monte_carlo_pop
         if mc_floor > 0:
             if spot > 0 and 0 < candidate.iv <= MAX_USABLE_IV:
@@ -693,7 +812,7 @@ class PaperTradingCycle:
                             ],
                         }
                     )
-                    return None
+                    return None, ""
             else:
                 self.audit.append(
                     "monte_carlo_pop_unavailable",
@@ -701,6 +820,20 @@ class PaperTradingCycle:
                      "spot": spot, "iv": candidate.iv},
                 )
 
+        return candidate, candidate.expiry
+
+    def _execute_entry(
+        self,
+        now: datetime,
+        ticker: str,
+        held_codes: set[str],
+        proposal,
+        candidate,
+        expiry: str,
+        spot: float,
+        result: CycleResult,
+    ):
+        """Validate liquidity, risk gate, place order, and record position."""
         quote = self.market.option_quote(
             option_code=proposal.option_code,
             expiry=expiry,
@@ -731,9 +864,6 @@ class PaperTradingCycle:
             )
             return None
 
-        # Buy ladder: bid at the mid first, then chase to the proposal limit.
-        # Half-spread on a $0.10-0.25 ticket is ~5% of the position -- fills
-        # captured at the mid go straight into expectancy.
         buy_ladder = [proposal.limit_price]
         if quote.ask > quote.bid > 0:
             mid = round((quote.bid + quote.ask) / 2, 2)
@@ -769,6 +899,7 @@ class PaperTradingCycle:
             take_profit_pct=proposal.exit_plan.take_profit_pct,
             stop_loss_pct=proposal.exit_plan.stop_loss_pct,
             time_stop=proposal.exit_plan.time_stop,
+            catalyst_window_end=_parse_window_end(proposal.expected_catalyst_window),
         )
         self.audit.append(
             "order_filled",

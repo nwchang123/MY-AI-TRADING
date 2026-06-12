@@ -3,6 +3,8 @@ from __future__ import annotations
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from trading_agent.data.http_utils import fetch_with_retry
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -99,20 +101,31 @@ class GoogleNewsClient:
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self._fetch = fetch_fn or self._http_fetch
 
-    def _http_fetch(self, ticker: str) -> str:
-        query = urllib.parse.quote(f'"{ticker}" stock')
+    def _http_fetch(self, query_text: str) -> str:
+        query = urllib.parse.quote(query_text)
         url = _GOOGLE_NEWS_URL.format(query=query)
         request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 return response.read().decode("utf-8", errors="replace")
         except (urllib.error.URLError, TimeoutError) as exc:
-            raise NewsFeedError(f"news fetch failed for {ticker}: {exc}") from exc
+            raise NewsFeedError(f"news fetch failed for {query_text}: {exc}") from exc
 
-    def fetch_evidence(self, ticker: str) -> list[EvidenceItem]:
+    def fetch_evidence(
+        self, ticker: str, query_name: str | None = None
+    ) -> list[EvidenceItem]:
+        """Headlines for a ticker.
+
+        ``query_name`` (the company's registered name) is preferred for the
+        search when supplied: a bare single-word ticker like TE or BULL returns
+        mostly unrelated news, while the full name anchors the query. Evidence
+        rows stay tagged with the ticker either way.
+        """
+
         now = self._now_fn()
+        query_text = f'"{query_name}" stock' if query_name else f'"{ticker}" stock'
         rows = parse_google_news_rss(
-            self._fetch(ticker),
+            self._fetch(query_text),
             now=now,
             max_items=self.max_items,
             max_age_days=self.max_age_days,

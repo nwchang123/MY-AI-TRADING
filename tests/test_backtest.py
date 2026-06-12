@@ -121,13 +121,21 @@ def test_backtest_rejects_unmarketable_buy_limit(tmp_path: Path) -> None:
 
 
 def test_backtest_daily_loss_stop_blocks_same_day_entry(tmp_path: Path) -> None:
+    # Open a $0.60 contract (cost $61, inside the $65 cap), then drop it so the
+    # same-day realized loss (-$40) clears the $35 daily stop WITHOUT reaching
+    # the $50 drawdown stop -- isolating the daily-stop reason. entry_fill =
+    # min(limit, ask+0.02) = 0.60; exit_fill = bid-0.02 = 0.20 => -$40.
     scenario = BacktestScenario(
         steps=[
-            BacktestStep(now=NOW, quote=_quote(), proposal=_proposal()),
+            BacktestStep(
+                now=NOW,
+                quote=_quote(bid=0.58, ask=0.60),
+                proposal=_proposal(limit_price=0.60, max_limit_price=0.63),
+            ),
             BacktestStep(
                 now=NEXT,
                 quotes=[
-                    _quote(bid=0.09, ask=0.11, now=NEXT),
+                    _quote(bid=0.22, ask=0.24, now=NEXT),
                     _quote(code=OTHER_CODE, bid=0.19, ask=0.21, now=NEXT),
                 ],
                 proposal=_proposal(code=OTHER_CODE, ticker="OTHER"),
@@ -137,7 +145,7 @@ def test_backtest_daily_loss_stop_blocks_same_day_entry(tmp_path: Path) -> None:
 
     result = run_backtest(scenario, mandate=_mandate(), root_dir=tmp_path)
 
-    assert result.summary["realized_pnl_usd"] == -14
+    assert result.summary["realized_pnl_usd"] == -40
     assert result.summary["trades_opened"] == 1
     assert result.summary["rejected_by_stage"] == {"risk_gate": 1}
     assert result.events[-1]["payload"]["reasons"] == ["daily loss stop is active"]

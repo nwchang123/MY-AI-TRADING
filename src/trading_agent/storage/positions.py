@@ -23,7 +23,16 @@ CREATE TABLE IF NOT EXISTS positions (
     close_reason TEXT,
     exit_price REAL
 );
+CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
+CREATE INDEX IF NOT EXISTS idx_positions_ticker ON positions(ticker);
 """
+
+# Columns added after the original schema shipped. Applied idempotently on init
+# so a ledger written by an older build keeps working (SQLite ADD COLUMN is
+# non-destructive and cheap). Each entry is (name, column-type).
+_ADDED_COLUMNS: list[tuple[str, str]] = [
+    ("catalyst_window_end", "TEXT"),
+]
 
 
 class PositionStore:
@@ -39,11 +48,19 @@ class PositionStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(positions)")}
+        for name, col_type in _ADDED_COLUMNS:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE positions ADD COLUMN {name} {col_type}")
 
     def open_position(
         self,
@@ -58,6 +75,7 @@ class PositionStore:
         take_profit_pct: float,
         stop_loss_pct: float,
         time_stop: date,
+        catalyst_window_end: date | None = None,
     ) -> None:
         opened_at = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
@@ -65,8 +83,8 @@ class PositionStore:
                 "INSERT OR REPLACE INTO positions "
                 "(option_code, ticker, option_side, entry_price, contracts, lot_size, "
                 "expiry, take_profit_pct, stop_loss_pct, time_stop, status, opened_at, "
-                "closed_at, close_reason, exit_price) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, NULL, NULL, NULL)",
+                "closed_at, close_reason, exit_price, catalyst_window_end) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, NULL, NULL, NULL, ?)",
                 (
                     option_code,
                     ticker,
@@ -79,6 +97,7 @@ class PositionStore:
                     stop_loss_pct,
                     time_stop.isoformat(),
                     opened_at,
+                    catalyst_window_end.isoformat() if catalyst_window_end else None,
                 ),
             )
 

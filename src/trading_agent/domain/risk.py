@@ -33,6 +33,7 @@ class UniverseMandate(BaseModel):
     require_listed_equity: bool
     reject_otc: bool
     reject_halted: bool
+    excluded_industries: list[str] = Field(default_factory=lambda: ["Shell Companies"])
 
 
 class OptionsMandate(BaseModel):

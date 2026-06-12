@@ -27,6 +27,17 @@ WEAK_CATALYST_SCORE = 10.0
 
 RedFlagSeverity = Literal["warn", "critical"]
 
+# Critical flags whose meaning is "the stock should go DOWN", not "do not trade".
+# These no longer block the whole name: they disallow a long CALL but argue FOR
+# a long PUT (handled in the committee). Any critical flag not listed here is
+# treated as non-directional and still blocks the trade outright.
+BEARISH_CRITICAL_CODES = frozenset({"dilution_overhang", "insider_selling"})
+
+# 8-K item 2.02 is the earnings release; the labeller stamps "(earnings)" /
+# "[signals: earnings]" into the fact, so a freestanding earnings-calendar feed
+# is not required for the IV-crush flag to fire.
+_EARNINGS_MARKERS = ("earnings", "results of operations")
+
 # Source types that corroborate a thesis with a primary / official record.
 _PRIMARY_SOURCES: set[SourceType] = {
     "sec_8k",
@@ -124,7 +135,12 @@ def detect_red_flags(
         )
 
     # --- earnings inside the window: IV crush can sink a long option ---
-    earnings = [item for item in evidence if item.source_type == "earnings_calendar"]
+    earnings = [
+        item
+        for item in evidence
+        if item.source_type == "earnings_calendar"
+        or (item.source_type == "sec_8k" and _contains(item.observed_fact, _EARNINGS_MARKERS))
+    ]
     if earnings:
         flags.append(
             RedFlag(
@@ -192,6 +208,26 @@ def detect_red_flags(
 
 def critical_flags(flags: list[RedFlag]) -> list[RedFlag]:
     return [flag for flag in flags if flag.severity == "critical"]
+
+
+def bearish_critical_flags(flags: list[RedFlag]) -> list[RedFlag]:
+    """Critical flags that argue for downside (a long put), not a hard block."""
+
+    return [
+        flag
+        for flag in flags
+        if flag.severity == "critical" and flag.code in BEARISH_CRITICAL_CODES
+    ]
+
+
+def nondirectional_critical_flags(flags: list[RedFlag]) -> list[RedFlag]:
+    """Critical flags that block any trade regardless of direction."""
+
+    return [
+        flag
+        for flag in flags
+        if flag.severity == "critical" and flag.code not in BEARISH_CRITICAL_CODES
+    ]
 
 
 def format_red_flags(flags: list[RedFlag]) -> str:

@@ -57,7 +57,7 @@ def test_parse_raises_on_garbage() -> None:
 
 
 def test_client_normalizes_to_evidence_items() -> None:
-    client = GoogleNewsClient(now_fn=lambda: NOW, fetch_fn=lambda ticker: RSS)
+    client = GoogleNewsClient(now_fn=lambda: NOW, fetch_fn=lambda query: RSS)
     items = client.fetch_evidence("sofi")
     assert len(items) == 2
     first = items[0]
@@ -66,3 +66,28 @@ def test_client_normalizes_to_evidence_items() -> None:
     assert first.source_url == "https://example.com/sofi-partnership"
     assert first.observed_fact.startswith("SoFi announces new partnership")
     assert first.evidence_id.startswith("news-")
+
+
+def test_company_name_anchors_the_query_but_tags_the_ticker() -> None:
+    seen: list[str] = []
+
+    def fake_fetch(query: str) -> str:
+        seen.append(query)
+        return RSS
+
+    client = GoogleNewsClient(now_fn=lambda: NOW, fetch_fn=fake_fetch)
+    items = client.fetch_evidence("TE", query_name="Tradeweb Markets Inc")
+
+    # The full company name anchors the search, not the ambiguous "TE"...
+    assert seen == ['"Tradeweb Markets Inc" stock']
+    # ...but the evidence rows stay tagged with the ticker.
+    assert items[0].ticker == "TE"
+
+
+def test_bare_ticker_query_when_no_name_supplied() -> None:
+    seen: list[str] = []
+    client = GoogleNewsClient(
+        now_fn=lambda: NOW, fetch_fn=lambda q: seen.append(q) or RSS
+    )
+    client.fetch_evidence("SOFI")
+    assert seen == ['"SOFI" stock']

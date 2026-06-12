@@ -55,6 +55,35 @@ def test_no_signal_when_inside_plan() -> None:
     assert _monitor().evaluate([_position()], NOW) == []
 
 
+def test_catalyst_window_elapsed_exits_even_on_stale_quote() -> None:
+    # The committee's catalyst window ended yesterday; the edge is gone, so the
+    # position exits regardless of a stale quote (time-based, like the time stop).
+    pos = _position(
+        catalyst_window_end=date(2026, 6, 1),  # NOW is 2026-06-02
+        observed_at=datetime(2026, 5, 1, tzinfo=timezone.utc),  # very stale
+    )
+    signals = _monitor().evaluate([pos], NOW)
+    assert len(signals) == 1
+    assert signals[0].reason == "catalyst window elapsed"
+
+
+def test_catalyst_window_not_yet_elapsed_does_not_exit() -> None:
+    pos = _position(catalyst_window_end=date(2026, 6, 20))  # still ahead of NOW
+    assert _monitor().evaluate([pos], NOW) == []
+
+
+def test_forced_close_takes_priority_over_catalyst_window() -> None:
+    # Expiry is imminent (within the 2-trading-day force window) AND the catalyst
+    # window has elapsed: the forced-close reason wins.
+    pos = _position(
+        expiry=date(2026, 6, 3),
+        time_stop=date(2026, 6, 3),
+        catalyst_window_end=date(2026, 6, 1),
+    )
+    signals = _monitor().evaluate([pos], NOW)
+    assert signals[0].reason == "forced close before expiry"
+
+
 def test_take_profit_fires() -> None:
     signals = _monitor().evaluate([_position(bid=0.40, ask=0.42)], NOW)
     assert len(signals) == 1

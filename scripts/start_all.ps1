@@ -37,14 +37,19 @@ if ($port) {
 
 # --- 2. Telegram control bot (single-instance guard inside run_bot.ps1) -------
 Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
-    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $scripts "run_bot.ps1")
+    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ('"' + (Join-Path $scripts "run_bot.ps1") + '"')
 )
 Write-Step "Bot " "控制机器人已确保运行 (24 小时,可在 Telegram 用命令/问答)"
 
-# --- 3. Autonomous trading loop (single-instance guard inside the script) -----
-Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
-    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $scripts "run_paper_loop.ps1")
-)
+# --- 3. Autonomous trading loop ------------------------------------------------
+# Use cmd.exe to launch python with output redirected to the daily log.
+# /k keeps the window alive if python crashes (for debugging); /min starts
+# minimized. The run-loop handles scheduling and market-hours internally.
+$loopLogDir = Join-Path $root "runtime\logs"
+$loopLog = Join-Path $loopLogDir ("loop-{0:yyyy-MM-dd}.log" -f (Get-Date))
+New-Item -ItemType Directory -Force -Path $loopLogDir | Out-Null
+$cmdLine = "python -m trading_agent run-loop --auto-universe --interval-seconds 1800 --max-iterations 18 >> `"$loopLog`" 2>&1"
+Start-Process cmd.exe -ArgumentList "/k", $cmdLine -WindowStyle Minimized -WorkingDirectory $root
 Write-Step "Loop" "交易循环已确保运行 (闭市自动跳过,盘中每 30 分钟一轮)"
 
 Start-Sleep -Seconds 3

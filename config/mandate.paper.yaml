@@ -15,6 +15,9 @@ universe:
   require_listed_equity: true
   reject_otc: true
   reject_halted: true
+  # Moomoo industry plates that never get an optionability probe (SPAC shells
+  # flood the volume-ratio ranking but essentially never have eligible options).
+  excluded_industries: ["Shell Companies"]
 
 options:
   allowed_opening_actions: [buy_call, buy_put]
@@ -23,7 +26,13 @@ options:
   min_dte: 14
   max_dte: 45
   min_option_bid_usd: 0.05
-  max_contract_cost_usd: 25
+  # AI gets free rein over the full $100: a single contract may cost up to ~2/3
+  # of the account, which reaches near-the-money strikes (higher delta -> higher
+  # win probability) instead of forcing deep-OTM lottery tickets. The OLD $25
+  # cap (ask <= ~$0.24) was the binding constraint that both starved candidate
+  # flow AND pinned the strategy to the lowest-win-rate options. Compounding
+  # scales this with realized equity, so wins widen the reachable strikes.
+  max_contract_cost_usd: 65
   max_bid_ask_spread_pct: 15
   min_open_interest: 100
   min_daily_volume: 10
@@ -33,19 +42,25 @@ options:
   fee_buffer_usd: 1
   # Both AI lineages (DeepSeek committee + Gemini adversary) must estimate at
   # least this win probability; the LOWEST estimate is binding. Breakeven at
-  # TP+100/SL-50 with ~20% friction is ~0.47, so 0.55 leaves a margin.
-  min_estimated_win_probability: 0.55
+  # TP+100/SL-50 with ~20% friction is ~0.47; raised from 0.55 to 0.60 as the
+  # quid pro quo for the wider cost cap -- bigger bets demand a higher win bar.
+  min_estimated_win_probability: 0.60
   # Deterministic Monte Carlo baseline (no-edge GBM): rejects tickets so
-  # hopeless that no catalyst edge could plausibly rescue them. Deliberately
-  # far below the AI floor -- the AIs claim the edge, the math sets the floor.
-  min_monte_carlo_pop: 0.2
+  # hopeless that no catalyst edge could plausibly rescue them. Raised 0.2->0.3
+  # alongside the win floor; still well below the AI bar (math sets the floor,
+  # the AIs claim the edge above it).
+  min_monte_carlo_pop: 0.3
 
 portfolio:
+  # Stops re-calibrated for the wider $65 cost cap: positions are now a much
+  # larger share of the $100 account, so the old $10/$25 dollar stops would
+  # halt on a single normal option swing. These are ~full-deployment with a
+  # "lose a third of the day / half the account -> stop and review" backstop.
   max_open_positions: 2
-  max_total_premium_at_risk_usd: 60
+  max_total_premium_at_risk_usd: 100
   max_new_positions_per_day: 2
-  daily_loss_stop_usd: 10
-  hard_drawdown_stop_usd: 25
+  daily_loss_stop_usd: 35
+  hard_drawdown_stop_usd: 50
   consecutive_loss_stop: 3
   cooldown_after_consecutive_losses_hours: 24
   # No new entries when the VIX is above this (panic regime guard); exits still run.

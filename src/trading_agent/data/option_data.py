@@ -5,6 +5,8 @@ import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from trading_agent.data.http_utils import fetch_with_retry
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Protocol, runtime_checkable
 
@@ -176,10 +178,13 @@ class CboeOptionData:
         url = _CBOE_URL.format(symbol=symbol)
         request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
         try:
-            with urllib.request.urlopen(
-                request, timeout=self.timeout, context=ssl.create_default_context()
-            ) as response:
-                return json.load(response)
+            data = fetch_with_retry(
+                url,
+                timeout=self.timeout,
+                max_retries=2,
+                retry_base_delay=1.0,
+            )
+            return json.loads(data)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 raise OptionDataError(
@@ -499,22 +504,26 @@ class FallbackOptionProvider:
 
 
 def build_option_provider(
-    source: str = "cboe",
+    source: str = "yahoo",
     *,
     tradier_token: str = "",
     tradier_base_url: str = TRADIER_SANDBOX_URL,
 ) -> OptionDataProvider:
     """Assemble the configured option-data provider.
 
-    ``source`` is one of ``cboe``, ``tradier``, or ``cboe+tradier``. Tradier is
-    included only when a token is supplied; if a Tradier-only source is asked for
-    without a token this raises, but ``cboe+tradier`` degrades to CBOE alone.
+    ``source`` is one of ``yahoo``, ``cboe``, ``tradier``, or combinations
+    like ``yahoo+cboe``. Providers are tried in order.
+    Recommended: ``yahoo`` (free, reliable).
     """
+
+    from trading_agent.data.yahoo import YahooOptionData
 
     providers: list[OptionDataProvider] = []
     for name in source.lower().split("+"):
         name = name.strip()
-        if name == "cboe":
+        if name == "yahoo":
+            providers.append(YahooOptionData())
+        elif name == "cboe":
             providers.append(CboeOptionData())
         elif name == "tradier":
             if tradier_token:
@@ -528,5 +537,5 @@ def build_option_provider(
         elif name:
             raise ValueError(f"unknown option data source: {name!r}")
     if not providers:
-        providers.append(CboeOptionData())
+        providers.append(YahooOptionData())
     return providers[0] if len(providers) == 1 else FallbackOptionProvider(providers)

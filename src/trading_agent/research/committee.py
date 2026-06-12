@@ -8,12 +8,13 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from trading_agent.domain.evidence import CandidateContext
 from trading_agent.domain.proposals import OpenPositionProposal, OptionCandidate
-from trading_agent.research.llm import LLMClient, LlmUsage
+from trading_agent.research.llm import LLMClient, LLMUsage
 from trading_agent.research.redflags import (
     RedFlag,
-    critical_flags,
+    bearish_critical_flags,
     detect_red_flags,
     format_red_flags,
+    nondirectional_critical_flags,
 )
 from trading_agent.research.scoring import ScoreComponents
 
@@ -63,6 +64,18 @@ _PM_CANDIDATE_RULE = (
     "\nThe option_code MUST be copied exactly from one of the CANDIDATE CONTRACTS"
     " in the briefing. Do not invent or modify a contract code."
 )
+
+# Injected when code has detected critical BEARISH signals (fresh dilution shelf
+# or insider selling). These used to free-reject the whole name; now they flip
+# the allowed direction so the thesis can be expressed as a long put instead.
+def _puts_only_block(flags: list[RedFlag]) -> str:
+    codes = ", ".join(flag.code for flag in flags)
+    return (
+        "DIRECTIONAL CONSTRAINT: code detected critical BEARISH signal(s) "
+        f"[{codes}] for this name (treat as observed fact). A long CALL is "
+        "DISALLOWED here. You may ONLY recommend a long PUT from the candidate "
+        "contracts, or decline (hold/reject). Do not argue for upside."
+    )
 
 # Both adversary roles must end with an independent win-probability estimate.
 # It is parsed deterministically and the LOWEST estimate across both model
@@ -191,14 +204,14 @@ class Committee:
         # lineages (skeptic, risk_manager, PM confidence). 0 disables.
         self.min_win_probability = min_win_probability
 
-    def usage_total(self) -> LlmUsage:
+    def usage_total(self) -> LLMUsage:
         """Aggregate token/call usage across the distinct clients in use.
 
         Snapshot this before and after ``run`` (see ``llm.usage_delta``) to meter
         the spend of a single committee pass.
         """
 
-        total = LlmUsage()
+        total = LLMUsage()
         seen: list[LLMClient] = []
         for client in (self.client, self.adversary_client, self.pro_client):
             if any(client is other for other in seen):
@@ -216,42 +229,77 @@ class Committee:
         candidates: list[OptionCandidate] | None = None,
         market_snapshot: dict | None = None,
     ) -> CommitteeOutput:
+        red_flags = detect_red_flags(context, scores)
+        # Non-directional critical flags (none today, but future-proofed) still
+        # hard-block with zero API calls: a known disqualifier never depends on
+        # the LLM noticing it.
+        blockers = nondirectional_critical_flags(red_flags)
+        if blockers:
+            return CommitteeOutput(
+                decision="reject",
+                rationale="Blocked by deterministic red flag(s): "
+                + ", ".join(flag.code for flag in blockers),
+                proposal=None,
+                role_notes=[],
+                vetoes=[f"redflags: {flag.message}" for flag in blockers],
+                llm_calls=0,
+                red_flags=red_flags,
+            )
+
+        # Critical BEARISH flags (fresh dilution / insider selling) no longer
+        # kill the name: they flip the allowed direction to PUT-only. The thesis
+        # can still be expressed -- as downside -- so half the opportunity space
+        # is no longer welded shut. With no tradeable put to express it, the old
+        # zero-API-call block still applies.
+        bearish = bearish_critical_flags(red_flags)
+        # The directional flip only makes sense with a real candidate list to
+        # restrict to puts. In legacy (no-chain) mode there is nothing to
+        # constrain, so a bearish critical keeps the original zero-API-call
+        # block; with a chain that has no tradeable put, likewise.
+        if bearish and (
+            candidates is None
+            or not [c for c in candidates if c.option_side == "put"]
+        ):
+            return CommitteeOutput(
+                decision="reject",
+                rationale="Blocked by deterministic red flag(s): "
+                + ", ".join(flag.code for flag in bearish),
+                proposal=None,
+                role_notes=[],
+                vetoes=[f"redflags: {flag.message}" for flag in bearish],
+                llm_calls=0,
+                red_flags=red_flags,
+            )
+
+        puts_only = bool(bearish)
+        effective = candidates
+        if puts_only and candidates is not None:
+            effective = [c for c in candidates if c.option_side == "put"]
+
         # In candidate mode the options_analyst/PM pick a real listed contract
-        # from ``candidates`` instead of guessing one; the PM's option_code is
+        # from ``effective`` instead of guessing one; the PM's option_code is
         # then constrained to that set. ``candidates=None`` keeps legacy behavior.
-        candidate_block = self._format_candidates(candidates)
+        candidate_block = self._format_candidates(effective)
         candidate_codes = (
-            {c.option_code for c in candidates} if candidates else None
+            {c.option_code for c in effective} if effective else None
         )
+        direction_block = _puts_only_block(bearish) if puts_only else ""
         options_system = _OPTIONS_SYSTEM_WITH_CHAIN if candidate_block else _OPTIONS_SYSTEM
-        pm_system = _PM_SYSTEM + (_PM_CANDIDATE_RULE if candidate_block else "")
+        pm_system = (
+            _PM_SYSTEM
+            + (_PM_CANDIDATE_RULE if candidate_block else "")
+            + (f"\n{direction_block}" if direction_block else "")
+        )
 
         briefing = self._briefing(context, scores)
         snapshot_block = self._format_snapshot(market_snapshot)
         if snapshot_block:
             briefing = f"{briefing}\n\n{snapshot_block}"
+        if direction_block:
+            briefing = f"{briefing}\n\n{direction_block}"
         flash_model = self._model_name(self.client)
         adversary_model = self._model_name(self.adversary_client)
         pro_model = self._model_name(self.pro_client)
-
-        red_flags = detect_red_flags(context, scores)
-        criticals = critical_flags(red_flags)
-        # A critical, code-detected red flag (a fresh dilution shelf or insider
-        # selling) blocks the trade deterministically and skips the committee
-        # entirely: a known disqualifier never depends on the LLM noticing it,
-        # and the block costs zero API calls.
-        if criticals:
-            vetoes = [f"redflags: {flag.message}" for flag in criticals]
-            return CommitteeOutput(
-                decision="reject",
-                rationale="Blocked by deterministic red flag(s): "
-                + ", ".join(flag.code for flag in criticals),
-                proposal=None,
-                role_notes=[],
-                vetoes=vetoes,
-                llm_calls=0,
-                red_flags=red_flags,
-            )
 
         flag_block = format_red_flags(red_flags)
         calls = 0
@@ -330,6 +378,7 @@ class Committee:
             red_flags,
             candidate_codes,
             adversary_estimates,
+            puts_only=puts_only,
         )
 
     def _finalize(
@@ -342,6 +391,7 @@ class Committee:
         red_flags: list[RedFlag],
         candidate_codes: set[str] | None = None,
         adversary_estimates: dict[str, float | None] | None = None,
+        puts_only: bool = False,
     ) -> CommitteeOutput:
         def reject(rationale: str) -> CommitteeOutput:
             return CommitteeOutput(
@@ -385,6 +435,13 @@ class Committee:
             return reject(
                 f"proposal ticker {proposal.ticker!r} does not match candidate "
                 f"{context.ticker!r}"
+            )
+
+        # Defense in depth: under a bearish directional constraint the PM may
+        # only go long a put. A call here means the model ignored the constraint.
+        if puts_only and proposal.option_side != "put":
+            return reject(
+                "proposal is a call but a critical bearish signal allows puts only"
             )
 
         allowed_ids = context.evidence_ids()
@@ -473,14 +530,24 @@ class Committee:
             "CANDIDATE CONTRACTS (already pass the mandate's liquidity/DTE/cost "
             "limits; choose option_code from THIS list only). mc_pop is the "
             "no-edge Monte Carlo baseline P(hit +100% before -50%): your "
-            "WIN_PROB above it is a claim that the catalyst adds real edge."
+            "WIN_PROB above it is a claim that the catalyst adds real edge. "
+            "delta is how much the option tracks the stock (|delta| near 0.5 = "
+            "near the money); breakeven_move is the % the stock must move by "
+            "expiry just to break even (closer to 0 = less has to go right)."
         ]
         for c in candidates:
             mc = "n/a" if c.mc_pop is None else f"{c.mc_pop}"
+            delta = "n/a" if c.delta is None else f"{c.delta:+.2f}"
+            be = (
+                "n/a"
+                if c.breakeven_move_pct is None
+                else f"{c.breakeven_move_pct:+.1f}%"
+            )
             lines.append(
                 f"  {c.option_code} {c.option_side} strike={c.strike} "
                 f"expiry={c.expiry.isoformat()} DTE={c.dte} bid={c.bid} ask={c.ask} "
                 f"OI={c.open_interest} vol={c.daily_volume} iv={c.iv} "
+                f"delta={delta} breakeven_move={be} "
                 f"est_cost=${c.estimated_contract_cost_usd} mc_pop={mc}"
             )
         return "\n".join(lines)

@@ -27,10 +27,20 @@ from trading_agent.execution.lock import single_instance_lock
 from trading_agent.notify import TelegramNotifier, format_cycle_alert
 from trading_agent.execution.orchestrator import PaperTradingCycle
 from trading_agent.execution.scheduler import run_scheduler
-from trading_agent.reporting import build_daily_report, read_audit_events
+from trading_agent.reporting import (
+    build_calibration_report,
+    build_daily_report,
+    build_funnel_report,
+    read_audit_events,
+)
 from trading_agent.research.catalysts import build_candidate_context, derive_score_inputs
 from trading_agent.research.committee import Committee
-from trading_agent.research.universe import DEFAULT_MAX_TICKERS, select_universe
+from trading_agent.research.universe import (
+    DEFAULT_MAX_TICKERS,
+    CachedProbe,
+    EligibleContractProbe,
+    select_universe,
+)
 from trading_agent.research.llm import OpenAICompatibleClient, usage_delta
 from trading_agent.research.scoring import ScoreInputs, score_candidate
 from trading_agent.settings import Settings
@@ -38,6 +48,7 @@ from trading_agent.storage.audit import AuditWriter
 from trading_agent.storage.budget import DailyTokenBudget
 from trading_agent.storage.decisions import DecisionCache
 from trading_agent.storage.positions import PositionStore
+from trading_agent.storage.probes import ProbeCache
 from trading_agent.storage.sqlite import SnapshotStore
 
 
@@ -62,9 +73,8 @@ def _market(settings: Settings) -> MoomooMarket:
 
 
 def _option_provider(settings: Settings) -> OptionDataProvider:
-    # Option chains/quotes come from a free delayed feed (Moomoo does not entitle
-    # US option data); Moomoo is still used for execution. This is the cycle's
-    # `market` dependency (option_quote + is_listed_option).
+    # Option chains/quotes come from Yahoo Finance (free, ~15min delayed).
+    # Moomoo is used for execution only. Real-time stock prices come from Moomoo.
     return build_option_provider(
         settings.option_data_source,
         tradier_token=settings.tradier_token,
@@ -317,6 +327,7 @@ def _build_cycle(
             if mandate.execution.max_daily_llm_tokens > 0
             else None
         ),
+        moomoo_market=_market(settings),
     )
 
 
@@ -373,17 +384,60 @@ def _write_heartbeat(settings: Settings, note: str) -> None:
 
 
 def _auto_universe(settings: Settings, max_tickers: int) -> list[str]:
-    """Let the agent pick its own tickers: scan -> rank -> optionability."""
+    """Let the agent pick its own tickers.
+
+    scan (full, paginated) -> rank by volume ratio with fresh 8-K filers first
+    -> skip fresh cached rejections -> cap per industry -> probe for a
+    mandate-eligible contract (negative probes cached on disk).
+    """
 
     mandate = Mandate.load(settings.mandate_path)
+    market = _market(settings)
+    provider = _option_provider(settings)
+    probe = CachedProbe(
+        EligibleContractProbe(
+            provider=provider,
+            options=mandate.options,
+            execution=mandate.execution,
+        ),
+        ProbeCache(settings.root_dir / "runtime" / "probe_cache.json"),
+    )
+    # Bench rejected names for 2h, not the full 6h decision TTL: the bench
+    # only saves a probe + evidence fetch, but it blocks the re-evaluation a
+    # changed digest would trigger (and the eligible-name flow is scarce).
+    skip = DecisionCache(
+        settings.root_dir / "runtime" / f"decisions.{settings.mode}.json"
+    ).fresh_rejections(within_hours=2.0)
+    try:
+        priority = SecEdgarClient(settings.sec_user_agent).recent_8k_tickers()
+    except Exception as exc:  # noqa: BLE001 - seeds are an enrichment, never block
+        priority = set()
+        print(f"auto universe: 8-K seed feed unavailable ({exc})", file=sys.stderr)
+
+    def industry_of(tickers: list[str]) -> dict[str, str]:
+        plates = market.industry_plates([f"US.{t}" for t in tickers])
+        return {code.removeprefix("US."): name for code, name in plates.items()}
+
     tickers = select_universe(
-        market=_market(settings),
-        provider=_option_provider(settings),
+        market=market,
+        provider=provider,
         universe=mandate.universe,
         max_tickers=max_tickers,
+        probe=probe,
+        skip_tickers=skip,
+        priority_tickers=priority,
+        industry_of=industry_of,
     )
     _audit_writer(settings).append(
-        "universe_selected", {"tickers": tickers, "max_tickers": max_tickers}
+        "universe_selected",
+        {
+            "tickers": tickers,
+            "max_tickers": max_tickers,
+            "skipped_fresh_rejections": sorted(skip),
+            "event_seeds": sorted(priority & set(tickers)),
+            "probe_fetches": probe.fetch_count,
+            "probe_cache_hits": probe.cache_hits,
+        },
     )
     print(f"auto universe: {', '.join(tickers) or '(none)'}", file=sys.stderr)
     return tickers
@@ -538,6 +592,16 @@ def _report(settings: Settings, on_date: date | None) -> None:
     _print_json(build_daily_report(events, target))
 
 
+def _funnel(settings: Settings, on_date: date | None) -> None:
+    events = read_audit_events(settings.root_dir / "runtime" / "audit.jsonl")
+    _print_json(build_funnel_report(events, on_date))
+
+
+def _calibration(settings: Settings, on_date: date | None) -> None:
+    events = read_audit_events(settings.root_dir / "runtime" / "audit.jsonl")
+    _print_json(build_calibration_report(events, on_date))
+
+
 def _run_backtest(settings: Settings, input_path: Path) -> None:
     mandate = Mandate.load(settings.mandate_path)
     result = run_backtest_file(
@@ -656,6 +720,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "report", help="Build a daily report from the audit log"
     )
     report_parser.add_argument("--date", default=None, help="UTC date YYYY-MM-DD")
+    funnel_parser = subparsers.add_parser(
+        "funnel",
+        help="Selection-to-entry funnel with per-stage drop counts from the audit log",
+    )
+    funnel_parser.add_argument(
+        "--date", default=None, help="UTC date YYYY-MM-DD (default: all events)"
+    )
+    calibration_parser = subparsers.add_parser(
+        "calibration",
+        help="Predicted win-probability vs realized outcome, bucketed",
+    )
+    calibration_parser.add_argument(
+        "--date", default=None, help="UTC date YYYY-MM-DD (default: all events)"
+    )
     backtest_parser = subparsers.add_parser(
         "backtest",
         help="Replay offline proposals and option quotes through the risk/exit engine",
@@ -742,6 +820,14 @@ def main() -> None:
     if args.command == "report":
         on_date = date.fromisoformat(args.date) if args.date else None
         _report(settings, on_date)
+        return
+    if args.command == "funnel":
+        on_date = date.fromisoformat(args.date) if args.date else None
+        _funnel(settings, on_date)
+        return
+    if args.command == "calibration":
+        on_date = date.fromisoformat(args.date) if args.date else None
+        _calibration(settings, on_date)
         return
     if args.command == "backtest":
         _run_backtest(settings, args.input)

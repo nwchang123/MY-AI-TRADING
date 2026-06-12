@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -6,8 +7,11 @@ from trading_agent.data.sec_edgar import (
     SecEdgarClient,
     SecEdgarError,
     build_filing_url,
+    label_8k_items,
     map_form_to_source_type,
+    parse_current_filing_ciks,
     parse_submissions,
+    strip_html,
 )
 
 RETRIEVED = datetime(2026, 6, 2, 13, 0, tzinfo=timezone.utc)
@@ -81,3 +85,135 @@ def test_client_requires_contactful_user_agent() -> None:
         SecEdgarClient("no-contact-here")
     # A contactful UA is accepted.
     SecEdgarClient("Research Team research@example.com")
+
+
+_CURRENT_8K_ATOM = """<?xml version="1.0" encoding="ISO-8859-1" ?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Latest Filings - Thu, 11 Jun 2026 15:00:00 EDT</title>
+  <entry>
+    <title>8-K - Acme Therapeutics Inc. (0001234567) (Filer)</title>
+    <summary> Filed: 2026-06-11 AccNo: 0001234567-26-000042 Size: 312 KB</summary>
+  </entry>
+  <entry>
+    <title>8-K/A - Borealis Mining Corp (0000111222) (Filer)</title>
+    <summary> Filed: 2026-06-11 AccNo: 0000111222-26-000007 Size: 88 KB</summary>
+  </entry>
+</feed>
+"""
+
+
+def test_parse_current_filing_ciks_reads_parenthesized_ciks() -> None:
+    # The dash-separated accession numbers in the summaries must not match.
+    assert parse_current_filing_ciks(_CURRENT_8K_ATOM) == {1234567, 111222}
+    assert parse_current_filing_ciks("<feed></feed>") == set()
+
+
+def test_recent_8k_tickers_joins_feed_against_registry() -> None:
+    client = SecEdgarClient("Research Team research@example.com")
+    client._get_bytes = lambda url: _CURRENT_8K_ATOM.encode("utf-8")  # type: ignore[method-assign]
+    # Pre-seeded registry: ACME maps to a feed CIK, NVDA does not, and the
+    # second feed CIK (a fund with no listed ticker) simply joins to nothing.
+    client._ticker_cache = {
+        "ACME": ("0001234567", 1234567, "Acme Therapeutics Inc."),
+        "NVDA": ("0001045810", 1045810, "NVIDIA Corp"),
+    }
+
+    assert client.recent_8k_tickers() == {"ACME"}
+
+
+def test_company_name_from_registry() -> None:
+    client = SecEdgarClient("Research Team research@example.com")
+    client._ticker_cache = {"ACME": ("0001234567", 1234567, "Acme Therapeutics Inc.")}
+    assert client.company_name("acme") == "Acme Therapeutics Inc."
+    assert client.company_name("UNKNOWN") is None
+
+
+def test_label_8k_items_decodes_codes_and_leans() -> None:
+    label, leans = label_8k_items("2.02,9.01")
+    assert "Results of Operations" in label
+    assert leans == {"earnings", "neutral"}
+    # Signed-deal and bankruptcy carry opposite leans.
+    assert label_8k_items("1.01")[1] == {"bull"}
+    assert label_8k_items("1.03")[1] == {"bear"}
+    # Unknown code is surfaced verbatim, never dropped.
+    assert label_8k_items("9.99") == ("item 9.99", {"neutral"})
+    assert label_8k_items("") == ("", set())
+
+
+def test_strip_html_drops_tags_scripts_and_entities() -> None:
+    html = "<html><style>p{color:red}</style><body>Acme <b>signs</b>&nbsp;deal</body></html>"
+    assert strip_html(html) == "Acme signs deal"
+
+
+def test_parse_submissions_labels_8k_items_with_signals() -> None:
+    subs = {
+        "filings": {
+            "recent": {
+                "accessionNumber": ["0001-26-1"],
+                "filingDate": ["2026-06-01"],
+                "acceptanceDateTime": ["2026-06-01T16:30:00.000Z"],
+                "form": ["8-K"],
+                "primaryDocument": ["a.htm"],
+                "primaryDocDescription": ["FORM 8-K"],
+                "items": ["2.02,9.01"],
+            }
+        }
+    }
+    fact = parse_submissions(subs, ticker="ABC", cik=1, retrieved_at=RETRIEVED)[0].observed_fact
+    assert "Results of Operations" in fact
+    assert "[signals: earnings]" in fact
+
+
+def test_fetch_bodies_appends_excerpt_to_8k(monkeypatch) -> None:
+    client = SecEdgarClient("Research Team research@example.com")
+    client._ticker_cache = {"ABC": ("0000000001", 1, "ABC Corp")}
+    subs = {
+        "filings": {
+            "recent": {
+                "accessionNumber": ["0001-26-1"],
+                "filingDate": ["2026-06-01"],
+                "acceptanceDateTime": ["2026-06-01T16:30:00.000Z"],
+                "form": ["8-K"],
+                "primaryDocument": ["a.htm"],
+                "primaryDocDescription": ["FORM 8-K"],
+                "items": ["1.01"],
+            }
+        }
+    }
+    body = b"<html><body>Company entered a binding supply agreement worth $50M.</body></html>"
+
+    def fake_get_bytes(url):
+        return json.dumps(subs).encode() if url.endswith(".json") else body
+
+    client._get_bytes = fake_get_bytes  # type: ignore[method-assign]
+    items = client.fetch_evidence("ABC", fetch_bodies=True)
+    assert "binding supply agreement worth $50M" in items[0].observed_fact
+
+
+def test_fetch_bodies_failure_is_nonfatal(monkeypatch) -> None:
+    client = SecEdgarClient("Research Team research@example.com")
+    client._ticker_cache = {"ABC": ("0000000001", 1, "ABC Corp")}
+    subs = {
+        "filings": {
+            "recent": {
+                "accessionNumber": ["0001-26-1"],
+                "filingDate": ["2026-06-01"],
+                "acceptanceDateTime": ["2026-06-01T16:30:00.000Z"],
+                "form": ["8-K"],
+                "primaryDocument": ["a.htm"],
+                "primaryDocDescription": ["FORM 8-K"],
+                "items": ["1.01"],
+            }
+        }
+    }
+
+    def fake_get_bytes(url):
+        if url.endswith(".json"):
+            return json.dumps(subs).encode()
+        raise SecEdgarError("document moved")
+
+    client._get_bytes = fake_get_bytes  # type: ignore[method-assign]
+    # Body fetch failed but the metadata evidence still comes back intact.
+    items = client.fetch_evidence("ABC", fetch_bodies=True)
+    assert len(items) == 1
+    assert items[0].source_type == "sec_8k"

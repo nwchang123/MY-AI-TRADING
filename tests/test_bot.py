@@ -35,9 +35,9 @@ class FakeLLM:
     def __init__(self, reply: str = "AI 的回答"):
         self.reply = reply
         self.calls: list[dict] = []
-        from trading_agent.research.llm import LlmUsage
+        from trading_agent.research.llm import LLMUsage
 
-        self.usage = LlmUsage(calls=0, prompt_tokens=0, completion_tokens=0)
+        self.usage = LLMUsage(calls=0, prompt_tokens=0, completion_tokens=0)
 
     def complete(self, *, system: str, user: str, json_mode: bool = False) -> str:
         self.calls.append({"system": system, "user": user})

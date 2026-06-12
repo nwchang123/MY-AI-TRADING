@@ -2,9 +2,11 @@ from datetime import datetime, timedelta, timezone
 
 from trading_agent.domain.evidence import CandidateContext, EvidenceItem, SourceType
 from trading_agent.research.redflags import (
+    bearish_critical_flags,
     critical_flags,
     detect_red_flags,
     format_red_flags,
+    nondirectional_critical_flags,
 )
 from trading_agent.research.scoring import ScoreInputs, score_candidate
 
@@ -116,6 +118,38 @@ def test_earnings_in_window_warns_about_iv_crush() -> None:
     iv = next(f for f in flags if f.code == "earnings_iv_crush")
     assert iv.severity == "warn"
     assert not critical_flags(flags)
+
+
+def test_earnings_8k_item_202_fires_iv_crush_without_calendar() -> None:
+    # An 8-K item 2.02 IS the earnings release; the labeller stamps "(earnings)"
+    # so the IV-crush flag fires with no separate earnings-calendar feed.
+    ctx = _context(
+        [
+            _evidence(
+                "e1", "sec_8k",
+                "SEC 8-K filing; items: 2.02 Results of Operations (earnings) "
+                "[signals: earnings].",
+                age_days=1,
+            ),
+            _evidence("e2", "press_release", "Other news.", age_days=1),
+        ]
+    )
+    flags = detect_red_flags(ctx, _scores(), now=NOW)
+    assert "earnings_iv_crush" in _codes(flags)
+
+
+def test_bearish_and_nondirectional_flag_partition() -> None:
+    ctx = _context(
+        [
+            _evidence("e1", "sec_s3", "Filed an S-3 shelf registration.", age_days=3),
+            _evidence("e2", "sec_form4", "Officer sold 50,000 shares.", age_days=5),
+        ]
+    )
+    flags = detect_red_flags(ctx, _scores(), now=NOW)
+    bearish = {f.code for f in bearish_critical_flags(flags)}
+    assert bearish == {"dilution_overhang", "insider_selling"}
+    # Both criticals are directional, so nothing hard-blocks regardless.
+    assert nondirectional_critical_flags(flags) == []
 
 
 def test_thin_single_item_evidence_warns() -> None:

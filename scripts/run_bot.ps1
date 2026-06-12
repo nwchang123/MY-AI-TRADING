@@ -1,4 +1,4 @@
-# Launched by the Startup-folder TradingAgent-Bot.vbs at logon, and revived
+﻿# Launched by the Startup-folder TradingAgent-Bot.vbs at logon, and revived
 # by run_paper_loop.ps1 every trading evening. Keeps the Telegram control bot
 # alive: if the listener crashes, it restarts after 10s. A single-instance
 # guard makes multiple launchers safe (duplicate getUpdates consumers would

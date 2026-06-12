@@ -326,6 +326,71 @@ def test_critical_red_flag_short_circuits_without_llm_calls() -> None:
     assert any(f.code == "dilution_overhang" for f in out.red_flags)
 
 
+_PUT_PROPOSAL = dict(
+    _PROPOSAL,
+    option_code="US.EXAMPLE260626P00005000",
+    option_side="put",
+    thesis="Fresh dilution shelf caps upside; long put on the overhang.",
+)
+
+
+def _put_candidates() -> list[OptionCandidate]:
+    return [
+        OptionCandidate(
+            option_code="US.EXAMPLE260626P00005000",
+            option_side="put",
+            strike=5.0,
+            expiry=date(2026, 6, 26),
+            bid=0.19,
+            ask=0.21,
+            open_interest=200,
+            daily_volume=30,
+            iv=0.5,
+            dte=24,
+            estimated_contract_cost_usd=22.0,
+        )
+    ]
+
+
+def test_bearish_flag_runs_puts_only_and_accepts_a_put() -> None:
+    # A fresh dilution shelf no longer kills the name: with a put on the chain
+    # the committee runs and a long-put thesis flows through.
+    client = MockLLMClient(
+        ["catalyst", "options", "fine", "fine", json.dumps(_PUT_PROPOSAL)]
+    )
+    out = Committee(client).run(
+        _dilution_context(), _scores(), candidates=_put_candidates()
+    )
+    assert out.decision == "open_position"
+    assert out.proposal is not None and out.proposal.option_side == "put"
+    assert out.llm_calls == 5  # committee actually ran, not free-rejected
+    assert "DIRECTIONAL CONSTRAINT" in client.calls[1]["user"]  # options analyst saw it
+
+
+def test_bearish_flag_blocks_a_call_even_with_put_candidates() -> None:
+    # Both sides on the chain, but a bearish critical filters the list to puts;
+    # a call proposal cannot get through.
+    client = MockLLMClient(
+        ["catalyst", "options", "fine", "fine", json.dumps(_PROPOSAL)]
+    )
+    out = Committee(client).run(
+        _dilution_context(), _scores(), candidates=_put_candidates() + _candidates()
+    )
+    assert out.decision == "reject"
+    assert out.proposal is None
+
+
+def test_bearish_flag_with_no_put_candidate_hard_blocks_without_llm() -> None:
+    # Only a call is tradeable: nothing to express the downside -> zero-API block.
+    client = MockLLMClient(
+        ["catalyst", "options", "fine", "fine", json.dumps(_PROPOSAL)]
+    )
+    out = Committee(client).run(_dilution_context(), _scores(), candidates=_candidates())
+    assert out.decision == "reject"
+    assert out.llm_calls == 0
+    assert client.calls == []
+
+
 def test_warn_red_flags_do_not_block_open() -> None:
     # The single-item _context() yields only a thin_evidence warning.
     out = _run(

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class OptionCandidate(BaseModel):
@@ -28,6 +28,12 @@ class OptionCandidate(BaseModel):
     # Deterministic Monte Carlo baseline POP at the standard +100/-50 exit
     # grid (no-edge GBM). None when the underlying spot or IV was unavailable.
     mc_pop: float | None = Field(default=None, ge=0, le=1)
+    # Black-Scholes delta (signed: puts are negative). How much the option
+    # actually tracks the underlying. None when spot/IV were unavailable.
+    delta: float | None = Field(default=None, ge=-1, le=1)
+    # Signed % move in the underlying needed to break even at expiry (positive =
+    # up, negative = down). Surfaces how far OTM a contract is. None w/o spot.
+    breakeven_move_pct: float | None = Field(default=None)
 
 
 class ExitPlan(BaseModel):
@@ -52,7 +58,19 @@ class OpenPositionProposal(BaseModel):
     thesis: str = Field(min_length=1)
     evidence_ids: list[str] = Field(min_length=1)
     confidence: float = Field(ge=0, le=1)
-    expected_catalyst_window: str = Field(min_length=1)
+    expected_catalyst_window: str
+
+    @field_validator("expected_catalyst_window")
+    @classmethod
+    def validate_catalyst_window(cls, v: str) -> str:
+        parts = v.split("/")
+        if len(parts) != 2:
+            raise ValueError("expected_catalyst_window must be 'YYYY-MM-DD/YYYY-MM-DD'")
+        from datetime import datetime
+        for part in parts:
+            datetime.strptime(part, "%Y-%m-%d")
+        return v
+
     exit_plan: ExitPlan
     invalidation: list[str] = Field(min_length=1)
 

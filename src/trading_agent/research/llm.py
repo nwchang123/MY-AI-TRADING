@@ -11,7 +11,7 @@ class LLMError(RuntimeError):
     """Raised when the LLM provider rejects a request or returns no content."""
 
 
-class LlmUsage(BaseModel):
+class LLMUsage(BaseModel):
     """Running tally of LLM calls and token spend for one or more clients."""
 
     model_config = ConfigDict(extra="forbid")
@@ -30,10 +30,10 @@ class LlmUsage(BaseModel):
         self.completion_tokens += other.completion_tokens
 
 
-def usage_delta(before: LlmUsage, after: LlmUsage) -> LlmUsage:
+def usage_delta(before: LLMUsage, after: LLMUsage) -> LLMUsage:
     """Tokens/calls accrued between two usage snapshots (e.g. around one run)."""
 
-    return LlmUsage(
+    return LLMUsage(
         calls=after.calls - before.calls,
         prompt_tokens=after.prompt_tokens - before.prompt_tokens,
         completion_tokens=after.completion_tokens - before.completion_tokens,
@@ -76,7 +76,7 @@ class OpenAICompatibleClient:
         self.max_retries = max(0, max_retries)
         self.retry_base_delay = max(0.0, retry_base_delay)
         self.sleep_fn = sleep_fn or time.sleep
-        self.usage = LlmUsage()
+        self.usage = LLMUsage()
         self._client = self._build_client(api_key, base_url, timeout)
 
     @staticmethod
@@ -149,7 +149,7 @@ class MockLLMClient:
         self._queue = list(responses) if responses is not None else []
         self._handler = handler
         self.calls: list[dict[str, Any]] = []
-        self.usage = LlmUsage()
+        self.usage = LLMUsage()
 
     def complete(self, *, system: str, user: str, json_mode: bool = False) -> str:
         self.calls.append({"system": system, "user": user, "json_mode": json_mode})

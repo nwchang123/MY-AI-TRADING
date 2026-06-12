@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS candidate_snapshots (
     reasons TEXT NOT NULL,
     payload TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_snapshots_ticker ON candidate_snapshots(ticker);
+CREATE INDEX IF NOT EXISTS idx_snapshots_recorded ON candidate_snapshots(recorded_at);
 """
 
 

@@ -61,6 +61,13 @@ class PositionMonitor:
         reason: str | None = None
         if trading_days_until(position.expiry, now) <= self.force_close_days:
             reason = "forced close before expiry"
+        elif (
+            position.catalyst_window_end is not None
+            and market_date(now) > position.catalyst_window_end
+        ):
+            # The committee's catalyst window has elapsed without a take-profit:
+            # by its own reasoning the edge is gone, so stop paying theta to hold.
+            reason = "catalyst window elapsed"
         elif market_date(now) >= position.time_stop:
             reason = "time stop reached"
         elif not stale:

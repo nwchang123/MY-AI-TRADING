@@ -3,10 +3,31 @@ import math
 import pytest
 
 from trading_agent.domain.montecarlo import (
+    black_scholes_delta,
     black_scholes_price,
     stable_seed,
     win_probability,
 )
+
+
+def test_black_scholes_delta_atm_is_near_half() -> None:
+    call = black_scholes_delta(side="call", spot=10, strike=10, t_years=30 / 365, iv=0.6)
+    put = black_scholes_delta(side="put", spot=10, strike=10, t_years=30 / 365, iv=0.6)
+    assert 0.45 < call < 0.6  # slightly above 0.5 from drift
+    assert -0.55 < put < -0.4
+    # Put = call - 1 (delta parity).
+    assert math.isclose(call - put, 1.0, abs_tol=0.02)
+
+
+def test_black_scholes_delta_collapses_to_intrinsic_at_expiry() -> None:
+    assert black_scholes_delta(side="call", spot=12, strike=10, t_years=0, iv=0.6) == 1.0
+    assert black_scholes_delta(side="call", spot=8, strike=10, t_years=0, iv=0.6) == 0.0
+    assert black_scholes_delta(side="put", spot=8, strike=10, t_years=0, iv=0.6) == -1.0
+
+
+def test_black_scholes_delta_rejects_bad_side() -> None:
+    with pytest.raises(ValueError):
+        black_scholes_delta(side="straddle", spot=10, strike=10, t_years=0.1, iv=0.5)
 
 
 def test_black_scholes_atm_call_matches_reference() -> None:

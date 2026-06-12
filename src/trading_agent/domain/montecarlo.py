@@ -41,6 +41,29 @@ def black_scholes_price(
     return strike * math.exp(-rate * t_years) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
 
 
+def black_scholes_delta(
+    *, side: str, spot: float, strike: float, t_years: float, iv: float,
+    rate: float = 0.04,
+) -> float:
+    """Black-Scholes delta; at/after expiry collapses to the intrinsic 0/±1.
+
+    Shown to the committee as an honest measure of how much the option actually
+    tracks the underlying: a 0.10-delta lottery ticket needs a far bigger move
+    than a 0.50-delta near-the-money contract to reach the same +100%.
+    """
+
+    if side not in {"call", "put"}:
+        raise ValueError("side must be 'call' or 'put'")
+    if t_years <= 0 or iv <= 0 or spot <= 0 or strike <= 0:
+        if side == "call":
+            return 1.0 if spot > strike else 0.0
+        return -1.0 if spot < strike else 0.0
+    d1 = (math.log(spot / strike) + (rate + iv * iv / 2.0) * t_years) / (
+        iv * math.sqrt(t_years)
+    )
+    return _norm_cdf(d1) if side == "call" else _norm_cdf(d1) - 1.0
+
+
 def stable_seed(key: str) -> int:
     """Reproducible per-contract seed so audited numbers can be re-derived."""
 
