@@ -32,6 +32,7 @@ CREATE INDEX IF NOT EXISTS idx_positions_ticker ON positions(ticker);
 # non-destructive and cheap). Each entry is (name, column-type).
 _ADDED_COLUMNS: list[tuple[str, str]] = [
     ("catalyst_window_end", "TEXT"),
+    ("pre_earnings_exit_date", "TEXT"),
 ]
 
 
@@ -76,6 +77,7 @@ class PositionStore:
         stop_loss_pct: float,
         time_stop: date,
         catalyst_window_end: date | None = None,
+        pre_earnings_exit_date: date | None = None,
     ) -> None:
         opened_at = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
@@ -83,8 +85,9 @@ class PositionStore:
                 "INSERT OR REPLACE INTO positions "
                 "(option_code, ticker, option_side, entry_price, contracts, lot_size, "
                 "expiry, take_profit_pct, stop_loss_pct, time_stop, status, opened_at, "
-                "closed_at, close_reason, exit_price, catalyst_window_end) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, NULL, NULL, NULL, ?)",
+                "closed_at, close_reason, exit_price, catalyst_window_end, "
+                "pre_earnings_exit_date) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, NULL, NULL, NULL, ?, ?)",
                 (
                     option_code,
                     ticker,
@@ -98,6 +101,9 @@ class PositionStore:
                     time_stop.isoformat(),
                     opened_at,
                     catalyst_window_end.isoformat() if catalyst_window_end else None,
+                    pre_earnings_exit_date.isoformat()
+                    if pre_earnings_exit_date
+                    else None,
                 ),
             )
 

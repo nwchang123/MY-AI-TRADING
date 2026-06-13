@@ -62,6 +62,22 @@ class OptionsMandate(BaseModel):
     # sticky IV). Set LOW: it only rejects structurally hopeless tickets that
     # no plausible catalyst edge could rescue. 0 disables the check.
     min_monte_carlo_pop: float = Field(default=0.0, ge=0, le=1)
+    # --- Phase 1: pre-catalyst (earnings) IV-ramp selection ---
+    # When earnings_window_max_days > 0, the universe is picked by UPCOMING
+    # earnings proximity instead of realized volume spikes: only names whose next
+    # earnings date is in [min, max] calendar days out are eligible, so we buy
+    # BEFORE the IV ramp and exit before the print. 0 (default) keeps the legacy
+    # volume-ratio ranking, so existing behavior is unchanged until enabled.
+    earnings_window_min_days: int = Field(default=0, ge=0)
+    earnings_window_max_days: int = Field(default=0, ge=0)
+    # Exit this many TRADING days before the earnings date so a position never
+    # holds through the print (the event IV crush is exactly what the run-up play
+    # avoids). 0 (default) disables the pre-earnings exit.
+    pre_earnings_exit_trading_days: int = Field(default=0, ge=0)
+    # Skip contracts whose implied volatility (a FRACTION: 1.5 = 150%) already
+    # exceeds this -- a name that has already ramped is the peak-IV trap we are
+    # trying to avoid. 0 (default) disables the IV ceiling.
+    max_entry_iv: float = Field(default=0.0, ge=0)
 
 
 class PortfolioMandate(BaseModel):

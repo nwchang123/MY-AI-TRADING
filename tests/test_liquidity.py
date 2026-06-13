@@ -44,12 +44,12 @@ def test_rejects_wide_spread() -> None:
 
 
 def test_rejects_low_open_interest() -> None:
-    result = _validator().validate(_quote(open_interest=50), now=NOW)
+    result = _validator().validate(_quote(open_interest=5), now=NOW)
     assert "open interest is below minimum" in result.reasons
 
 
 def test_rejects_low_volume() -> None:
-    result = _validator().validate(_quote(daily_volume=5), now=NOW)
+    result = _validator().validate(_quote(daily_volume=0), now=NOW)
     assert "daily option volume is below minimum" in result.reasons
 
 
@@ -61,8 +61,14 @@ def test_rejects_dte_out_of_range() -> None:
 
 
 def test_rejects_premium_above_cost_cap() -> None:
-    result = _validator().validate(_quote(bid=0.69, ask=0.70), now=NOW)
-    assert "contract cost exceeds mandate" in result.reasons  # 0.70*100 + 1 = 71 > 65
+    validator = _validator()
+    # Derive an ask whose 1-contract cost (ask*100 + fee_buffer) just exceeds the
+    # configured cap, so this stays correct regardless of the mandate's capital.
+    cap = validator.options.max_contract_cost_usd
+    fee = validator.options.fee_buffer_usd
+    ask = round((cap - fee) / 100 + 0.10, 2)
+    result = validator.validate(_quote(bid=round(ask - 0.02, 2), ask=ask), now=NOW)
+    assert "contract cost exceeds mandate" in result.reasons
 
 
 def test_rejects_zero_bid() -> None:

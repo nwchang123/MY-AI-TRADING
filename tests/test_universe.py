@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from trading_agent.domain.risk import Mandate
@@ -19,7 +19,12 @@ NOW = datetime(2026, 6, 11, 15, 0, tzinfo=timezone.utc)
 
 
 def _mandate() -> Mandate:
-    return Mandate.load(Path("config/mandate.paper.yaml"))
+    # Pin the canonical $100 cost cap so the probe-eligibility fixtures (costs
+    # calibrated to the $65 cap) stay stable when the live paper mandate's
+    # capital/caps change (e.g. raised to a $500 base).
+    mandate = Mandate.load(Path("config/mandate.paper.yaml"))
+    options = mandate.options.model_copy(update={"max_contract_cost_usd": 65.0})
+    return mandate.model_copy(update={"options": options})
 
 
 def _universe():
@@ -301,7 +306,7 @@ def test_probe_no_contract_when_chain_exists_but_nothing_tradeable() -> None:
         chain=[
             # Cost 0.70 * 100 + fee buffer = $71 > the $65 mandate cap.
             _contract("US.X1", bid=0.68, ask=0.70),
-            # Open interest below the 100 floor.
+            # Open interest below the mandate floor.
             _contract("US.X2", bid=0.19, ask=0.21, oi=5),
         ],
     )
@@ -395,6 +400,84 @@ def test_probe_limit_charges_only_real_fetches_not_cache_hits(tmp_path) -> None:
     assert picked == ["CCC"]
     assert fetcher.calls == 1
     assert probe.cache_hits == 2
+
+
+# --- pre-catalyst (earnings IV-ramp) selection ---------------------------
+
+
+def test_select_universe_earnings_mode_ranks_farther_earnings_first() -> None:
+    market = FakeScanMarket(
+        [
+            _row("US.AAA", 5e7, volume_ratio=9.0),  # would top the legacy ranking
+            _row("US.BBB", 4e7, volume_ratio=1.0),
+            _row("US.CCC", 3e7, volume_ratio=8.0),  # no upcoming earnings
+        ]
+    )
+    provider = FakeProvider(optionable={"AAA", "BBB", "CCC"})
+    earnings = {"AAA": date(2026, 6, 23), "BBB": date(2026, 7, 1)}
+
+    picked = select_universe(
+        market=market,
+        provider=provider,
+        universe=_universe(),
+        max_tickers=5,
+        earnings_of=lambda tickers: earnings,
+    )
+
+    # CCC has no upcoming earnings -> excluded, never probed. BBB's earnings are
+    # farther out (lower current IV) so it ranks ahead of AAA despite AAA's far
+    # higher volume ratio: the volume-spike bias is gone in earnings mode.
+    assert picked == ["BBB", "AAA"]
+    assert "CCC" not in provider.probed
+
+
+def test_select_universe_earnings_mode_empty_without_upcoming_earnings() -> None:
+    market = FakeScanMarket([_row("US.AAA", 5e7, volume_ratio=9.0)])
+    provider = FakeProvider(optionable={"AAA"})
+
+    picked = select_universe(
+        market=market,
+        provider=provider,
+        universe=_universe(),
+        max_tickers=5,
+        earnings_of=lambda tickers: {},
+    )
+
+    assert picked == []
+    assert provider.probed == []
+
+
+def _probe_iv(provider, max_entry_iv: float) -> EligibleContractProbe:
+    mandate = _mandate()
+    return EligibleContractProbe(
+        provider=provider,
+        options=mandate.options,
+        execution=mandate.execution,
+        now_fn=lambda: NOW,
+        max_entry_iv=max_entry_iv,
+    )
+
+
+def test_probe_iv_ceiling_rejects_high_iv_contracts() -> None:
+    high = {**_contract("US.HI", bid=0.19, ask=0.21), "iv": 2.0}  # 200% > ceiling
+    low = {**_contract("US.LO", bid=0.19, ask=0.21), "iv": 1.0}  # 100% <= ceiling
+    # Only a high-IV contract: nothing tradeable under the ceiling (peak-IV trap).
+    assert (
+        _probe_iv(FakeChainProvider(optionable=True, chain=[high]), 1.5).status("X")
+        == PROBE_NO_CONTRACT
+    )
+    # A low-IV contract clears the ceiling -> eligible.
+    assert (
+        _probe_iv(
+            FakeChainProvider(optionable=True, chain=[high, low]), 1.5
+        ).status("X")
+        == PROBE_ELIGIBLE
+    )
+    # Ceiling disabled (0) -> the high-IV contract is eligible again (legacy).
+    assert (
+        _probe_iv(FakeChainProvider(optionable=True, chain=[high]), 0.0).status("X")
+        == PROBE_ELIGIBLE
+    )
 
 
 def test_select_universe_excluded_industries_are_never_probed() -> None:

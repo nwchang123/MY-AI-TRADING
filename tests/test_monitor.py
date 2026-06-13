@@ -84,6 +84,34 @@ def test_forced_close_takes_priority_over_catalyst_window() -> None:
     assert signals[0].reason == "forced close before expiry"
 
 
+def test_pre_earnings_exit_fires_even_on_stale_quote() -> None:
+    # The pre-earnings exit date has arrived: get out before the print, even on a
+    # stale quote (missing it means holding through the event IV crush).
+    pos = _position(
+        pre_earnings_exit_date=date(2026, 6, 2),  # == market date of NOW
+        observed_at=datetime(2026, 5, 1, tzinfo=timezone.utc),  # very stale
+    )
+    signals = _monitor().evaluate([pos], NOW)
+    assert len(signals) == 1
+    assert signals[0].reason == "pre-earnings exit"
+
+
+def test_pre_earnings_exit_not_yet_due_does_not_exit() -> None:
+    pos = _position(pre_earnings_exit_date=date(2026, 6, 20))  # still ahead of NOW
+    assert _monitor().evaluate([pos], NOW) == []
+
+
+def test_forced_close_takes_priority_over_pre_earnings_exit() -> None:
+    # Expiry is imminent AND the pre-earnings exit is due: forced close wins.
+    pos = _position(
+        expiry=date(2026, 6, 3),
+        time_stop=date(2026, 6, 3),
+        pre_earnings_exit_date=date(2026, 6, 1),
+    )
+    signals = _monitor().evaluate([pos], NOW)
+    assert signals[0].reason == "forced close before expiry"
+
+
 def test_take_profit_fires() -> None:
     signals = _monitor().evaluate([_position(bid=0.40, ask=0.42)], NOW)
     assert len(signals) == 1

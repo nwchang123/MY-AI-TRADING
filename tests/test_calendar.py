@@ -6,10 +6,24 @@ from trading_agent.domain.calendar import (
     market_close_time,
     market_date,
     minutes_since_open,
+    subtract_trading_days,
     trading_days_until,
     us_early_close_dates,
     us_market_holidays,
 )
+
+
+def test_subtract_trading_days_skips_weekend() -> None:
+    # 2 trading days before Tue 2026-06-16 is Fri 2026-06-12 (skips the weekend).
+    assert subtract_trading_days(date(2026, 6, 16), 2) == date(2026, 6, 12)
+    # n<=0 is a no-op.
+    assert subtract_trading_days(date(2026, 6, 16), 0) == date(2026, 6, 16)
+
+
+def test_subtract_trading_days_skips_holiday() -> None:
+    # 1 trading day before Mon 2026-07-06 skips the weekend AND Fri 2026-07-03
+    # (observed Independence Day holiday) to Thu 2026-07-02.
+    assert subtract_trading_days(date(2026, 7, 6), 1) == date(2026, 7, 2)
 
 
 def test_minutes_since_open_inside_session() -> None:

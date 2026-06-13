@@ -89,6 +89,20 @@ def test_open_position_flows_through() -> None:
     assert out.vetoes == []
 
 
+def test_pre_earnings_strategy_note_briefed_when_active() -> None:
+    client = MockLLMClient(["c", "o", "s", "r", json.dumps(_PROPOSAL)])
+    Committee(client, pre_earnings_exit_trading_days=2).run(_context(), _scores())
+    briefing = client.calls[0]["user"]  # the catalyst analyst's briefing
+    assert "PRE-EARNINGS IV-RAMP" in briefing
+    assert "do NOT veto on event/earnings IV-crush" in briefing
+
+
+def test_no_pre_earnings_note_when_disabled() -> None:
+    client = MockLLMClient(["c", "o", "s", "r", json.dumps(_PROPOSAL)])
+    Committee(client).run(_context(), _scores())  # default: strategy off
+    assert "PRE-EARNINGS IV-RAMP" not in client.calls[0]["user"]
+
+
 def test_skeptic_veto_blocks_open() -> None:
     out = _run(
         ["catalyst", "options", "VETO: dilution shelf detected", "ok", json.dumps(_PROPOSAL)]

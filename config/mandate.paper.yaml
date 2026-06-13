@@ -1,9 +1,16 @@
 ﻿account:
-  initial_capital_usd: 100
+  initial_capital_usd: 500
   live_mode_requires_operator_flag: true
   withdrawal_capability: forbidden
-  # Paper compounds: dollar caps scale with realized equity (win $100 -> trade
-  # like a $200 account; lose -> de-risk). Drawdown is measured from the peak.
+  # Paper compounds: dollar caps scale with realized equity relative to this $500
+  # base (grow to $1000 -> trade like a $1000 account; lose -> de-risk). Drawdown
+  # is measured from the peak. Base raised 100 -> 500 on 2026-06-12: at a $100
+  # base the $65 cost cap only reached deep-OTM illiquid strikes (empty universe,
+  # all-zero cycles); $500 lifts the cap to $325 (ask <= ~$3.24), reaching the
+  # near-the-money liquid contracts this strategy is designed for. Validate paper
+  # at the SAME capital you intend to deploy live -- the cost cap (and thus strike
+  # selection, liquidity, and win rate) scales with capital, so a track record at
+  # one size does not transfer to another.
   compounding: true
 
 universe:
@@ -26,16 +33,21 @@ options:
   min_dte: 14
   max_dte: 45
   min_option_bid_usd: 0.05
-  # AI gets free rein over the full $100: a single contract may cost up to ~2/3
-  # of the account, which reaches near-the-money strikes (higher delta -> higher
-  # win probability) instead of forcing deep-OTM lottery tickets. The OLD $25
-  # cap (ask <= ~$0.24) was the binding constraint that both starved candidate
-  # flow AND pinned the strategy to the lowest-win-rate options. Compounding
-  # scales this with realized equity, so wins widen the reachable strikes.
-  max_contract_cost_usd: 65
-  max_bid_ask_spread_pct: 15
-  min_open_interest: 100
-  min_daily_volume: 10
+  # Single-contract cost cap = 65% of the $500 base = $325 (ask <= ~$3.24), which
+  # reaches near-the-money strikes (higher delta -> higher win probability)
+  # instead of deep-OTM lottery tickets. At the old $100 base this was $65
+  # (ask <= ~$0.64) -- the binding constraint that starved candidate flow AND
+  # pinned the strategy to the lowest-win-rate options. Compounding scales this
+  # with realized equity, so wins widen the reachable strikes.
+  max_contract_cost_usd: 325
+  # Loosened 2026-06-12 for the small-cap universe (large-cap-grade gates of
+  # spread<=15% / OI>=100 / vol>=10 produced an empty universe). At the $500 base
+  # the $325 cost cap CAN reach liquid near-the-money contracts, so these may be
+  # re-tightened once the $325-cap universe is confirmed healthy under stricter
+  # gates; kept permissive for now so candidate flow is never starved.
+  max_bid_ask_spread_pct: 40
+  min_open_interest: 10
+  min_daily_volume: 1
   use_limit_orders_only: true
   reject_auto_exercise: true
   force_close_before_expiry_trading_days: 2
@@ -50,17 +62,27 @@ options:
   # alongside the win floor; still well below the AI bar (math sets the floor,
   # the AIs claim the edge above it).
   min_monte_carlo_pop: 0.3
+  # --- Phase 1: pre-catalyst (earnings) IV-ramp selection ---
+  # DISABLED for now (all 0 = legacy volume-ratio selection unchanged). To
+  # ACTIVATE: set the window to 10/25, pre_earnings exit to 2, AND add a Finnhub
+  # key (TRADING_AGENT_FINNHUB_API_KEY) to .env -- without the key the bulk
+  # earnings calendar falls back to a thin yfinance per-ticker shortlist and the
+  # universe will be sparse. Recommended enable values shown in comments.
+  earnings_window_min_days: 0   # enable: 10  (nearest earnings to target)
+  earnings_window_max_days: 0   # enable: 25  (0 keeps volume-ratio selection)
+  pre_earnings_exit_trading_days: 0   # enable: 2  (close 2 trading days before the print)
+  max_entry_iv: 0   # leave 0 at first; tune down from observed earnings-window IVs
 
 portfolio:
-  # Stops re-calibrated for the wider $65 cost cap: positions are now a much
-  # larger share of the $100 account, so the old $10/$25 dollar stops would
-  # halt on a single normal option swing. These are ~full-deployment with a
-  # "lose a third of the day / half the account -> stop and review" backstop.
+  # Dollar stops sized to the $500 base, same ratios as the old $100 mandate
+  # (~full deployment with a "lose a third of the day / half the account -> stop
+  # and review" backstop): premium-at-risk = 100% of base, daily loss = 35%,
+  # hard drawdown = 50%. Compounding scales all three with realized equity.
   max_open_positions: 2
-  max_total_premium_at_risk_usd: 100
+  max_total_premium_at_risk_usd: 500
   max_new_positions_per_day: 2
-  daily_loss_stop_usd: 35
-  hard_drawdown_stop_usd: 50
+  daily_loss_stop_usd: 175
+  hard_drawdown_stop_usd: 250
   consecutive_loss_stop: 3
   cooldown_after_consecutive_losses_hours: 24
   # No new entries when the VIX is above this (panic regime guard); exits still run.
@@ -78,7 +100,12 @@ execution:
   kill_switch_file: runtime/HALT
   # No new entries in the first N minutes after the open (widest spreads).
   no_entry_minutes_after_open: 15
-  # Hard daily LLM token budget; committee skipped once exceeded. ~10-15k
-  # tokens per committee pass, so this allows ~20-30 passes/day.
-  max_daily_llm_tokens: 300000
+  # Hard daily LLM token budget; committee skipped once exceeded. Measured
+  # 2026-06-12: a committee pass (5 roles, full evidence + 8-K bodies + candidate
+  # list) costs ~33k tokens (prompt ~30-36k + completion ~2.5-3k), NOT the
+  # 10-15k once assumed -- so 300k only bought ~9 passes/day and a 25-name
+  # universe exhausted it in 1-2 cycles, blocking the committee the rest of the
+  # day. Raised to 1,000,000 (~30 passes/day) so the committee can work the full
+  # session. DeepSeek pricing makes this only cents/day.
+  max_daily_llm_tokens: 1000000
 

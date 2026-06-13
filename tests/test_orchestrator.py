@@ -150,7 +150,21 @@ class FakeSec:
 
 
 def _mandate() -> Mandate:
-    return Mandate.load(Path("config/mandate.paper.yaml"))
+    # Pin the canonical $100 risk profile so the compounding/cap assertions stay
+    # stable when the live paper mandate's capital/caps change (e.g. $500 base).
+    mandate = Mandate.load(Path("config/mandate.paper.yaml"))
+    account = mandate.account.model_copy(update={"initial_capital_usd": 100.0})
+    options = mandate.options.model_copy(update={"max_contract_cost_usd": 65.0})
+    portfolio = mandate.portfolio.model_copy(
+        update={
+            "max_total_premium_at_risk_usd": 100.0,
+            "daily_loss_stop_usd": 35.0,
+            "hard_drawdown_stop_usd": 50.0,
+        }
+    )
+    return mandate.model_copy(
+        update={"account": account, "options": options, "portfolio": portfolio}
+    )
 
 
 def _committee(responses: list[str]) -> Committee:
@@ -166,8 +180,10 @@ def _cycle(
     store: PositionStore | None = None,
     trd_env: str = "SIMULATE",
     max_open_positions_override: int | None = None,
+    mandate: "Mandate | None" = None,
+    earnings_calendar=None,
 ) -> PaperTradingCycle:
-    mandate = _mandate()
+    mandate = mandate or _mandate()
     return PaperTradingCycle(
         mandate=mandate,
         account_id=123,
@@ -184,6 +200,7 @@ def _cycle(
         max_open_positions_override=max_open_positions_override,
         order_poll_interval_seconds=0.1,
         sleep_fn=lambda _seconds: None,
+        earnings_calendar=earnings_calendar,
     )
 
 
@@ -204,6 +221,65 @@ def _seed_open(store: PositionStore, code: str = OPTION_CODE) -> None:
 
 def _open_responses() -> list[str]:
     return ["catalyst", "options", "fine", "fine", json.dumps(_PROPOSAL)]
+
+
+class _FixedEarningsCalendar:
+    def __init__(self, day: date):
+        self.day = day
+
+    def next_earnings_date(self, ticker: str):
+        return self.day
+
+
+def test_eligible_candidates_drops_contracts_expiring_before_earnings(
+    tmp_path: Path,
+) -> None:
+    # Pre-earnings (IV-ramp) play: a contract must OUTLIVE the print to carry its
+    # event vega, so the one expiring before the earnings date is dropped while
+    # the one expiring after it survives.
+    from trading_agent.execution.orchestrator import CycleResult
+
+    base = _mandate()
+    opts = base.options.model_copy(update={"pre_earnings_exit_trading_days": 2})
+    mandate = base.model_copy(update={"options": opts})
+
+    before = "US.EXAMPLE260622C00005000"  # expires 06-22, BEFORE earnings 06-26
+    after = "US.EXAMPLE260710C00005000"  # expires 07-10, AFTER earnings
+    cycle = _cycle(
+        tmp_path,
+        broker=FakeBroker(),
+        market=FakeMarket(chain_codes=[before, after]),
+        committee=_committee([]),
+        mandate=mandate,
+        earnings_calendar=_FixedEarningsCalendar(date(2026, 6, 26)),
+    )
+    codes = {
+        c.option_code
+        for c in cycle._eligible_candidates(NOW, "EXAMPLE", CycleResult())
+    }
+    assert before not in codes
+    assert after in codes
+
+
+def test_eligible_candidates_keeps_all_when_pre_earnings_disabled(
+    tmp_path: Path,
+) -> None:
+    # Strategy off (default mandate) -> the earnings-DTE filter is inert.
+    from trading_agent.execution.orchestrator import CycleResult
+
+    before = "US.EXAMPLE260622C00005000"
+    after = "US.EXAMPLE260710C00005000"
+    cycle = _cycle(
+        tmp_path,
+        broker=FakeBroker(),
+        market=FakeMarket(chain_codes=[before, after]),
+        committee=_committee([]),
+    )
+    codes = {
+        c.option_code
+        for c in cycle._eligible_candidates(NOW, "EXAMPLE", CycleResult())
+    }
+    assert codes == {before, after}
 
 
 def test_halt_aborts_before_any_broker_call(tmp_path: Path) -> None:

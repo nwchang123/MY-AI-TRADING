@@ -153,6 +153,24 @@ def minutes_since_open(now: datetime) -> float | None:
     return (eastern - open_moment).total_seconds() / 60.0
 
 
+def subtract_trading_days(day: date, n: int) -> date:
+    """The date ``n`` TRADING days before ``day`` (weekends/holidays skipped).
+
+    Used to schedule a pre-earnings exit ``n`` trading days ahead of the print so
+    a position never holds through the report. ``n <= 0`` returns ``day``.
+    """
+
+    if n <= 0:
+        return day
+    cursor = day
+    remaining = n
+    while remaining > 0:
+        cursor -= timedelta(days=1)
+        if is_trading_day(cursor):
+            remaining -= 1
+    return cursor
+
+
 def trading_days_until(expiry: date, now: date | datetime) -> int:
     """Trading days from the day after ``now`` through ``expiry`` inclusive.
 

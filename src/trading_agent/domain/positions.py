@@ -28,6 +28,10 @@ class MonitoredPosition(BaseModel):
     # so the position exits rather than bleeding theta to the time stop. None
     # keeps the legacy behavior (time stop only).
     catalyst_window_end: date | None = None
+    # Pre-earnings (IV-ramp) play: exit on/after this date so the position is out
+    # BEFORE the print and never eats the event IV crush. Set to
+    # earnings_date - pre_earnings_exit_trading_days. None keeps legacy behavior.
+    pre_earnings_exit_date: date | None = None
     bid: float = Field(ge=0)
     ask: float = Field(ge=0)
     observed_at: datetime

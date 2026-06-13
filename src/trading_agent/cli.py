@@ -15,6 +15,7 @@ from trading_agent.brokers.moomoo import (
     assert_opend_reachable,
 )
 from trading_agent.data.earnings import YahooEarningsCalendar
+from trading_agent.data.earnings_calendar import build_earnings_calendar
 from trading_agent.data.moomoo_market import MoomooMarket
 from trading_agent.data.news_feeds import GoogleNewsClient
 from trading_agent.data.price_history import YahooPriceHistory
@@ -169,6 +170,9 @@ def _build_committee(settings: Settings) -> Committee:
         _llm_client(settings, settings.llm_model_pro),
         adversary_client=_adversary_client(settings),
         min_win_probability=mandate.options.min_estimated_win_probability,
+        account_capital_usd=mandate.account.initial_capital_usd,
+        max_contract_cost_usd=mandate.options.max_contract_cost_usd,
+        pre_earnings_exit_trading_days=mandate.options.pre_earnings_exit_trading_days,
     )
 
 
@@ -332,6 +336,7 @@ def _build_cycle(
         moomoo_market=_market(settings),
         earnings_client=YahooEarningsCalendar(),
         price_history=YahooPriceHistory(),
+        earnings_calendar=build_earnings_calendar(settings.finnhub_api_key),
     )
 
 
@@ -396,13 +401,15 @@ def _auto_universe(settings: Settings, max_tickers: int) -> list[str]:
     """
 
     mandate = Mandate.load(settings.mandate_path)
+    opt = mandate.options
     market = _market(settings)
     provider = _option_provider(settings)
     probe = CachedProbe(
         EligibleContractProbe(
             provider=provider,
-            options=mandate.options,
+            options=opt,
             execution=mandate.execution,
+            max_entry_iv=opt.max_entry_iv,
         ),
         ProbeCache(settings.root_dir / "runtime" / "probe_cache.json"),
     )
@@ -422,6 +429,29 @@ def _auto_universe(settings: Settings, max_tickers: int) -> list[str]:
         plates = market.industry_plates([f"US.{t}" for t in tickers])
         return {code.removeprefix("US."): name for code, name in plates.items()}
 
+    # Pre-catalyst (earnings IV-ramp) mode: only active when the mandate opens
+    # the window. The bulk calendar intersects the scan with names reporting in
+    # [today+min, today+max] days; select_universe then ranks farther-earnings
+    # (lower IV) first. earnings_of=None keeps the legacy volume-ratio ranking.
+    earnings_of: Callable[[list[str]], dict[str, date]] | None = None
+    earnings_window: dict[str, str] | None = None
+    if opt.earnings_window_max_days > 0:
+        calendar = build_earnings_calendar(settings.finnhub_api_key)
+        today = datetime.now(timezone.utc).date()
+        win_start = today + timedelta(days=opt.earnings_window_min_days)
+        win_end = today + timedelta(days=opt.earnings_window_max_days)
+        earnings_window = {"start": win_start.isoformat(), "end": win_end.isoformat()}
+
+        def earnings_of(tickers: list[str]) -> dict[str, date]:
+            try:
+                return calendar.upcoming(tickers, win_start, win_end)
+            except Exception as exc:  # noqa: BLE001 - calendar never blocks a cycle
+                print(
+                    f"auto universe: earnings calendar unavailable ({exc})",
+                    file=sys.stderr,
+                )
+                return {}
+
     tickers = select_universe(
         market=market,
         provider=provider,
@@ -431,6 +461,7 @@ def _auto_universe(settings: Settings, max_tickers: int) -> list[str]:
         skip_tickers=skip,
         priority_tickers=priority,
         industry_of=industry_of,
+        earnings_of=earnings_of,
     )
     _audit_writer(settings).append(
         "universe_selected",
@@ -441,6 +472,7 @@ def _auto_universe(settings: Settings, max_tickers: int) -> list[str]:
             "event_seeds": sorted(priority & set(tickers)),
             "probe_fetches": probe.fetch_count,
             "probe_cache_hits": probe.cache_hits,
+            "earnings_window": earnings_window,
         },
     )
     print(f"auto universe: {', '.join(tickers) or '(none)'}", file=sys.stderr)

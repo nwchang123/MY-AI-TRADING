@@ -8,7 +8,22 @@ NOW = datetime(2026, 6, 2, 15, 0, tzinfo=timezone.utc)
 
 
 def _mandate() -> Mandate:
-    return Mandate.load(Path("config/mandate.paper.yaml"))
+    # Pin the canonical $100 risk profile so the gate's dollar-limit assertions
+    # (cost cap, drawdown stop, etc.) stay stable when the live paper mandate's
+    # capital/caps change (e.g. raised to a $500 base).
+    mandate = Mandate.load(Path("config/mandate.paper.yaml"))
+    account = mandate.account.model_copy(update={"initial_capital_usd": 100.0})
+    options = mandate.options.model_copy(update={"max_contract_cost_usd": 65.0})
+    portfolio = mandate.portfolio.model_copy(
+        update={
+            "max_total_premium_at_risk_usd": 100.0,
+            "daily_loss_stop_usd": 35.0,
+            "hard_drawdown_stop_usd": 50.0,
+        }
+    )
+    return mandate.model_copy(
+        update={"account": account, "options": options, "portfolio": portfolio}
+    )
 
 
 def _proposal() -> OpenPositionProposal:

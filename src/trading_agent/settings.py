@@ -39,6 +39,10 @@ class Settings:
     option_data_source: str = "cboe"
     tradier_token: str = ""
     tradier_base_url: str = "https://sandbox.tradier.com/v1"
+    # Finnhub free key for the bulk upcoming-earnings calendar (pre-catalyst
+    # selection). Blank -> the earnings calendar falls back to a yfinance
+    # per-ticker shortlist.
+    finnhub_api_key: str = ""
     # Operator alerts (optional): Telegram bot token + the operator's chat id.
     # Blank disables alerting; a notifier failure never blocks a cycle.
     telegram_bot_token: str = ""
@@ -91,6 +95,7 @@ class Settings:
             tradier_base_url=os.getenv(
                 "TRADING_AGENT_TRADIER_BASE_URL", "https://sandbox.tradier.com/v1"
             ).strip(),
+            finnhub_api_key=os.getenv("TRADING_AGENT_FINNHUB_API_KEY", "").strip(),
             telegram_bot_token=os.getenv(
                 "TRADING_AGENT_TELEGRAM_BOT_TOKEN", ""
             ).strip(),

@@ -120,8 +120,13 @@ def test_halt_and_resume_roundtrip(tmp_path: Path) -> None:
 
 
 def test_status_reports_equity_and_market(tmp_path: Path) -> None:
+    from trading_agent.domain.risk import Mandate
+
+    capital = Mandate.load(
+        ROOT / "config" / "mandate.paper.yaml"
+    ).account.initial_capital_usd
     reply = _bot(tmp_path).handle_text("/status")
-    assert "权益 $100.00" in reply  # fresh ledger -> initial capital
+    assert f"权益 ${capital:.2f}" in reply  # fresh ledger -> initial capital
     assert "市场" in reply
     assert "心跳：从未运行" in reply
 

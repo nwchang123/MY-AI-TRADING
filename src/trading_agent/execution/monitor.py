@@ -62,6 +62,14 @@ class PositionMonitor:
         if trading_days_until(position.expiry, now) <= self.force_close_days:
             reason = "forced close before expiry"
         elif (
+            position.pre_earnings_exit_date is not None
+            and market_date(now) >= position.pre_earnings_exit_date
+        ):
+            # Pre-earnings (IV-ramp) play: get out BEFORE the print. Fires even on
+            # a stale quote -- missing the exit means holding through the event
+            # IV crush, which is exactly what this strategy exists to avoid.
+            reason = "pre-earnings exit"
+        elif (
             position.catalyst_window_end is not None
             and market_date(now) > position.catalyst_window_end
         ):

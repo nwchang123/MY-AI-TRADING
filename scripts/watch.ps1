@@ -41,7 +41,11 @@ while ($true) {
     }
     $marketOpen = Get-MarketOpen
 
-    $today = $now.ToString("yyyy-MM-dd")
+    # audit recorded_at is UTC, and a U.S. session (13:30-20:00 UTC) sits inside
+    # one UTC date -- but spans two LOCAL dates here (MY = UTC+8, so the session
+    # crosses local midnight). Filtering by the LOCAL date silently hid the whole
+    # post-midnight half of the session. Use the UTC date to match recorded_at.
+    $today = [DateTime]::UtcNow.ToString("yyyy-MM-dd")
     $auditFile = Join-Path $root "runtime\audit.jsonl"
     $events = @()
     if (Test-Path $auditFile) {

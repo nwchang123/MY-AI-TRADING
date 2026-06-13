@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 
 from trading_agent.data.moomoo_market import US_OPTION_LOT_SIZE
@@ -69,11 +69,16 @@ class EligibleContractProbe:
         options: OptionsMandate,
         execution: ExecutionMandate,
         now_fn: Callable[[], datetime] | None = None,
+        max_entry_iv: float = 0.0,
     ):
         self.provider = provider
         self.options = options
         self.validator = LiquidityValidator(options, execution)
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        # Pre-catalyst (IV-ramp) play: a contract whose IV already exceeds this
+        # is the peak-IV trap we avoid, so it does not count as eligible. 0 (the
+        # default) disables the ceiling, keeping the plain liquidity behavior.
+        self.max_entry_iv = max_entry_iv
 
     def status(self, ticker: str) -> str:
         now = self._now_fn()
@@ -90,6 +95,13 @@ class EligibleContractProbe:
             ask = float(row.get("ask") or 0.0)
             if ask <= 0:
                 continue
+            if self.max_entry_iv > 0:
+                iv = float(row.get("iv") or 0.0)
+                # iv<=0 means the feed gave no IV; treat as unknown and keep it
+                # (the deterministic gates still apply). Only a KNOWN-high IV is
+                # the peak-IV trap we reject here.
+                if iv > self.max_entry_iv:
+                    continue
             quote = QuoteSnapshot(
                 option_code=row["code"],
                 bid=float(row.get("bid") or 0.0),
@@ -156,19 +168,26 @@ def select_universe(
     priority_tickers: Iterable[str] = (),
     industry_of: Callable[[list[str]], dict[str, str]] | None = None,
     max_per_industry: int = DEFAULT_MAX_PER_INDUSTRY,
+    earnings_of: Callable[[list[str]], dict[str, date]] | None = None,
 ) -> list[str]:
     """Autonomously pick today's candidate tickers.
 
     Screens U.S. small caps through the Moomoo stock filter (price, market cap,
-    turnover from the mandate), ranks by volume ratio descending (turnover as
-    tiebreak) with ``priority_tickers`` (fresh event filers) jumping the queue,
-    then keeps the first ``max_tickers`` names that pass ``probe`` (defaults to
-    a bare optionability check). ``skip_tickers`` (e.g. names with a fresh
-    cached committee rejection) never occupy a slot, no industry takes more
-    than ``max_per_industry`` slots, and industries in the mandate's
-    ``excluded_industries`` (SPAC shells by default) are never probed at all.
-    Returns bare ticker symbols (no ``US.`` prefix), ready for the trading
-    cycle.
+    turnover from the mandate), then keeps the first ``max_tickers`` names that
+    pass ``probe`` (defaults to a bare optionability check). ``skip_tickers``
+    (e.g. names with a fresh cached committee rejection) never occupy a slot, no
+    industry takes more than ``max_per_industry`` slots, and industries in the
+    mandate's ``excluded_industries`` (SPAC shells by default) are never probed
+    at all. Returns bare ticker symbols (no ``US.`` prefix).
+
+    Ranking has two modes:
+    - Default (``earnings_of`` is None): by VOLUME RATIO descending (turnover as
+      tiebreak), ``priority_tickers`` (fresh event filers) jumping the queue.
+    - Pre-catalyst IV-ramp (``earnings_of`` given): keep ONLY names whose next
+      earnings date is in the caller's window (``earnings_of`` returns just those,
+      mapped to the date), ranked by FARTHER earnings first -- lower current IV,
+      more room for the vol ramp -- with turnover as the liquidity tiebreak. This
+      buys before the IV ramp instead of chasing already-spiked, high-IV names.
 
     ``probe_limit`` charges only probes that actually hit the data feed: a
     probe exposing ``fetch_count`` (CachedProbe) gets its cache hits for free,
@@ -188,6 +207,7 @@ def select_universe(
 
     rows = market.scan_small_caps(universe)
     normalized: list[tuple[str, float, float]] = []
+    turnover_of: dict[str, float] = {}
     for row in rows:
         code = str(row.get("code") or "")
         ticker = code.removeprefix("US.").strip().upper()
@@ -202,24 +222,43 @@ def select_universe(
         # accumulation (elevated ratio, small but real move) still ranks.
         if volume_ratio > WASH_VOLUME_RATIO and abs(change_rate) < FLAT_CHANGE_PCT:
             continue
-        normalized.append(
-            (
-                ticker,
-                volume_ratio,
-                float(row.get("turnover") or 0.0),
-            )
-        )
-    normalized.sort(
-        key=lambda c: (c[0] in priority, c[1], c[2]), reverse=True
-    )
+        turnover = float(row.get("turnover") or 0.0)
+        normalized.append((ticker, volume_ratio, turnover))
+        turnover_of.setdefault(ticker, turnover)
 
-    ranked: list[str] = []
-    seen: set[str] = set()
-    for ticker, _, _ in normalized:
-        if ticker in seen or ticker in skip:
-            continue
-        seen.add(ticker)
-        ranked.append(ticker)
+    def _dedupe(tickers: Iterable[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for ticker in tickers:
+            if ticker in seen or ticker in skip:
+                continue
+            seen.add(ticker)
+            out.append(ticker)
+        return out
+
+    if earnings_of is None:
+        normalized.sort(key=lambda c: (c[0] in priority, c[1], c[2]), reverse=True)
+        ranked = _dedupe(t for t, _, _ in normalized)
+    else:
+        # Pre-catalyst mode: intersect the small-cap pool with the upcoming-
+        # earnings window, then rank farther-earnings-first (lower current IV).
+        pool = _dedupe(t for t, _, _ in normalized)
+        try:
+            earnings = {
+                str(t).strip().upper(): d
+                for t, d in (earnings_of(pool) or {}).items()
+            }
+        except Exception:  # noqa: BLE001 - calendar is best-effort, never blocks
+            earnings = {}
+        ranked = [t for t in pool if t in earnings]
+        ranked.sort(
+            key=lambda t: (
+                t in priority,
+                earnings[t].toordinal(),
+                turnover_of.get(t, 0.0),
+            ),
+            reverse=True,
+        )
 
     industries: dict[str, str] = {}
     if industry_of is not None and (max_per_industry > 0 or excluded_industries):

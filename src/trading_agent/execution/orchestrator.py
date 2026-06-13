@@ -6,7 +6,11 @@ from typing import Any, Callable
 
 from trading_agent.data.moomoo_market import US_OPTION_LOT_SIZE, parse_us_option_code
 from trading_agent.data.sec_edgar import SecEdgarClient
-from trading_agent.domain.calendar import market_date, minutes_since_open
+from trading_agent.domain.calendar import (
+    market_date,
+    minutes_since_open,
+    subtract_trading_days,
+)
 from trading_agent.domain.montecarlo import (
     MAX_USABLE_IV,
     black_scholes_delta,
@@ -97,6 +101,7 @@ class PaperTradingCycle:
         moomoo_market: Any | None = None,
         earnings_client: Any | None = None,
         price_history: Any | None = None,
+        earnings_calendar: Any | None = None,
     ):
         if trd_env not in {"SIMULATE", "REAL"}:
             raise ValueError("trd_env must be 'SIMULATE' or 'REAL'")
@@ -119,6 +124,12 @@ class PaperTradingCycle:
         self.moomoo_market = moomoo_market
         self.earnings_client = earnings_client
         self.price_history = price_history
+        # Unified upcoming-earnings source so the option DTE filter and the
+        # pre-earnings exit use the SAME calendar the universe scanner selected
+        # on (avoids a Finnhub-vs-yfinance date mismatch). Falls back to
+        # earnings_client.next_earnings_date when not supplied.
+        self.earnings_calendar = earnings_calendar
+        self._earnings_date_cache: dict[str, date | None] = {}
         # Refreshed at the start of every cycle: when the account compounds,
         # these carry the equity-scaled risk caps; otherwise they alias the
         # injected gate/liquidity unchanged.
@@ -348,6 +359,7 @@ class PaperTradingCycle:
                 continue
             ledger_by_code[code] = ledger
             window_end = ledger.get("catalyst_window_end")
+            pre_earnings = ledger.get("pre_earnings_exit_date")
             position = MonitoredPosition(
                 option_code=code,
                 option_side=ledger["option_side"],
@@ -359,6 +371,9 @@ class PaperTradingCycle:
                 stop_loss_pct=ledger["stop_loss_pct"],
                 time_stop=date.fromisoformat(ledger["time_stop"]),
                 catalyst_window_end=date.fromisoformat(window_end) if window_end else None,
+                pre_earnings_exit_date=(
+                    date.fromisoformat(pre_earnings) if pre_earnings else None
+                ),
                 bid=quote.bid,
                 ask=quote.ask,
                 observed_at=quote.observed_at,
@@ -490,6 +505,12 @@ class PaperTradingCycle:
         today = now.date()
         start = today + timedelta(days=self.mandate.options.min_dte)
         end = today + timedelta(days=self.mandate.options.max_dte)
+        # Pre-earnings (IV-ramp) play: the option must OUTLIVE the print to carry
+        # its event vega through the hold, so drop contracts expiring on/before
+        # the earnings date. Only when the strategy is active and the date known.
+        earnings_date = None
+        if self.active_mandate.options.pre_earnings_exit_trading_days > 0:
+            earnings_date = self._next_earnings_date(ticker)
         try:
             chain = self.market.option_chain(ticker, start, end, "ALL")
         except Exception as exc:  # noqa: BLE001
@@ -500,6 +521,8 @@ class PaperTradingCycle:
         for row in chain:
             ask = float(row.get("ask") or 0.0)
             if ask <= 0:
+                continue
+            if earnings_date is not None and row["expiry"] <= earnings_date:
                 continue
             quote = QuoteSnapshot(
                 option_code=row["code"],
@@ -673,6 +696,48 @@ class PaperTradingCycle:
         except Exception as exc:  # noqa: BLE001 - context never blocks an entry
             self._record_error(result, "price_context", ticker, exc)
             return None
+
+    def _next_earnings_date(self, ticker: str):
+        """Next earnings date for ``ticker`` from the unified calendar (cached).
+
+        Prefers ``earnings_calendar`` (the SAME source the universe scanner
+        selected on), falling back to ``earnings_client``. Best-effort: any
+        failure or unknown date yields None. Cached per cycle so the candidate
+        DTE filter and the pre-earnings exit share one lookup.
+        """
+
+        key = ticker.strip().upper()
+        if key in self._earnings_date_cache:
+            return self._earnings_date_cache[key]
+        result = None
+        for source in (self.earnings_calendar, self.earnings_client):
+            getter = getattr(source, "next_earnings_date", None) if source else None
+            if getter is None:
+                continue
+            try:
+                result = getter(ticker)
+            except Exception:  # noqa: BLE001 - absence is not an error
+                result = None
+            if result is not None:
+                break
+        self._earnings_date_cache[key] = result
+        return result
+
+    def _pre_earnings_exit_date(self, ticker: str) -> date | None:
+        """Exit date for the pre-earnings (IV-ramp) play, or None when disabled.
+
+        K trading days before the next earnings print so the position is out
+        BEFORE the report. None when the strategy is off or no date is known
+        (the position then falls back to its ordinary exits).
+        """
+
+        k = self.active_mandate.options.pre_earnings_exit_trading_days
+        if k <= 0:
+            return None
+        earnings_day = self._next_earnings_date(ticker)
+        if earnings_day is None:
+            return None
+        return subtract_trading_days(earnings_day, k)
 
     def _try_enter(
         self, now: datetime, ticker: str, held_codes: set[str], result: CycleResult
@@ -936,6 +1001,7 @@ class PaperTradingCycle:
             stop_loss_pct=proposal.exit_plan.stop_loss_pct,
             time_stop=proposal.exit_plan.time_stop,
             catalyst_window_end=_parse_window_end(proposal.expected_catalyst_window),
+            pre_earnings_exit_date=self._pre_earnings_exit_date(ticker),
         )
         self.audit.append(
             "order_filled",
