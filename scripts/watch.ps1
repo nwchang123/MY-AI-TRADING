@@ -1,4 +1,4 @@
-﻿# Live monitor: a human-readable dashboard refreshed every few seconds.
+# Live monitor: a human-readable dashboard refreshed every few seconds.
 # Reads heartbeat + the audit log and renders status / progress / recent
 # activity in plain Chinese. Read-only: closing this window stops nothing.
 param([switch]$Once)
@@ -86,6 +86,22 @@ while ($true) {
     if ($pnl -gt 0) { Write-Host $pnlStr -ForegroundColor Green }
     elseif ($pnl -lt 0) { Write-Host $pnlStr -ForegroundColor Red }
     else { Write-Host $pnlStr -ForegroundColor Gray }
+    # Win probability distribution
+    $allProbs = @()
+    foreach ($e in @($committee)) {
+        foreach ($note in @($e.payload.output.role_notes)) {
+            if ($note.note -match "WIN_PROB\s*[:：]\s*(\d+\.?\d*)") {
+                $allProbs += [double]$Matches[1]
+            }
+        }
+    }
+    if ($allProbs.Count -gt 0) {
+        $avgProb = ($allProbs | Measure-Object -Average).Average
+        $maxProb = ($allProbs | Measure-Object -Maximum).Maximum
+        $minProb = ($allProbs | Measure-Object -Minimum).Minimum
+        $above40 = @($allProbs | Where-Object { $_ -ge 0.40 }).Count
+        Write-Host ("   盈利率估计  : 均值 " + '{0:N2}' -f $avgProb + " | 范围 " + '{0:N2}' -f $minProb + "-" + '{0:N2}' -f $maxProb + " | >=0.40: " + $above40 + "/" + $allProbs.Count)
+    }
     Write-Host ""
     Write-Host "   --- 最近动态 ---" -ForegroundColor Yellow
     $recent = @($events | Where-Object { $_.event_type -in @("universe_selected","committee_run","committee_cache_hit","order_filled","position_closed","circuit_breaker_tripped","kill_switch_activated","cycle_crashed","entries_skipped") } | Select-Object -Last 8)
@@ -95,7 +111,23 @@ while ($true) {
         $p = $e.payload
         switch ($e.event_type) {
             "universe_selected"       { Write-Host ("   " + $t + "  选股 " + @($p.tickers).Count + " 只") }
-            "committee_run"           { Write-Host ("   " + $t + "  委员会[" + $p.ticker + "] " + $p.decision + " — " + (Summarize-Reason $p.output.rationale)) }
+            "committee_run"           {
+                $ticker = $p.ticker
+                $decision = $p.decision
+                $rationale = Summarize-Reason $p.output.rationale
+                # Extract win probability estimates from role_notes
+                $winProbs = @()
+                foreach ($note in @($p.output.role_notes)) {
+                    if ($note.note -match "WIN_PROB\s*[:：]\s*(\d+\.?\d*)") {
+                        $role = $note.role
+                        $val = $Matches[1]
+                        $winProbs += "$role=$val"
+                    }
+                }
+                $probStr = ""
+                if ($winProbs.Count -gt 0) { $probStr = " [" + ($winProbs -join " ") + "]" }
+                Write-Host ("   " + $t + "  委员会[" + $ticker + "] " + $decision + $probStr + " — " + $rationale)
+            }
             "committee_cache_hit"     { Write-Host ("   " + $t + "  委员会[" + $p.ticker + "] " + $p.decision + "（缓存复用）") -ForegroundColor DarkGray }
             "order_filled"            { Write-Host ("   " + $t + "  成交 " + $p.option_code + " @ " + $p.price) -ForegroundColor Green }
             "position_closed"         { Write-Host ("   " + $t + "  平仓 " + $p.option_code + " 盈亏 $" + $p.realized_pnl_usd) }
