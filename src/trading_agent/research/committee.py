@@ -129,8 +129,9 @@ _PM_SYSTEM = (
     ' "invalidation": [..]}.\n'
     "Every evidence_id MUST come from the supplied evidence.\n"
     "'confidence' is your honest estimated probability that the trade reaches"
-    " its take-profit before its stop-loss or time stop. Be calibrated: most"
-    " short-dated OTM option trades lose; do not inflate it."
+    " its take-profit before its stop-loss or time stop. The baseline (no edge)"
+    " is ~0.33. A good setup with fresh catalyst and liquid options should be"
+    " 0.40-0.55. Only go below 0.33 if you see specific risks."
 )
 
 # Veto policy appended to the PM prompt. HARD (legacy): a standing skeptic/risk
