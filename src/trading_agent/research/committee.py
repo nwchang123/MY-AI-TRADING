@@ -88,8 +88,9 @@ def _puts_only_block(flags: list[RedFlag]) -> str:
 _WIN_PROB_RULE = (
     "\nEnd your reply with a line 'WIN_PROB: 0.NN' -- your honest, independent"
     " estimate of the probability that the proposed trade reaches its take-profit"
-    " before its stop-loss or time stop. Be calibrated: most short-dated OTM"
-    " option trades lose, so estimates above 0.6 should be rare."
+    " before its stop-loss or time stop. Calibrate against the breakeven win rate"
+    " (~0.33 for TP+100%/SL-50%). Above 0.50 means you see genuine catalyst edge"
+    " beyond baseline; above 0.60 requires very strong, fresh evidence."
 )
 
 _SKEPTIC_SYSTEM = (
@@ -124,11 +125,26 @@ _PM_SYSTEM = (
     ' "expected_catalyst_window": "YYYY-MM-DD/YYYY-MM-DD", "exit_plan":'
     ' {"take_profit_pct", "stop_loss_pct", "time_stop": "YYYY-MM-DD"},'
     ' "invalidation": [..]}.\n'
-    "Every evidence_id MUST come from the supplied evidence. If a skeptic or"
-    " risk_manager veto stands, do not open a position.\n"
+    "Every evidence_id MUST come from the supplied evidence.\n"
     "'confidence' is your honest estimated probability that the trade reaches"
     " its take-profit before its stop-loss or time stop. Be calibrated: most"
     " short-dated OTM option trades lose; do not inflate it."
+)
+
+# Veto policy appended to the PM prompt. HARD (legacy): a standing skeptic/risk
+# veto is an absolute block. SOFT: the veto is a strong objection the PM may
+# override with high conviction; each standing veto then docks the binding
+# win-probability by ``veto_win_prob_penalty`` (see Committee), so an override
+# only survives the win-prob floor when the PM is clearly more confident.
+_PM_VETO_HARD = (
+    "\nIf a skeptic or risk_manager veto stands, do not open a position."
+)
+_PM_VETO_SOFT = (
+    "\nA skeptic or risk_manager VETO is a STRONG objection but NOT an automatic"
+    " block: you MAY still open if your independent conviction clearly overcomes"
+    " their reasons. Weigh each objection honestly -- every standing veto applies"
+    " a penalty to the binding win-probability, so override only when you are"
+    " markedly more confident, and set 'confidence' accordingly."
 )
 
 
@@ -204,6 +220,8 @@ class Committee:
         account_capital_usd: float = 100.0,
         max_contract_cost_usd: float = 0.0,
         pre_earnings_exit_trading_days: int = 0,
+        earnings_window_max_days: int = 0,
+        veto_win_prob_penalty: float = 0.0,
     ):
         self.client = client
         self.pro_client = pro_client or client
@@ -211,16 +229,29 @@ class Committee:
         # Floor for the LOWEST win-probability estimate across both model
         # lineages (skeptic, risk_manager, PM confidence). 0 disables.
         self.min_win_probability = min_win_probability
+        # 0 = legacy: a skeptic/risk VETO hard-blocks any open. >0 = soft veto:
+        # the veto no longer blocks here; it instead drops that role's own estimate
+        # from the binding min() and docks the binding win-probability by this much
+        # per standing veto, so the PM can override only with enough conviction to
+        # still clear ``min_win_probability``.
+        self.veto_win_prob_penalty = veto_win_prob_penalty
         # Real account size + per-contract cost cap, stated in the briefing so
         # roles judge cost against the ACTUAL mandate. The prompts once hardcoded
         # "USD 100", which made the skeptic veto mandate-eligible contracts (e.g.
         # a $246 contract under a $325 cap) as "over budget".
         self.account_capital_usd = account_capital_usd
         self.max_contract_cost_usd = max_contract_cost_usd
-        # >0 when the pre-earnings (IV-ramp) strategy is active: the briefing
-        # then states that the position exits this many trading days BEFORE the
-        # print, so the skeptic does not veto on event IV-crush it will never eat.
+        # >0 when the position auto-closes this many trading days BEFORE its own
+        # earnings (IV-crush guard). KEPT even when the IV-ramp ENTRY strategy is
+        # off, so the briefing reassures the skeptic the print is never held.
         self.pre_earnings_exit_trading_days = pre_earnings_exit_trading_days
+        # >0 ONLY when the IV-ramp ENTRY strategy is active (names selected by an
+        # upcoming earnings window). Distinguishes a real IV-ramp play from the
+        # volume-ratio strategy that merely keeps the pre-earnings EXIT guard --
+        # without this split the briefing falsely told the committee EVERY trade
+        # was a pre-earnings IV-ramp entry, so the skeptic vetoed all of them for
+        # not having an upcoming earnings date / a post-earnings expiry.
+        self.earnings_window_max_days = earnings_window_max_days
 
     def usage_total(self) -> LLMUsage:
         """Aggregate token/call usage across the distinct clients in use.
@@ -304,8 +335,12 @@ class Committee:
         )
         direction_block = _puts_only_block(bearish) if puts_only else ""
         options_system = _OPTIONS_SYSTEM_WITH_CHAIN if candidate_block else _OPTIONS_SYSTEM
+        veto_policy = (
+            _PM_VETO_SOFT if self.veto_win_prob_penalty > 0 else _PM_VETO_HARD
+        )
         pm_system = (
             _PM_SYSTEM
+            + veto_policy
             + (_PM_CANDIDATE_RULE if candidate_block else "")
             + (f"\n{direction_block}" if direction_block else "")
         )
@@ -381,8 +416,12 @@ class Committee:
             RoleNote(role="portfolio_manager", note=pm_raw.strip(), model=pro_model)
         )
 
-        # A standing veto blocks any open decision regardless of the PM's vote.
-        if vetoes:
+        # Legacy mode (penalty == 0): a standing veto is an absolute block,
+        # regardless of the PM's vote. Soft mode (penalty > 0): the veto is NOT
+        # fatal here -- it instead docks the binding win-probability in _finalize,
+        # so the PM can override it with high conviction while the win-prob floor
+        # still guards the trade.
+        if vetoes and self.veto_win_prob_penalty <= 0:
             return CommitteeOutput(
                 decision="reject",
                 rationale="Blocked by committee veto: " + "; ".join(vetoes),
@@ -393,6 +432,7 @@ class Committee:
                 red_flags=red_flags,
             )
 
+        vetoing_roles = {note.role for note in notes if note.vetoed}
         adversary_estimates = {
             "skeptic": parse_win_prob(skeptic),
             "risk_manager": parse_win_prob(risk),
@@ -407,6 +447,7 @@ class Committee:
             candidate_codes,
             adversary_estimates,
             puts_only=puts_only,
+            vetoing_roles=vetoing_roles,
         )
 
     def _finalize(
@@ -420,6 +461,7 @@ class Committee:
         candidate_codes: set[str] | None = None,
         adversary_estimates: dict[str, float | None] | None = None,
         puts_only: bool = False,
+        vetoing_roles: set[str] | None = None,
     ) -> CommitteeOutput:
         def reject(rationale: str) -> CommitteeOutput:
             return CommitteeOutput(
@@ -485,12 +527,30 @@ class Committee:
 
         estimates: dict[str, float | None] = dict(adversary_estimates or {})
         estimates["portfolio_manager"] = proposal.confidence
-        # The most pessimistic estimate across both lineages is binding; a role
-        # that failed to provide one counts as 0 so a formatting miss can never
-        # let a trade through.
-        win_probability = min(
-            (value if value is not None else 0.0) for value in estimates.values()
-        )
+        vetoed = vetoing_roles or set()
+        if self.veto_win_prob_penalty > 0 and vetoed:
+            # Soft veto: a vetoing role's own (low) win-prob estimate drops out of
+            # the binding minimum; the veto is represented instead as a fixed
+            # penalty. The PM (never a vetoing role) and any non-vetoing adversary
+            # set the base, which is then docked per standing veto. So an override
+            # only clears the floor when conviction beats the penalty -- e.g. at
+            # penalty 0.10 and floor 0.55, one veto needs PM confidence >= 0.65,
+            # two vetoes >= 0.75. Raw per-role estimates are still audited below.
+            base_vals = [
+                value
+                for role, value in estimates.items()
+                if role not in vetoed and value is not None
+            ]
+            base = min(base_vals) if base_vals else 0.0
+            penalty = self.veto_win_prob_penalty * len(vetoed)
+            win_probability = max(0.0, round(base - penalty, 4))
+        else:
+            # The most pessimistic estimate across both lineages is binding; a role
+            # that failed to provide one counts as 0 so a formatting miss can never
+            # let a trade through.
+            win_probability = min(
+                (value if value is not None else 0.0) for value in estimates.values()
+            )
         if self.min_win_probability > 0 and win_probability < self.min_win_probability:
             detail = ", ".join(
                 f"{role}={'?' if value is None else value}"
@@ -517,26 +577,46 @@ class Committee:
         )
 
     def _format_strategy(self) -> str:
-        """Tell every role the pre-earnings (IV-ramp) entry/exit plan.
+        """Tell every role what strategy this trade actually is.
 
-        Without this the skeptic vetoes on "earnings -> IV crush" -- but this
-        strategy exits BEFORE the print, so that crush is never eaten. The note
-        redirects the skepticism to what still matters: already-extreme IV
-        (overpaying) and stale/post-event catalysts. Emitted only when active.
+        Two distinct regimes share the pre-earnings EXIT guard, so the briefing
+        MUST match the active one or the skeptic vetoes on the wrong grounds:
+
+        * IV-ramp ENTRY active (earnings_window_max_days > 0): names ARE picked by
+          an upcoming earnings window, so frame it as the pre-earnings IV-ramp
+          play and tell the skeptic the print is never held.
+        * Exit-guard only (window == 0, exit days > 0): the volume-ratio strategy.
+          It is NOT an earnings play -- entry is on the catalyst thesis, there is
+          NO requirement for an upcoming earnings date or a post-earnings expiry.
+          State only the IV-crush reassurance (a held name auto-closes before its
+          OWN earnings). Without this split the briefing falsely declared every
+          trade a pre-earnings IV-ramp entry and the skeptic vetoed all of them.
         """
 
-        if self.pre_earnings_exit_trading_days <= 0:
-            return ""
         k = self.pre_earnings_exit_trading_days
-        return (
-            "STRATEGY -- PRE-EARNINGS IV-RAMP: this position is opened AHEAD of an "
-            f"upcoming earnings date and CLOSED ~{k} trading day(s) BEFORE the "
-            "print; it never holds through earnings. The edge is the volatility "
-            "ramp INTO the event, not the earnings reaction. So do NOT veto on "
-            "event/earnings IV-crush (we exit before it). DO still veto if current "
-            "IV is ALREADY extreme (we would overpay) or the catalyst is "
-            "stale / already released."
-        )
+        if self.earnings_window_max_days > 0:
+            return (
+                "STRATEGY -- PRE-EARNINGS IV-RAMP: this position is opened AHEAD "
+                f"of an upcoming earnings date and CLOSED ~{k} trading day(s) "
+                "BEFORE the print; it never holds through earnings. The edge is "
+                "the volatility ramp INTO the event, not the earnings reaction. So "
+                "do NOT veto on event/earnings IV-crush (we exit before it). DO "
+                "still veto if current IV is ALREADY extreme (we would overpay) or "
+                "the catalyst is stale / already released."
+            )
+        if k > 0:
+            return (
+                "STRATEGY -- CATALYST/MOMENTUM (NOT an earnings play): the entry "
+                "thesis is the catalyst in the evidence, NOT a pre-earnings "
+                "volatility ramp. There is NO requirement for an upcoming earnings "
+                "date, and the contract need NOT expire after any earnings date -- "
+                "do NOT veto on either ground. As a safety, a held position is "
+                f"auto-closed ~{k} trading day(s) before its OWN earnings, so do "
+                "NOT veto solely on 'holds through earnings -> IV crush'. DO still "
+                "veto if current IV is ALREADY extreme (we would overpay) or the "
+                "catalyst is stale / already released."
+            )
+        return ""
 
     def _format_budget(self) -> str:
         """State the real account size + per-contract cost cap for every role.
