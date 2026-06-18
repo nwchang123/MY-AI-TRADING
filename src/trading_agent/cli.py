@@ -167,12 +167,14 @@ def _build_committee(settings: Settings) -> Committee:
     mandate = Mandate.load(settings.mandate_path)
     return Committee(
         _llm_client(settings, settings.llm_model),
-        _llm_client(settings, settings.llm_model_pro),
+        _llm_client(settings, settings.llm_model),
         adversary_client=_adversary_client(settings),
         min_win_probability=mandate.options.min_estimated_win_probability,
         account_capital_usd=mandate.account.initial_capital_usd,
         max_contract_cost_usd=mandate.options.max_contract_cost_usd,
         pre_earnings_exit_trading_days=mandate.options.pre_earnings_exit_trading_days,
+        earnings_window_max_days=mandate.options.earnings_window_max_days,
+        veto_win_prob_penalty=mandate.options.veto_win_prob_penalty,
     )
 
 
@@ -452,6 +454,7 @@ def _auto_universe(settings: Settings, max_tickers: int) -> list[str]:
                 )
                 return {}
 
+    watchlist = {t.strip().upper() for t in mandate.universe.watchlist if t.strip()}
     tickers = select_universe(
         market=market,
         provider=provider,
@@ -462,6 +465,7 @@ def _auto_universe(settings: Settings, max_tickers: int) -> list[str]:
         priority_tickers=priority,
         industry_of=industry_of,
         earnings_of=earnings_of,
+        watchlist=watchlist,
     )
     _audit_writer(settings).append(
         "universe_selected",
@@ -497,6 +501,7 @@ def _run_loop(
     interval_seconds: float,
     max_iterations: int | None,
     market_hours_only: bool,
+    stop_after_close: bool = False,
 ) -> None:
     if settings.account_id is None:
         raise RuntimeError(
@@ -566,6 +571,7 @@ def _run_loop(
         max_iterations=max_iterations,
         market_hours_only=market_hours_only,
         on_skip=on_skip,
+        stop_after_close=stop_after_close,
     )
     if notifier is not None:
         mode_label = "模拟盘" if settings.mode == "paper" else "实盘"
@@ -744,6 +750,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run cycles even when the U.S. market is closed",
     )
+    loop_parser.add_argument(
+        "--stop-after-close",
+        action="store_true",
+        help="For near-continuous loops: exit cleanly once the market closes "
+        "(after running), instead of spinning skip-ticks until max-iterations",
+    )
     live_parser = subparsers.add_parser(
         "run-live",
         help="Run one controlled LIVE cycle (real money; requires explicit setup)",
@@ -844,6 +856,7 @@ def main() -> None:
             interval_seconds=args.interval_seconds,
             max_iterations=args.max_iterations,
             market_hours_only=not args.ignore_market_hours,
+            stop_after_close=args.stop_after_close,
         )
         return
     if args.command == "run-live":
