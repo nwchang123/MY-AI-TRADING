@@ -89,9 +89,10 @@ def _puts_only_block(flags: list[RedFlag]) -> str:
 _WIN_PROB_RULE = (
     "\nEnd your reply with a line 'WIN_PROB: 0.NN' -- your honest, independent"
     " estimate of the probability that the proposed trade reaches its take-profit"
-    " before its stop-loss or time stop. Calibrate against the breakeven win rate"
-    " (~0.33 for TP+100%/SL-50%). Above 0.50 means you see genuine catalyst edge"
-    " beyond baseline; above 0.60 requires very strong, fresh evidence."
+    " before its stop-loss or time stop. The baseline (no catalyst edge) is ~0.33."
+    " A trade with a fresh, timed catalyst and liquid near-money options should be"
+    " ABOVE 0.33 -- typically 0.40-0.55 for a good setup. Only give below 0.33 if"
+    " you see specific risks that make this worse than a random coin-flip."
 )
 
 _SKEPTIC_SYSTEM = (
