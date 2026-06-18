@@ -8,9 +8,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from trading_agent.domain.evidence import CandidateContext, EvidenceItem, SourceType
 from trading_agent.research.catalysts import (
     DILUTION_KEYWORDS,
-    DILUTION_TYPES,
     INSIDER_SELL_KEYWORDS,
 )
+
+# Only 424B filings (actual offering prospectuses) are critical dilution.
+# S-3 shelf registrations are just "permission to issue" — warn, not critical.
+ACTUAL_OFFERING_TYPES: set[SourceType] = {"sec_424b"}
+SHELF_TYPES: set[SourceType] = {"sec_s3"}
 from trading_agent.research.scoring import ScoreComponents
 
 # Tunable thresholds. A dilution registration or an insider sale only counts as
@@ -95,24 +99,51 @@ def detect_red_flags(
     evidence = context.evidence
     flags: list[RedFlag] = []
 
-    # --- dilution overhang: shelf / ATM / offering / warrant ---
-    dilution = [
+    # --- dilution overhang ---
+    # Split into actual offerings (424B = critical) and shelf registrations
+    # (S-3 = warn only). Keywords like "at-the-market" or "offering" in any
+    # source type also count as actual dilution.
+    actual_dilution = [
         item
         for item in evidence
-        if item.source_type in DILUTION_TYPES
-        or _contains(item.observed_fact, DILUTION_KEYWORDS)
+        if item.source_type in ACTUAL_OFFERING_TYPES
+        or (
+            item.source_type not in SHELF_TYPES
+            and _contains(item.observed_fact, DILUTION_KEYWORDS)
+        )
     ]
-    if dilution:
-        fresh = any(_age_days(item, as_of) <= DILUTION_FRESH_DAYS for item in dilution)
+    shelf_only = [
+        item
+        for item in evidence
+        if item.source_type in SHELF_TYPES
+        and not _contains(item.observed_fact, DILUTION_KEYWORDS)
+    ]
+
+    if actual_dilution:
+        fresh = any(
+            _age_days(item, as_of) <= DILUTION_FRESH_DAYS for item in actual_dilution
+        )
         flags.append(
             RedFlag(
                 code="dilution_overhang",
                 severity="critical" if fresh else "warn",
                 message=(
-                    f"{len(dilution)} dilution-related item(s) (shelf/ATM/offering/"
-                    "warrant). New issuance can cap a long call's upside."
+                    f"{len(actual_dilution)} actual dilution event(s) "
+                    "(ATM/offering/warrant). New issuance can cap a long call's upside."
                 ),
-                evidence_ids=[item.evidence_id for item in dilution],
+                evidence_ids=[item.evidence_id for item in actual_dilution],
+            )
+        )
+    elif shelf_only:
+        flags.append(
+            RedFlag(
+                code="dilution_overhang",
+                severity="warn",
+                message=(
+                    f"{len(shelf_only)} shelf registration(s) on file. "
+                    "Shelf = permission to issue, not active dilution."
+                ),
+                evidence_ids=[item.evidence_id for item in shelf_only],
             )
         )
 

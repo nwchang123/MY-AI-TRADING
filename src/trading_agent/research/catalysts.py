@@ -37,7 +37,6 @@ DILUTION_KEYWORDS = (
     "dilution",
     "at-the-market",
     "atm offering",
-    "shelf",
     "offering",
     "registered direct",
     "warrant",

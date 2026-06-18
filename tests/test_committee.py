@@ -89,18 +89,37 @@ def test_open_position_flows_through() -> None:
     assert out.vetoes == []
 
 
-def test_pre_earnings_strategy_note_briefed_when_active() -> None:
+def test_iv_ramp_strategy_note_briefed_when_entry_window_active() -> None:
+    # IV-ramp ENTRY active (earnings_window_max_days > 0) -> full IV-ramp framing.
     client = MockLLMClient(["c", "o", "s", "r", json.dumps(_PROPOSAL)])
-    Committee(client, pre_earnings_exit_trading_days=2).run(_context(), _scores())
+    Committee(
+        client, pre_earnings_exit_trading_days=2, earnings_window_max_days=25
+    ).run(_context(), _scores())
     briefing = client.calls[0]["user"]  # the catalyst analyst's briefing
     assert "PRE-EARNINGS IV-RAMP" in briefing
     assert "do NOT veto on event/earnings IV-crush" in briefing
 
 
-def test_no_pre_earnings_note_when_disabled() -> None:
+def test_catalyst_note_when_only_exit_guard_kept() -> None:
+    # Regression: exit guard ON but IV-ramp ENTRY OFF (window == 0). The briefing
+    # must NOT frame the trade as a pre-earnings IV-ramp entry (that vetoed every
+    # volume-ratio name for lacking an upcoming earnings date); it must say it is
+    # a catalyst play with no earnings-date / post-earnings-expiry requirement.
     client = MockLLMClient(["c", "o", "s", "r", json.dumps(_PROPOSAL)])
-    Committee(client).run(_context(), _scores())  # default: strategy off
+    Committee(
+        client, pre_earnings_exit_trading_days=2, earnings_window_max_days=0
+    ).run(_context(), _scores())
+    briefing = client.calls[0]["user"]
+    assert "PRE-EARNINGS IV-RAMP" not in briefing
+    assert "NOT an earnings play" in briefing
+    assert "NO requirement for an upcoming earnings date" in briefing
+
+
+def test_no_strategy_note_when_all_disabled() -> None:
+    client = MockLLMClient(["c", "o", "s", "r", json.dumps(_PROPOSAL)])
+    Committee(client).run(_context(), _scores())  # default: everything off
     assert "PRE-EARNINGS IV-RAMP" not in client.calls[0]["user"]
+    assert "NOT an earnings play" not in client.calls[0]["user"]
 
 
 def test_skeptic_veto_blocks_open() -> None:
@@ -349,10 +368,10 @@ def _dilution_context() -> CandidateContext:
             EvidenceItem(
                 evidence_id="evt_2",
                 ticker="EXAMPLE",
-                source_type="sec_s3",
-                source_url="https://sec.gov/s3",
+                source_type="sec_424b",
+                source_url="https://sec.gov/424b",
                 published_at=NOW,
-                observed_fact="Filed an S-3 shelf registration for up to USD 100M.",
+                observed_fact="Filed an offering prospectus for up to USD 100M.",
                 retrieved_at=NOW,
             ),
         ],
@@ -376,7 +395,7 @@ _PUT_PROPOSAL = dict(
     _PROPOSAL,
     option_code="US.EXAMPLE260626P00005000",
     option_side="put",
-    thesis="Fresh dilution shelf caps upside; long put on the overhang.",
+    thesis="Fresh dilution offering caps upside; long put on the overhang.",
 )
 
 
@@ -399,7 +418,7 @@ def _put_candidates() -> list[OptionCandidate]:
 
 
 def test_bearish_flag_runs_puts_only_and_accepts_a_put() -> None:
-    # A fresh dilution shelf no longer kills the name: with a put on the chain
+    # A fresh dilution offering no longer kills the name: with a put on the chain
     # the committee runs and a long-put thesis flows through.
     client = MockLLMClient(
         ["catalyst", "options", "fine", "fine", json.dumps(_PUT_PROPOSAL)]
@@ -495,6 +514,72 @@ def test_adversary_veto_blocks_open() -> None:
     )
     assert out.decision == "reject"
     assert any("skeptic" in v for v in out.vetoes)
+
+
+def _proposal_with_confidence(conf: float) -> str:
+    payload = dict(_PROPOSAL)
+    payload["confidence"] = conf
+    return json.dumps(payload)
+
+
+def test_soft_veto_lets_pm_override_with_high_conviction() -> None:
+    # penalty 0.10 + floor 0.55: one veto needs the non-vetoing roles + PM to
+    # clear 0.65. The skeptic vetoes (its 0.15 drops out, becomes a penalty);
+    # risk + PM are confident, so binding = min(0.72, 0.72) - 0.10 = 0.62 >= 0.55.
+    client = MockLLMClient(
+        [
+            "catalyst",
+            "options",
+            "VETO: dilution risk\nWIN_PROB: 0.15",  # skeptic vetoes
+            "acceptable\nWIN_PROB: 0.72",  # risk does NOT veto
+            _proposal_with_confidence(0.72),
+        ]
+    )
+    out = Committee(
+        client, min_win_probability=0.55, veto_win_prob_penalty=0.10
+    ).run(_context(), _scores())
+    assert out.decision == "open_position"
+    assert out.win_probability == 0.62  # 0.72 - 0.10 penalty
+    # The veto is still recorded for audit even though it was overridden.
+    assert any("skeptic" in v for v in out.vetoes)
+    assert out.win_estimates["skeptic"] == 0.15  # raw estimate preserved
+
+
+def test_soft_veto_penalty_blocks_low_conviction_override() -> None:
+    # Two standing vetoes dock the binding win-prob by 0.20, so the PM's 0.70
+    # confidence -> 0.50 < 0.55 floor -> reject. (Two vetoes would need PM >= 0.75.)
+    client = MockLLMClient(
+        [
+            "catalyst",
+            "options",
+            "VETO: dilution\nWIN_PROB: 0.15",  # skeptic vetoes
+            "VETO: unbounded risk\nWIN_PROB: 0.15",  # risk vetoes
+            _proposal_with_confidence(0.70),
+        ]
+    )
+    out = Committee(
+        client, min_win_probability=0.55, veto_win_prob_penalty=0.10
+    ).run(_context(), _scores())
+    assert out.decision == "reject"
+    assert out.win_probability == 0.50  # 0.70 - 2 * 0.10
+    assert "0.55" in out.rationale
+
+
+def test_soft_veto_disabled_keeps_hard_block() -> None:
+    # penalty 0 (default) => a single veto is still an absolute block even if the
+    # PM is highly confident; the trade never reaches the win-prob math.
+    client = MockLLMClient(
+        [
+            "catalyst",
+            "options",
+            "VETO: dilution risk\nWIN_PROB: 0.15",
+            "acceptable\nWIN_PROB: 0.72",
+            _proposal_with_confidence(0.90),
+        ]
+    )
+    out = Committee(client, min_win_probability=0.55).run(_context(), _scores())
+    assert out.decision == "reject"
+    assert "veto" in out.rationale.lower()
 
 
 def test_omitted_adversary_falls_back_to_primary() -> None:

@@ -46,7 +46,7 @@ def _codes(flags) -> set[str]:
     return {flag.code for flag in flags}
 
 
-def test_fresh_shelf_is_critical() -> None:
+def test_fresh_shelf_is_warn_not_critical() -> None:
     ctx = _context(
         [
             _evidence("e1", "sec_s3", "Filed an S-3 shelf registration.", age_days=3),
@@ -55,9 +55,9 @@ def test_fresh_shelf_is_critical() -> None:
     )
     flags = detect_red_flags(ctx, _scores(), now=NOW)
     dilution = next(f for f in flags if f.code == "dilution_overhang")
-    assert dilution.severity == "critical"
+    assert dilution.severity == "warn"
     assert dilution.evidence_ids == ["e1"]
-    assert critical_flags(flags)
+    assert not critical_flags(flags)
 
 
 def test_dilution_keyword_in_8k_is_detected() -> None:
@@ -141,7 +141,7 @@ def test_earnings_8k_item_202_fires_iv_crush_without_calendar() -> None:
 def test_bearish_and_nondirectional_flag_partition() -> None:
     ctx = _context(
         [
-            _evidence("e1", "sec_s3", "Filed an S-3 shelf registration.", age_days=3),
+            _evidence("e1", "sec_424b", "Filed an offering prospectus.", age_days=3),
             _evidence("e2", "sec_form4", "Officer sold 50,000 shares.", age_days=5),
         ]
     )
@@ -204,7 +204,7 @@ def test_clean_candidate_has_no_critical_flags() -> None:
 
 def test_format_red_flags_lists_severity_and_codes() -> None:
     ctx = _context(
-        [_evidence("e1", "sec_s3", "Filed an S-3 shelf registration.", age_days=3)]
+        [_evidence("e1", "sec_424b", "Filed an offering prospectus.", age_days=3)]
     )
     flags = detect_red_flags(ctx, _scores(), now=NOW)
     rendered = format_red_flags(flags)
