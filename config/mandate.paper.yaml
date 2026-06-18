@@ -97,7 +97,7 @@ options:
   # the floor was not the bottleneck; trimmed slightly toward breakeven anyway.
   # Do NOT drop below 0.55 -- 0.50 leaves only ~0.03 over breakeven, negative-EV
   # once the model's win-prob is even mildly over-optimistic.
-  min_estimated_win_probability: 0.40
+  min_estimated_win_probability: 0.35
   # Deterministic Monte Carlo baseline (no-edge GBM): rejects tickets so
   # hopeless that no catalyst edge could plausibly rescue them. LOWERED 0.3 ->
   # 0.25 on 2026-06-17 (toward the original 0.20); still well below the AI bar
