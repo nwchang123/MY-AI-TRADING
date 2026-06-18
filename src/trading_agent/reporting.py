@@ -15,7 +15,10 @@ def read_audit_events(path: Path) -> list[dict[str, Any]]:
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if line:
-            events.append(json.loads(line))
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
     return events
 
 

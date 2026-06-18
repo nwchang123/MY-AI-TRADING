@@ -4,6 +4,8 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from trading_agent.storage import atomic_write_json
+
 PROBE_ELIGIBLE = "eligible"
 PROBE_NO_CHAIN = "no_chain"
 PROBE_NO_CONTRACT = "no_eligible_contract"
@@ -47,10 +49,9 @@ class ProbeCache:
             return {}
 
     def flush(self) -> None:
-        """Write in-memory cache to disk."""
+        """Write in-memory cache to disk atomically."""
         if self._data is not None:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(self._data), encoding="utf-8")
+            atomic_write_json(self.path, self._data)
 
     def get(self, ticker: str, now: datetime | None = None) -> str | None:
         """Return the cached status, or None on miss/expiry."""

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -379,12 +380,19 @@ class Committee:
             + (f"\n\n{candidate_block}" if candidate_block else "")
             + f"\n\n[catalyst_analyst]\n{catalyst}\n\n[options_analyst]\n{options}"
         )
-        skeptic = self.adversary_client.complete(
-            system=_SKEPTIC_SYSTEM, user=analyst_context
-        )
-        risk = self.adversary_client.complete(
-            system=_RISK_SYSTEM, user=f"{analyst_context}\n\n[skeptic]\n{skeptic}"
-        )
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            skeptic_fut = pool.submit(
+                self.adversary_client.complete,
+                system=_SKEPTIC_SYSTEM,
+                user=analyst_context,
+            )
+            risk_fut = pool.submit(
+                self.adversary_client.complete,
+                system=_RISK_SYSTEM,
+                user=analyst_context,
+            )
+            skeptic = skeptic_fut.result()
+            risk = risk_fut.result()
         calls += 2
 
         notes = [

@@ -6,6 +6,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from trading_agent.storage import atomic_write_json
+
 DEFAULT_TTL_HOURS = 6.0
 
 
@@ -44,10 +46,9 @@ class DecisionCache:
             return {}
 
     def flush(self) -> None:
-        """Write in-memory cache to disk."""
+        """Write in-memory cache to disk atomically."""
         if self._data is not None:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(self._data), encoding="utf-8")
+            atomic_write_json(self.path, self._data)
 
     def get(self, ticker: str, digest: str, now: datetime | None = None) -> str | None:
         """Return the cached CommitteeOutput JSON, or None on miss/expiry."""

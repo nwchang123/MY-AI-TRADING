@@ -88,9 +88,9 @@ def test_approves_proposal_inside_mandate(tmp_path: Path) -> None:
 
 
 def test_rejects_low_estimated_win_probability(tmp_path: Path) -> None:
-    # Paper mandate floor is 0.60; the proposal's confidence is the PM's win
-    # estimate, so 0.4 must be rejected even if everything else is fine.
-    low = _proposal().model_copy(update={"confidence": 0.4})
+    # Paper mandate floor is 0.40; the proposal's confidence is the PM's win
+    # estimate, so 0.3 must be rejected even if everything else is fine.
+    low = _proposal().model_copy(update={"confidence": 0.3})
     result = RiskGate(_mandate(), tmp_path).evaluate_open(
         low, _quote(), _portfolio(), NOW
     )

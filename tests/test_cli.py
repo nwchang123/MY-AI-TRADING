@@ -59,7 +59,9 @@ def test_build_committee_falls_back_without_adversary(tmp_path: Path) -> None:
     committee = _build_committee(_settings(tmp_path, root_dir=ROOT))
     assert committee.adversary_client is committee.client
     # The mandate's win-probability floor is threaded into the committee.
-    assert committee.min_win_probability == 0.60
+    assert committee.min_win_probability == 0.40
+    # The soft-veto penalty is threaded through too (paper mandate sets 0.05).
+    assert committee.veto_win_prob_penalty == 0.05
 
 
 def _offline_input(tmp_path: Path, *, bid: float = 0.19) -> Path:

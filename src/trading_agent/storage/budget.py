@@ -4,6 +4,8 @@ import json
 from datetime import date
 from pathlib import Path
 
+from trading_agent.storage import atomic_write_json
+
 
 class DailyTokenBudget:
     """Persistent daily LLM token meter with a hard ceiling.
@@ -39,7 +41,4 @@ class DailyTokenBudget:
         if tokens <= 0:
             return
         total = self.used(day) + tokens
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps({"day": day.isoformat(), "tokens": total}), encoding="utf-8"
-        )
+        atomic_write_json(self.path, {"day": day.isoformat(), "tokens": total})
