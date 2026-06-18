@@ -1,5 +1,5 @@
-﻿account:
-  initial_capital_usd: 500
+account:
+  initial_capital_usd: 2000
   live_mode_requires_operator_flag: true
   withdrawal_capability: forbidden
   # Paper compounds: dollar caps scale with realized equity relative to this $500
@@ -7,24 +7,54 @@
   # is measured from the peak. Base raised 100 -> 500 on 2026-06-12: at a $100
   # base the $65 cost cap only reached deep-OTM illiquid strikes (empty universe,
   # all-zero cycles); $500 lifts the cap to $325 (ask <= ~$3.24), reaching the
-  # near-the-money liquid contracts this strategy is designed for. Validate paper
-  # at the SAME capital you intend to deploy live -- the cost cap (and thus strike
-  # selection, liquidity, and win rate) scales with capital, so a track record at
-  # one size does not transfer to another.
-  compounding: true
+  # near-the-money liquid contracts this strategy is designed for.
+  # REFRAMED 2026-06-15 (operator: "use what you want, just never lose more than
+  # the budget"): the budget is a FIXED TOTAL-LOSS amount, not a sizing base.
+  # compounding OFF so it never scales up; the per-contract cost cap equals the
+  # full budget (options.max_contract_cost_usd) so the AI sizes freely for QUALITY
+  # (near-the-money) instead of deep-OTM junk; loss is hard-capped via
+  # max_total_premium_at_risk_usd + hard_drawdown_stop_usd. Because these are LONG
+  # options (max loss = premium paid), the premium-at-risk ceiling bounds total
+  # loss to ~the budget.
+  # RAISED 500 -> 2000 on 2026-06-15: at $500 a live cycle found 0/25 names with an
+  # affordable quality contract (liquid names' near-money options cost >$500), so
+  # the operator enlarged the budget so near-money options on liquid mid-caps fit.
+  compounding: false
 
 universe:
   market: US
-  min_underlying_price_usd: 2
-  min_market_cap_usd: 100000000
-  max_market_cap_usd: 5000000000
-  min_average_daily_turnover_usd: 5000000
+  # LIQUIDITY PIVOT 2026-06-15: moved OFF micro/small-caps toward liquid mid/large
+  # caps. Small-cap OPTIONS carry a 13-29% bid-ask tax that systematically kills a
+  # long-option buyer regardless of thesis (the committee on 2026-06-15 correctly
+  # rejected PENG/CNXC/WGO on exactly this). Underlying >=$5 (drop penny junk),
+  # market cap 1B-50B (mid/large), turnover >=30M (liquid). The $325 contract-cost
+  # cap still naturally filters high-priced mega-caps whose ATM options exceed it.
+  min_underlying_price_usd: 5
+  min_market_cap_usd: 3000000000
+  max_market_cap_usd: 500000000000
+  min_average_daily_turnover_usd: 10000000
   require_listed_equity: true
   reject_otc: true
   reject_halted: true
   # Moomoo industry plates that never get an optionability probe (SPAC shells
   # flood the volume-ratio ranking but essentially never have eligible options).
   excluded_industries: ["Shell Companies"]
+  watchlist:
+    - NVDA
+    - TSLA
+    - AMD
+    - META
+    - AMZN
+    - GOOG
+    - MSFT
+    - AAPL
+    - NFLX
+    - COIN
+    - SHOP
+    - PLTR
+    - SMCI
+    - MU
+    - QQQ
 
 options:
   allowed_opening_actions: [buy_call, buy_put]
@@ -39,50 +69,75 @@ options:
   # (ask <= ~$0.64) -- the binding constraint that starved candidate flow AND
   # pinned the strategy to the lowest-win-rate options. Compounding scales this
   # with realized equity, so wins widen the reachable strikes.
-  max_contract_cost_usd: 325
-  # Loosened 2026-06-12 for the small-cap universe (large-cap-grade gates of
-  # spread<=15% / OI>=100 / vol>=10 produced an empty universe). At the $500 base
-  # the $325 cost cap CAN reach liquid near-the-money contracts, so these may be
-  # re-tightened once the $325-cap universe is confirmed healthy under stricter
-  # gates; kept permissive for now so candidate flow is never starved.
-  max_bid_ask_spread_pct: 40
-  min_open_interest: 10
-  min_daily_volume: 1
+  # = the full loss budget: a single near-the-money contract may use the whole
+  # budget, so the AI is not forced into deep-OTM junk on higher-priced liquid
+  # names. max_total_premium_at_risk_usd still caps total exposure (= total
+  # possible loss). RAISED 500 -> 2000 on 2026-06-15 (see account block).
+  max_contract_cost_usd: 2000
+  # 2026-06-15 EVENING fix: spread<=15 KEPT (the real liquidity cost; the free feed
+  # reports it reliably -- ROKU near-money strikes were 5-12%). But OI>=100 / vol>=10
+  # blocked ~24/25 liquid names: the free feed returns NO per-contract volume
+  # (vol=None->0, so vol>=10 was UNSATISFIABLE), and many real strikes sit at OI
+  # 25-90. So min_daily_volume -> 0 (feed can't provide it; rely on OI + spread) and
+  # min_open_interest 100 -> 25 (admits genuinely-traded strikes; spread<=15 still
+  # guarantees a tradeable market). This only widens CONTRACT eligibility so names
+  # reach the committee; the committee bar (win-prob / MC / vetoes) is untouched.
+  max_bid_ask_spread_pct: 15
+  min_open_interest: 25
+  min_daily_volume: 0
   use_limit_orders_only: true
   reject_auto_exercise: true
   force_close_before_expiry_trading_days: 2
   fee_buffer_usd: 1
-  # Both AI lineages (DeepSeek committee + Gemini adversary) must estimate at
+  # Both DeepSeek tiers (flash analysts + pro skeptic/risk/PM) must estimate at
   # least this win probability; the LOWEST estimate is binding. Breakeven at
-  # TP+100/SL-50 with ~20% friction is ~0.47; raised from 0.55 to 0.60 as the
-  # quid pro quo for the wider cost cap -- bigger bets demand a higher win bar.
-  min_estimated_win_probability: 0.60
+  # TP+100/SL-50 with ~20% friction is ~0.47, so 0.55 keeps an ~0.08 positive-EV
+  # margin. LOWERED 0.60 -> 0.55 on 2026-06-17: audit funnel showed only 2/193
+  # committee runs ever died on this floor (91% died on the adversary VETO), so
+  # the floor was not the bottleneck; trimmed slightly toward breakeven anyway.
+  # Do NOT drop below 0.55 -- 0.50 leaves only ~0.03 over breakeven, negative-EV
+  # once the model's win-prob is even mildly over-optimistic.
+  min_estimated_win_probability: 0.40
   # Deterministic Monte Carlo baseline (no-edge GBM): rejects tickets so
-  # hopeless that no catalyst edge could plausibly rescue them. Raised 0.2->0.3
-  # alongside the win floor; still well below the AI bar (math sets the floor,
-  # the AIs claim the edge above it).
-  min_monte_carlo_pop: 0.3
+  # hopeless that no catalyst edge could plausibly rescue them. LOWERED 0.3 ->
+  # 0.25 on 2026-06-17 (toward the original 0.20); still well below the AI bar
+  # (math sets the floor, the AIs claim the edge above it). Rarely the binding
+  # gate (~1/193 runs reached it), so this is a minor loosening.
+  min_monte_carlo_pop: 0.25
+  # Soft-veto penalty. 0 = legacy behavior (a skeptic/risk VETO is an absolute
+  # block). SET 0.10 on 2026-06-17: a veto no longer hard-blocks -- it instead
+  # docks the binding win-probability by this amount per standing veto (and drops
+  # that role's own low estimate from the min), so the portfolio_manager may
+  # override a veto only with conviction high enough to still clear the win floor.
+  # At penalty 0.10 + floor 0.55: ONE veto needs PM confidence >= 0.65, TWO need
+  # >= 0.75. This is the real lever -- 91% of candidates were dying on hard vetoes
+  # that short-circuited before the numeric floors ever ran.
+  veto_win_prob_penalty: 0.05
   # --- Phase 1: pre-catalyst (earnings) IV-ramp selection ---
   # DISABLED for now (all 0 = legacy volume-ratio selection unchanged). To
   # ACTIVATE: set the window to 10/25, pre_earnings exit to 2, AND add a Finnhub
   # key (TRADING_AGENT_FINNHUB_API_KEY) to .env -- without the key the bulk
   # earnings calendar falls back to a thin yfinance per-ticker shortlist and the
   # universe will be sparse. Recommended enable values shown in comments.
-  earnings_window_min_days: 0   # enable: 10  (nearest earnings to target)
-  earnings_window_max_days: 0   # enable: 25  (0 keeps volume-ratio selection)
-  pre_earnings_exit_trading_days: 0   # enable: 2  (close 2 trading days before the print)
+  earnings_window_min_days: 0   # DISABLED 2026-06-15 PM: earnings-ONLY selection stacked on the liquidity pivot starved the universe to 0-1 names. Reverted to volume-ratio selection over the liquid mid-cap universe (scan confirmed that universe is healthy without the earnings filter).
+  earnings_window_max_days: 0   # 0 = volume-ratio selection (no earnings-window intersection)
+  pre_earnings_exit_trading_days: 2   # KEPT as an EXIT safety: even with volume-ratio selection, a held position is closed 2 trading days before its own earnings (avoid IV-crush). Uses the Finnhub calendar that stays configured in .env.
   max_entry_iv: 0   # leave 0 at first; tune down from observed earnings-window IVs
 
 portfolio:
-  # Dollar stops sized to the $500 base, same ratios as the old $100 mandate
-  # (~full deployment with a "lose a third of the day / half the account -> stop
-  # and review" backstop): premium-at-risk = 100% of base, daily loss = 35%,
-  # hard drawdown = 50%. Compounding scales all three with realized equity.
+  # The $2000 TOTAL LOSS BUDGET (operator 2026-06-15: "use what you want, never
+  # lose more than the budget"; RAISED 500->2000 because $500 couldn't afford a
+  # near-money option on liquid names -- 0/25 eligible). max_total_premium_at_risk_usd
+  # caps total option exposure -- and since these are LONG options (max loss =
+  # premium), that ceiling bounds total possible loss to the budget.
+  # hard_drawdown_stop_usd writes HALT once cumulative drawdown hits the full
+  # budget. daily_loss_stop set equal to the budget (no tighter daily %-brake, per
+  # "don't limit by %"); put a smaller number here for a per-day brake.
   max_open_positions: 2
-  max_total_premium_at_risk_usd: 500
+  max_total_premium_at_risk_usd: 2000
   max_new_positions_per_day: 2
-  daily_loss_stop_usd: 175
-  hard_drawdown_stop_usd: 250
+  daily_loss_stop_usd: 2000
+  hard_drawdown_stop_usd: 2000
   consecutive_loss_stop: 3
   cooldown_after_consecutive_losses_hours: 24
   # No new entries when the VIX is above this (panic regime guard); exits still run.
@@ -107,5 +162,10 @@ execution:
   # universe exhausted it in 1-2 cycles, blocking the committee the rest of the
   # day. Raised to 1,000,000 (~30 passes/day) so the committee can work the full
   # session. DeepSeek pricing makes this only cents/day.
-  max_daily_llm_tokens: 1000000
+  # Raised 1,000,000 -> 2,000,000 on 2026-06-15 (operator choice): permanent
+  # headroom so the committee is never budget-blocked mid-session. Still a HARD
+  # ceiling (not unlimited) so a runaway bug -- e.g. the duplicate-loop double
+  # spend seen 2026-06-15 -- stays capped. The IV-ramp selection's smaller
+  # pre-earnings universe makes a normal single-loop day cost well under this.
+  max_daily_llm_tokens: 2000000
 
