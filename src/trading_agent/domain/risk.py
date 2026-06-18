@@ -34,6 +34,7 @@ class UniverseMandate(BaseModel):
     reject_otc: bool
     reject_halted: bool
     excluded_industries: list[str] = Field(default_factory=lambda: ["Shell Companies"])
+    watchlist: list[str] = Field(default_factory=list)
 
 
 class OptionsMandate(BaseModel):
@@ -62,6 +63,14 @@ class OptionsMandate(BaseModel):
     # sticky IV). Set LOW: it only rejects structurally hopeless tickets that
     # no plausible catalyst edge could rescue. 0 disables the check.
     min_monte_carlo_pop: float = Field(default=0.0, ge=0, le=1)
+    # Soft-veto control. 0 (default) keeps the legacy behavior where a skeptic or
+    # risk_manager VETO is an absolute block. When > 0, a veto no longer hard-
+    # blocks: each standing veto instead docks the binding win-probability by this
+    # amount (and drops that role's own estimate from the min), so the
+    # portfolio_manager can override a veto only with conviction high enough to
+    # still clear ``min_estimated_win_probability``. E.g. penalty 0.10 + floor
+    # 0.55 => one veto needs PM confidence >= 0.65, two vetoes >= 0.75.
+    veto_win_prob_penalty: float = Field(default=0.0, ge=0, le=1)
     # --- Phase 1: pre-catalyst (earnings) IV-ramp selection ---
     # When earnings_window_max_days > 0, the universe is picked by UPCOMING
     # earnings proximity instead of realized volume spikes: only names whose next
@@ -85,6 +94,7 @@ class PortfolioMandate(BaseModel):
 
     max_open_positions: int = Field(gt=0)
     max_total_premium_at_risk_usd: float = Field(gt=0)
+    max_single_position_cost_usd: float = Field(default=0, ge=0)
     max_new_positions_per_day: int = Field(gt=0)
     daily_loss_stop_usd: float = Field(gt=0)
     hard_drawdown_stop_usd: float = Field(gt=0)
@@ -308,6 +318,11 @@ class RiskGate:
             > self.mandate.portfolio.max_total_premium_at_risk_usd
         ):
             reasons.append("total premium at risk would exceed mandate")
+        if (
+            self.mandate.portfolio.max_single_position_cost_usd > 0
+            and estimated_cost > self.mandate.portfolio.max_single_position_cost_usd
+        ):
+            reasons.append("single position cost exceeds mandate limit")
         if portfolio.new_positions_today >= self.mandate.portfolio.max_new_positions_per_day:
             reasons.append("daily new-position limit reached")
         if portfolio.daily_pnl_usd <= -self.mandate.portfolio.daily_loss_stop_usd:

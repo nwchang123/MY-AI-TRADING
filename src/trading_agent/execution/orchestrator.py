@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
+from trading_agent.data.iv_history import IV30History
 from trading_agent.data.moomoo_market import US_OPTION_LOT_SIZE, parse_us_option_code
 from trading_agent.data.sec_edgar import SecEdgarClient
 from trading_agent.domain.calendar import (
@@ -14,6 +15,8 @@ from trading_agent.domain.calendar import (
 from trading_agent.domain.montecarlo import (
     MAX_USABLE_IV,
     black_scholes_delta,
+    iv_rank,
+    kelly_criterion,
     stable_seed,
     win_probability,
 )
@@ -102,6 +105,7 @@ class PaperTradingCycle:
         earnings_client: Any | None = None,
         price_history: Any | None = None,
         earnings_calendar: Any | None = None,
+        iv_history: IV30History | None = None,
     ):
         if trd_env not in {"SIMULATE", "REAL"}:
             raise ValueError("trd_env must be 'SIMULATE' or 'REAL'")
@@ -129,6 +133,7 @@ class PaperTradingCycle:
         # on (avoids a Finnhub-vs-yfinance date mismatch). Falls back to
         # earnings_client.next_earnings_date when not supplied.
         self.earnings_calendar = earnings_calendar
+        self.iv_history = iv_history
         self._earnings_date_cache: dict[str, date | None] = {}
         # Refreshed at the start of every cycle: when the account compounds,
         # these carry the equity-scaled risk caps; otherwise they alias the
@@ -163,6 +168,14 @@ class PaperTradingCycle:
         self._refresh_sizing()
         held_codes = self._reconcile(now, result)
         marks = self._run_exits(now, held_codes, result)
+
+        # Refresh held_codes from the position store to get an accurate count
+        # after exits. Positions closed during _run_exits are now marked as
+        # closed in the store, so re-reading gives the correct open set.
+        held_codes = {
+            r["option_code"]
+            for r in self.position_store.open_positions()
+        } & held_codes
 
         if not self._enforce_circuit_breakers(now, result, marks):
             if self._in_cooldown(now):
@@ -295,9 +308,17 @@ class PaperTradingCycle:
         engine would otherwise never manage. Adopted positions get the mandate's
         standard exit plan (+100/-50, time stop at expiry -- the forced-close
         window still fires first). Non-option holdings are ignored.
+
+        Orphans are rejected if adopting would violate the portfolio mandate
+        (position count, total premium, single-position cost).
         """
 
         ledger_open = {r["option_code"] for r in self.position_store.open_positions()}
+        current_premium = sum(
+            r["entry_price"] * r["contracts"] * r["lot_size"]
+            for r in self.position_store.open_positions()
+        )
+        current_count = len(ledger_open)
         for row in held_rows:
             code = row["code"]
             if code in ledger_open:
@@ -308,23 +329,43 @@ class PaperTradingCycle:
                 continue  # stock or non-US-option holding: not ours to manage
             entry = float(row.get("cost_price") or 0.0)
             if entry <= 0:
-                # No usable cost basis: mark from the nominal price so the exit
-                # engine at least has a reference; worst case the stop fires.
                 entry = float(row.get("nominal_price") or 0.0)
             if entry <= 0:
                 continue
+            contracts = int(float(row.get("qty") or 1))
+            orphan_cost = entry * contracts * US_OPTION_LOT_SIZE
+
+            # --- risk gate checks for orphan adoption ---
+            portfolio = self.mandate.portfolio
+            reject_reason = None
+            if current_count + 1 > portfolio.max_open_positions:
+                reject_reason = f"adopting {code} would exceed max open positions ({current_count}+1 > {portfolio.max_open_positions})"
+            elif portfolio.max_single_position_cost_usd > 0 and orphan_cost > portfolio.max_single_position_cost_usd:
+                reject_reason = f"adopting {code} cost ${orphan_cost:.0f} exceeds single position limit ${portfolio.max_single_position_cost_usd:.0f}"
+            elif current_premium + orphan_cost > portfolio.max_total_premium_at_risk_usd:
+                reject_reason = f"adopting {code} would exceed total premium at risk (${current_premium:.0f}+${orphan_cost:.0f} > ${portfolio.max_total_premium_at_risk_usd:.0f})"
+
+            if reject_reason:
+                self.audit.append(
+                    "orphan_adopt_rejected",
+                    {"option_code": code, "reason": reject_reason, "at": now.isoformat()},
+                )
+                continue
+
             self.position_store.open_position(
                 option_code=code,
                 ticker=parse_us_option_code(code)[0],
                 option_side=side,
                 entry_price=entry,
-                contracts=int(float(row.get("qty") or 1)),
+                contracts=contracts,
                 lot_size=US_OPTION_LOT_SIZE,
                 expiry=expiry,
                 take_profit_pct=100.0,
                 stop_loss_pct=50.0,
                 time_stop=expiry,
             )
+            current_count += 1
+            current_premium += orphan_cost
             result.adopted.append(code)
             self.audit.append(
                 "position_adopted",
@@ -507,9 +548,15 @@ class PaperTradingCycle:
         end = today + timedelta(days=self.mandate.options.max_dte)
         # Pre-earnings (IV-ramp) play: the option must OUTLIVE the print to carry
         # its event vega through the hold, so drop contracts expiring on/before
-        # the earnings date. Only when the strategy is active and the date known.
+        # the earnings date. This contract filter belongs to the IV-ramp ENTRY
+        # strategy ONLY (gated on earnings_window_max_days), NOT the pre-earnings
+        # exit safety: when only the exit is kept, requiring expiry > earnings is
+        # both pointless (the position is closed before the print anyway) and
+        # catastrophic in earnings season -- every in-window expiry falls on/
+        # before the next print, emptying the candidate list for the whole
+        # universe.
         earnings_date = None
-        if self.active_mandate.options.pre_earnings_exit_trading_days > 0:
+        if self.active_mandate.options.earnings_window_max_days > 0:
             earnings_date = self._next_earnings_date(ticker)
         try:
             chain = self.market.option_chain(ticker, start, end, "ALL")
@@ -655,36 +702,41 @@ class PaperTradingCycle:
     def _underlying_snapshot(
         self, ticker: str, result: CycleResult
     ) -> dict[str, Any] | None:
-        """Get real-time stock price from Moomoo, fallback to delayed CBOE/Yahoo."""
+        """Get real-time stock price from Moomoo, fallback to delayed CBOE/Yahoo.
+
+        When Moomoo provides the price but lacks iv30, we enrich the snapshot
+        from the CBOE/Yahoo fallback so IV Rank can be computed.
+        """
 
         # Try Moomoo first (real-time)
+        moomoo_snap = None
         if self.moomoo_market is not None:
             try:
-                snapshot = self.moomoo_market.stock_snapshot(ticker)
-                if snapshot and snapshot.get("price"):
-                    self.audit.append(
-                        "stock_snapshot_source",
-                        {"ticker": ticker, "source": "moomoo_realtime"},
-                    )
-                    return snapshot
+                moomoo_snap = self.moomoo_market.stock_snapshot(ticker)
             except Exception as exc:  # noqa: BLE001
                 self._record_error(result, "moomoo_stock_snapshot", ticker, exc)
 
-        # Fallback to option data provider (delayed)
+        # Fallback to option data provider (delayed) for iv30 enrichment.
+        cboe_snap = None
         method = getattr(self.market, "underlying_snapshot", None)
-        if method is None:
+        if method is not None:
+            try:
+                cboe_snap = method(ticker) or None
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Prefer Moomoo price (real-time), enrich with CBOE iv30 if missing.
+        snapshot = moomoo_snap or cboe_snap
+        if snapshot is None:
             return None
-        try:
-            snapshot = method(ticker) or None
-            if snapshot:
-                self.audit.append(
-                    "stock_snapshot_source",
-                    {"ticker": ticker, "source": "cboe_delayed"},
-                )
-            return snapshot
-        except Exception as exc:  # noqa: BLE001
-            self._record_error(result, "underlying_snapshot", ticker, exc)
-            return None
+
+        if moomoo_snap and cboe_snap and not snapshot.get("iv30"):
+            snapshot["iv30"] = cboe_snap.get("iv30", 0)
+            snapshot["iv30_change"] = cboe_snap.get("iv30_change", 0)
+
+        source = "moomoo_realtime" if moomoo_snap else "cboe_delayed"
+        self.audit.append("stock_snapshot_source", {"ticker": ticker, "source": source})
+        return snapshot
 
     def _price_context(self, ticker: str, result: CycleResult) -> dict[str, Any] | None:
         """Delayed daily-bar technical context for the committee (best-effort)."""
@@ -743,6 +795,13 @@ class PaperTradingCycle:
         self, now: datetime, ticker: str, held_codes: set[str], result: CycleResult
     ) -> str | None:
         snapshot = self._underlying_snapshot(ticker, result)
+
+        # Record iv30 for IV Rank history (always, even without candidates).
+        if self.iv_history is not None and snapshot:
+            current_iv30 = float(snapshot.get("iv30") or 0)
+            if current_iv30 > 0:
+                self.iv_history.record(ticker, current_iv30, today=market_date(now))
+
         spot = float((snapshot or {}).get("price") or 0.0)
         candidates = self._eligible_candidates(now, ticker, result, spot=spot)
         if not candidates:
@@ -826,10 +885,22 @@ class PaperTradingCycle:
             )
             return None
 
+        # Compute IV Rank from snapshot iv30 and local history.
+        current_iv30 = float((snapshot or {}).get("iv30") or 0.0)
+        iv_rank_val = None
+        if current_iv30 > 0 and self.iv_history is not None:
+            extremes = self.iv_history.extremes(ticker)
+            if extremes is not None:
+                iv_rank_val = iv_rank(
+                    current_iv=current_iv30,
+                    iv_52w_high=extremes[0],
+                    iv_52w_low=extremes[1],
+                )
+
         before = self.committee.usage_total()
         output = self.committee.run(
             context, scores, candidates=candidates, market_snapshot=snapshot,
-            price_context=price_context,
+            price_context=price_context, iv_rank=iv_rank_val,
         )
         usage = usage_delta(before, self.committee.usage_total())
         self.audit.append(

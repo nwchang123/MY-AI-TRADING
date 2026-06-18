@@ -112,7 +112,7 @@ options:
   # At penalty 0.10 + floor 0.55: ONE veto needs PM confidence >= 0.65, TWO need
   # >= 0.75. This is the real lever -- 91% of candidates were dying on hard vetoes
   # that short-circuited before the numeric floors ever ran.
-  veto_win_prob_penalty: 0.05
+  veto_win_prob_penalty: 0.02
   # --- Phase 1: pre-catalyst (earnings) IV-ramp selection ---
   # DISABLED for now (all 0 = legacy volume-ratio selection unchanged). To
   # ACTIVATE: set the window to 10/25, pre_earnings exit to 2, AND add a Finnhub
@@ -135,6 +135,7 @@ portfolio:
   # "don't limit by %"); put a smaller number here for a per-day brake.
   max_open_positions: 2
   max_total_premium_at_risk_usd: 2000
+  max_single_position_cost_usd: 800
   max_new_positions_per_day: 2
   daily_loss_stop_usd: 2000
   hard_drawdown_stop_usd: 2000
