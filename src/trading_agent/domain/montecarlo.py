@@ -64,6 +64,127 @@ def black_scholes_delta(
     return _norm_cdf(d1) if side == "call" else _norm_cdf(d1) - 1.0
 
 
+def black_scholes_gamma(
+    *, spot: float, strike: float, t_years: float, iv: float,
+    rate: float = 0.04,
+) -> float:
+    """Black-Scholes gamma; call and put share the same gamma.
+
+    Gamma is highest for ATM options and increases sharply near expiry.
+    A large gamma means delta is very sensitive to small price moves --
+    useful for spotting elevated risk on short-dated, near-the-money contracts.
+    """
+
+    if spot <= 0 or strike <= 0 or iv <= 0:
+        return 0.0
+    if t_years <= 0:
+        return 0.0
+    sq = iv * math.sqrt(t_years)
+    d1 = (math.log(spot / strike) + (rate + iv * iv / 2.0) * t_years) / sq
+    return math.exp(-d1 * d1 / 2.0) / (spot * sq * math.sqrt(2.0 * math.pi))
+
+
+def black_scholes_vega(
+    *, spot: float, strike: float, t_years: float, iv: float,
+    rate: float = 0.04,
+) -> float:
+    """Black-Scholes vega; call and put share the same vega.
+
+    Vega measures sensitivity to a 1-unit (100%) change in IV.  In practice
+    IV moves in percentage points, so multiply by 0.01 to get the dollar
+    change per 1% IV move.  High vega = big exposure to IV changes.
+    """
+
+    if spot <= 0 or strike <= 0 or iv <= 0 or t_years <= 0:
+        return 0.0
+    sq = iv * math.sqrt(t_years)
+    d1 = (math.log(spot / strike) + (rate + iv * iv / 2.0) * t_years) / sq
+    return spot * math.exp(-d1 * d1 / 2.0) * math.sqrt(t_years) / math.sqrt(2.0 * math.pi)
+
+
+def black_scholes_theta(
+    *, side: str, spot: float, strike: float, t_years: float, iv: float,
+    rate: float = 0.04,
+) -> float:
+    """Black-Scholes theta (time decay per year).
+
+    Negative for long options (they lose value over time).  Divide by 365
+    for daily decay.  Theta is largest for ATM options near expiry.
+    """
+
+    if side not in {"call", "put"}:
+        raise ValueError("side must be 'call' or 'put'")
+    if spot <= 0 or strike <= 0 or iv <= 0 or t_years <= 0:
+        return 0.0
+    sq = iv * math.sqrt(t_years)
+    d1 = (math.log(spot / strike) + (rate + iv * iv / 2.0) * t_years) / sq
+    d2 = d1 - sq
+    common = -(spot * math.exp(-d1 * d1 / 2.0) * iv) / (2.0 * math.sqrt(2.0 * math.pi * t_years))
+    if side == "call":
+        return common - rate * strike * math.exp(-rate * t_years) * _norm_cdf(d2)
+    return common + rate * strike * math.exp(-rate * t_years) * _norm_cdf(-d2)
+
+
+def iv_rank(
+    *,
+    current_iv: float,
+    iv_history: list[float] | None = None,
+    iv_52w_high: float | None = None,
+    iv_52w_low: float | None = None,
+) -> float | None:
+    """IV Rank: where current IV sits in its 52-week range (0.0 – 1.0).
+
+    When a full history or 52-week extremes are provided the rank is exact;
+    otherwise returns None so callers can skip gracefully.  Useful for the
+    committee: IV Rank > 0.70 signals expensive options (don't buy premium),
+    < 0.30 signals cheap options (favorable for long premium).
+    """
+
+    if current_iv <= 0:
+        return None
+
+    if iv_history and len(iv_history) >= 2:
+        hi = max(iv_history)
+        lo = min(iv_history)
+        if hi <= lo:
+            return None
+        return (current_iv - lo) / (hi - lo)
+
+    if iv_52w_high is not None and iv_52w_low is not None:
+        if iv_52w_high <= iv_52w_low:
+            return None
+        return (current_iv - iv_52w_low) / (iv_52w_high - iv_52w_low)
+
+    return None
+
+
+def kelly_criterion(
+    *,
+    win_prob: float,
+    win_amount: float,
+    lose_amount: float,
+) -> float | None:
+    """Kelly fraction: optimal fraction of bankroll to risk per trade.
+
+    f* = (p * b - q) / b  where p = win_prob, q = 1-p, b = win_amount / lose_amount.
+    Returns a value in [0, 1] (negative → no bet).  In practice, fractional
+    Kelly (0.25–0.50) is used to smooth volatility.  Returns None on invalid
+    inputs.
+    """
+
+    if win_prob <= 0 or win_prob >= 1:
+        return None
+    if win_amount <= 0 or lose_amount <= 0:
+        return None
+
+    p = win_prob
+    q = 1.0 - p
+    b = win_amount / lose_amount
+    fraction = (p * b - q) / b
+
+    return max(0.0, min(fraction, 1.0))
+
+
 def stable_seed(key: str) -> int:
     """Reproducible per-contract seed so audited numbers can be re-derived."""
 
@@ -130,3 +251,224 @@ def win_probability(
             if mark <= sl_level:
                 break
     return wins / paths
+
+
+# ---------------------------------------------------------------------------
+# #4  Value at Risk (VaR)
+# ---------------------------------------------------------------------------
+
+
+def portfolio_var(
+    *,
+    positions: list[dict],
+    confidence: float = 0.95,
+    horizon_days: int = 1,
+    paths: int = 5000,
+    rate: float = 0.04,
+    seed: int | None = None,
+) -> float:
+    """Historical-simulation VaR for a portfolio of long option positions.
+
+    Each position dict: {side, spot, strike, dte_days, iv, contracts,
+    lot_size, entry_price}.  Returns the dollar loss at the given confidence
+    level over the horizon.  Positive = loss amount.
+    """
+
+    if not positions:
+        return 0.0
+    rng = random.Random(seed)
+    dt = horizon_days / 365.0
+    pnl_paths: list[float] = []
+    for _ in range(paths):
+        total_pnl = 0.0
+        for pos in positions:
+            s = pos["spot"]
+            drift = (rate - 0.5 * pos["iv"] ** 2) * dt
+            vol = pos["iv"] * math.sqrt(dt)
+            s_end = s * math.exp(drift + vol * rng.gauss(0.0, 1.0))
+            t_end = max(pos["dte_days"] - horizon_days, 0) / 365.0
+            old_mark = black_scholes_price(
+                side=pos["side"], spot=s, strike=pos["strike"],
+                t_years=pos["dte_days"] / 365.0, iv=pos["iv"], rate=rate,
+            )
+            new_mark = black_scholes_price(
+                side=pos["side"], spot=s_end, strike=pos["strike"],
+                t_years=t_end, iv=pos["iv"], rate=rate,
+            )
+            total_pnl += (new_mark - old_mark) * pos["contracts"] * pos["lot_size"]
+        pnl_paths.append(total_pnl)
+    pnl_paths.sort()
+    idx = int((1 - confidence) * len(pnl_paths))
+    return -pnl_paths[max(idx, 0)]
+
+
+# ---------------------------------------------------------------------------
+# #5  IV Surface helpers
+# ---------------------------------------------------------------------------
+
+
+def iv_skew(
+    *,
+    calls_by_strike: list[dict],
+    spot: float,
+) -> float | None:
+    """Approximate 25-delta risk-reversal skew: IV(25d put) - IV(25d call).
+
+    ``calls_by_strike``: list of {strike, iv, delta} for ATM附近的options.
+    Returns the skew (positive = put vol > call vol = bearish skew), or None
+    if insufficient data.
+    """
+
+    puts = sorted(
+        [r for r in calls_by_strike if r.get("delta") is not None and r["delta"] < -0.20],
+        key=lambda r: abs(r["delta"] + 0.25),
+    )
+    calls = sorted(
+        [r for r in calls_by_strike if r.get("delta") is not None and r["delta"] > 0.20],
+        key=lambda r: abs(r["delta"] - 0.25),
+    )
+    if not puts or not calls:
+        return None
+    return puts[0]["iv"] - calls[0]["iv"]
+
+
+def iv_term_structure(
+    *,
+    iv_by_expiry: list[dict],
+) -> float | None:
+    """Term-structure slope: IV(90d) - IV(30d).
+
+    ``iv_by_expiry``: list of {dte_days, iv}.  Returns the slope (positive =
+    contango = longer-dated more expensive), or None if insufficient data.
+    """
+
+    short = [r for r in iv_by_expiry if 20 <= r["dte_days"] <= 40]
+    long = [r for r in iv_by_expiry if 80 <= r["dte_days"] <= 100]
+    if not short or not long:
+        return None
+    return long[0]["iv"] - short[0]["iv"]
+
+
+# ---------------------------------------------------------------------------
+# #6  P&L Attribution
+# ---------------------------------------------------------------------------
+
+
+def pnl_attribution(
+    *,
+    side: str,
+    spot: float,
+    strike: float,
+    t_years: float,
+    iv: float,
+    spot_move: float,
+    iv_change: float,
+    time_decay_days: int,
+    rate: float = 0.04,
+) -> dict[str, float]:
+    """Decompose P&L into delta/gamma/vega/theta components.
+
+    Uses second-order Taylor expansion:
+      dP = delta*dS + 0.5*gamma*dS^2 + vega*dIV + theta*dt
+    Returns dict with each component and total.
+    """
+
+    delta = black_scholes_delta(
+        side=side, spot=spot, strike=strike, t_years=t_years, iv=iv, rate=rate,
+    )
+    gamma = black_scholes_gamma(
+        spot=spot, strike=strike, t_years=t_years, iv=iv, rate=rate,
+    )
+    vega = black_scholes_vega(
+        spot=spot, strike=strike, t_years=t_years, iv=iv, rate=rate,
+    )
+    theta = black_scholes_theta(
+        side=side, spot=spot, strike=strike, t_years=t_years, iv=iv, rate=rate,
+    )
+
+    d_s = spot_move
+    d_iv = iv_change
+    dt = time_decay_days / 365.0
+
+    delta_pnl = delta * d_s
+    gamma_pnl = 0.5 * gamma * d_s * d_s
+    vega_pnl = vega * d_iv
+    theta_pnl = theta * dt
+    total = delta_pnl + gamma_pnl + vega_pnl + theta_pnl
+
+    return {
+        "delta_pnl": round(delta_pnl, 4),
+        "gamma_pnl": round(gamma_pnl, 4),
+        "vega_pnl": round(vega_pnl, 4),
+        "theta_pnl": round(theta_pnl, 4),
+        "total": round(total, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# #7  Delta Hedging simulation
+# ---------------------------------------------------------------------------
+
+
+def delta_hedge_pnl(
+    *,
+    side: str,
+    spot: float,
+    strike: float,
+    dte_days: int,
+    iv: float,
+    rebalance_days: int = 1,
+    rate: float = 0.04,
+    seed: int | None = None,
+) -> dict[str, float]:
+    """Simulate delta-hedged P&L for a long option position.
+
+    Buys delta shares at start, rebalances every ``rebalance_days``.
+    Returns dict with hedged_pnl, unhedged_pnl, hedge_cost.
+    """
+
+    rng = random.Random(seed)
+    dt = 1.0 / 365.0
+    s = spot
+    t = dte_days / 365.0
+    drift = (rate - 0.5 * iv * iv) * dt
+    vol = iv * math.sqrt(dt)
+
+    d = black_scholes_delta(
+        side=side, spot=s, strike=strike, t_years=t, iv=iv, rate=rate,
+    )
+    shares = d * (-100 if side == "put" else 100)
+    hedge_cost = s * shares
+
+    unhedged_start = black_scholes_price(
+        side=side, spot=s, strike=strike, t_years=t, iv=iv, rate=rate,
+    )
+    total_hedge_pnl = 0.0
+
+    for day in range(1, dte_days + 1):
+        s *= math.exp(drift + vol * rng.gauss(0.0, 1.0))
+        t = max(dte_days - day, 0) / 365.0
+        if t <= 0:
+            break
+        if day % rebalance_days == 0:
+            new_d = black_scholes_delta(
+                side=side, spot=s, strike=strike, t_years=t, iv=iv, rate=rate,
+            )
+            new_shares = new_d * (-100 if side == "put" else 100)
+            total_hedge_pnl += (new_shares - shares) * s
+            shares = new_shares
+
+    option_end = black_scholes_price(
+        side=side, spot=s, strike=strike, t_years=0, iv=iv, rate=rate,
+    ) if t <= 0 else black_scholes_price(
+        side=side, spot=s, strike=strike, t_years=t, iv=iv, rate=rate,
+    )
+
+    unhedged_pnl = (option_end - unhedged_start) * 100
+    hedged_pnl = unhedged_pnl + total_hedge_pnl - hedge_cost * rate * dte_days / 365.0
+
+    return {
+        "hedged_pnl": round(hedged_pnl, 2),
+        "unhedged_pnl": round(unhedged_pnl, 2),
+        "hedge_cost": round(abs(total_hedge_pnl), 2),
+    }

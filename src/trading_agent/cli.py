@@ -16,6 +16,7 @@ from trading_agent.brokers.moomoo import (
 )
 from trading_agent.data.earnings import YahooEarningsCalendar
 from trading_agent.data.earnings_calendar import build_earnings_calendar
+from trading_agent.data.iv_history import IV30History
 from trading_agent.data.moomoo_market import MoomooMarket
 from trading_agent.data.news_feeds import GoogleNewsClient
 from trading_agent.data.price_history import YahooPriceHistory
@@ -339,6 +340,7 @@ def _build_cycle(
         earnings_client=YahooEarningsCalendar(),
         price_history=YahooPriceHistory(),
         earnings_calendar=build_earnings_calendar(settings.finnhub_api_key),
+        iv_history=IV30History(settings.root_dir / "runtime" / "iv30_history.json"),
     )
 
 
@@ -383,6 +385,43 @@ def _alert_cycle(settings: Settings, result: Any) -> None:
     text = format_cycle_alert(result, mode=settings.mode)
     if text:
         notifier.send(text)
+
+
+def _update_dashboard(settings: Settings, result: Any) -> None:
+    """Regenerate the HTML dashboard after each cycle (best-effort)."""
+    try:
+        from trading_agent.dashboard import update_dashboard
+        from trading_agent.storage.positions import PositionStore
+
+        store = PositionStore(settings.root_dir / "runtime" / "positions.sqlite")
+        open_pos = [p.__dict__ for p in store.open_positions()]
+
+        from trading_agent.data.iv_history import IV30History
+        iv_hist = IV30History(settings.root_dir / "runtime" / "iv30_history.json")
+        iv_data = iv_hist._data
+
+        import sqlite3
+        audit_path = settings.root_dir / "runtime" / "audit.jsonl"
+        audit_summary = {}
+        if audit_path.exists():
+            for line in audit_path.read_text(encoding="utf-8").strip().splitlines():
+                try:
+                    d = json.loads(line)
+                    et = d.get("event_type", "")
+                    audit_summary[et] = audit_summary.get(et, 0) + 1
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        update_dashboard(
+            root_dir=settings.root_dir,
+            positions=open_pos,
+            recent_exits=getattr(result, "exits", []),
+            recent_entries=getattr(result, "entries", []),
+            iv_history=iv_data,
+            audit_summary=audit_summary,
+        )
+    except Exception:  # noqa: BLE001 - dashboard never blocks trading
+        pass
 
 
 def _write_heartbeat(settings: Settings, note: str) -> None:
@@ -545,6 +584,7 @@ def _run_loop(
         totals["exits"] += len(result.exits)
         totals["errors"] += len(result.errors)
         _alert_cycle(settings, result)
+        _update_dashboard(settings, result)
         _write_heartbeat(settings, "cycle done")
         _print_json(_cycle_payload(result))
 

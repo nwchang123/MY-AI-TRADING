@@ -40,7 +40,7 @@ class UniverseMandate(BaseModel):
 class OptionsMandate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    allowed_opening_actions: list[Literal["buy_call", "buy_put"]]
+    allowed_opening_actions: list[Literal["buy_call", "buy_put", "buy_spread", "sell_spread"]]
     allowed_closing_actions: list[Literal["sell_to_close"]]
     contracts_per_order: int = Field(gt=0)
     min_dte: int = Field(gt=0)

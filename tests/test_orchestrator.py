@@ -152,8 +152,15 @@ class FakeSec:
 def _mandate() -> Mandate:
     # Pin the canonical $100 risk profile so the compounding/cap assertions stay
     # stable when the live paper mandate's capital/caps change (e.g. $500 base).
+    # compounding is pinned ON here because several tests below exercise the
+    # scaling/drawdown-from-peak mechanics; the live paper mandate turned it OFF
+    # on 2026-06-15 (fixed total-loss budget), so the value must be pinned rather
+    # than inherited. At equity == initial it is a no-op (scale 1.0), so tests
+    # that do not move equity are unaffected; the one fixed-cap test overrides it.
     mandate = Mandate.load(Path("config/mandate.paper.yaml"))
-    account = mandate.account.model_copy(update={"initial_capital_usd": 100.0})
+    account = mandate.account.model_copy(
+        update={"initial_capital_usd": 100.0, "compounding": True}
+    )
     options = mandate.options.model_copy(update={"max_contract_cost_usd": 65.0})
     portfolio = mandate.portfolio.model_copy(
         update={
@@ -236,11 +243,18 @@ def test_eligible_candidates_drops_contracts_expiring_before_earnings(
 ) -> None:
     # Pre-earnings (IV-ramp) play: a contract must OUTLIVE the print to carry its
     # event vega, so the one expiring before the earnings date is dropped while
-    # the one expiring after it survives.
+    # the one expiring after it survives. The filter is gated on the IV-ramp
+    # ENTRY strategy (earnings_window_max_days > 0), not the exit safety.
     from trading_agent.execution.orchestrator import CycleResult
 
     base = _mandate()
-    opts = base.options.model_copy(update={"pre_earnings_exit_trading_days": 2})
+    opts = base.options.model_copy(
+        update={
+            "earnings_window_min_days": 10,
+            "earnings_window_max_days": 25,
+            "pre_earnings_exit_trading_days": 2,
+        }
+    )
     mandate = base.model_copy(update={"options": opts})
 
     before = "US.EXAMPLE260622C00005000"  # expires 06-22, BEFORE earnings 06-26
@@ -274,6 +288,37 @@ def test_eligible_candidates_keeps_all_when_pre_earnings_disabled(
         broker=FakeBroker(),
         market=FakeMarket(chain_codes=[before, after]),
         committee=_committee([]),
+    )
+    codes = {
+        c.option_code
+        for c in cycle._eligible_candidates(NOW, "EXAMPLE", CycleResult())
+    }
+    assert codes == {before, after}
+
+
+def test_eligible_candidates_keeps_all_when_only_pre_earnings_exit_set(
+    tmp_path: Path,
+) -> None:
+    # Regression: the pre-earnings EXIT safety must NOT activate the contract-DTE
+    # filter. With IV-ramp entry off (earnings_window_max_days == 0), a contract
+    # expiring before the next print must still survive -- otherwise, in earnings
+    # season every in-window expiry is dropped and the universe goes empty (the
+    # "system never opens a position" failure).
+    from trading_agent.execution.orchestrator import CycleResult
+
+    base = _mandate()
+    opts = base.options.model_copy(update={"pre_earnings_exit_trading_days": 2})
+    mandate = base.model_copy(update={"options": opts})
+
+    before = "US.EXAMPLE260622C00005000"  # expires BEFORE earnings 06-26
+    after = "US.EXAMPLE260710C00005000"  # expires AFTER earnings
+    cycle = _cycle(
+        tmp_path,
+        broker=FakeBroker(),
+        market=FakeMarket(chain_codes=[before, after]),
+        committee=_committee([]),
+        mandate=mandate,
+        earnings_calendar=_FixedEarningsCalendar(date(2026, 6, 26)),
     )
     codes = {
         c.option_code

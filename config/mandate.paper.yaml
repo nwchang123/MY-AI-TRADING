@@ -168,5 +168,9 @@ execution:
   # ceiling (not unlimited) so a runaway bug -- e.g. the duplicate-loop double
   # spend seen 2026-06-15 -- stays capped. The IV-ramp selection's smaller
   # pre-earnings universe makes a normal single-loop day cost well under this.
-  max_daily_llm_tokens: 2000000
+  # RAISED 2M -> 5M on 2026-06-19: pre-screen filters (red flags, weak
+  # catalysts, IV ceiling) now skip ~25% of committee runs before LLM, but
+  # 2M was still exhausted by 25-ticker universes. 5M (~125 committee passes)
+  # covers a full session with headroom. DeepSeek pricing: ~$0.05/day.
+  max_daily_llm_tokens: 5000000
 

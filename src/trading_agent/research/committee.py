@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from trading_agent.domain.evidence import CandidateContext
+from trading_agent.domain.montecarlo import kelly_criterion
 from trading_agent.domain.proposals import OpenPositionProposal, OptionCandidate
 from trading_agent.research.llm import LLMClient, LLMUsage
 from trading_agent.research.redflags import (
@@ -281,6 +282,7 @@ class Committee:
         candidates: list[OptionCandidate] | None = None,
         market_snapshot: dict | None = None,
         price_context: dict | None = None,
+        iv_rank: float | None = None,
     ) -> CommitteeOutput:
         red_flags = detect_red_flags(context, scores)
         # Non-directional critical flags (none today, but future-proofed) still
@@ -332,7 +334,7 @@ class Committee:
         # In candidate mode the options_analyst/PM pick a real listed contract
         # from ``effective`` instead of guessing one; the PM's option_code is
         # then constrained to that set. ``candidates=None`` keeps legacy behavior.
-        candidate_block = self._format_candidates(effective)
+        candidate_block = self._format_candidates(effective, iv_rank=iv_rank)
         candidate_codes = (
             {c.option_code for c in effective} if effective else None
         )
@@ -704,7 +706,13 @@ class Committee:
         )
 
     @staticmethod
-    def _format_candidates(candidates: list[OptionCandidate] | None) -> str:
+    @staticmethod
+    def _format_candidates(
+        candidates: list[OptionCandidate] | None,
+        iv_rank: float | None = None,
+        kelly_tp_pct: float = 100.0,
+        kelly_sl_pct: float = 50.0,
+    ) -> str:
         if not candidates:
             return ""
         lines = [
@@ -716,6 +724,17 @@ class Committee:
             "near the money); breakeven_move is the % the stock must move by "
             "expiry just to break even (closer to 0 = less has to go right)."
         ]
+        if iv_rank is not None:
+            iv_pct = round(iv_rank * 100)
+            if iv_pct >= 70:
+                iv_hint = "IV HIGH -- options are expensive, prefer selling or spread strategies"
+            elif iv_pct <= 30:
+                iv_hint = "IV LOW -- options are cheap, favorable for buying premium"
+            else:
+                iv_hint = "IV moderate"
+            lines.append(
+                f"IV Rank: {iv_pct}% ({iv_hint})"
+            )
         for c in candidates:
             mc = "n/a" if c.mc_pop is None else f"{c.mc_pop}"
             delta = "n/a" if c.delta is None else f"{c.delta:+.2f}"
@@ -724,12 +743,23 @@ class Committee:
                 if c.breakeven_move_pct is None
                 else f"{c.breakeven_move_pct:+.1f}%"
             )
+            # Kelly sizing hint: optimal fraction of bankroll to risk.
+            kelly = "n/a"
+            if c.mc_pop is not None and c.mc_pop > 0:
+                k = kelly_criterion(
+                    win_prob=c.mc_pop,
+                    win_amount=kelly_tp_pct / 100.0,
+                    lose_amount=kelly_sl_pct / 100.0,
+                )
+                if k is not None:
+                    kelly = f"{k:.1%}"
             lines.append(
                 f"  {c.option_code} {c.option_side} strike={c.strike} "
                 f"expiry={c.expiry.isoformat()} DTE={c.dte} bid={c.bid} ask={c.ask} "
                 f"OI={c.open_interest} vol={c.daily_volume} iv={c.iv} "
                 f"delta={delta} breakeven_move={be} "
-                f"est_cost=${c.estimated_contract_cost_usd} mc_pop={mc}"
+                f"est_cost=${c.estimated_contract_cost_usd} mc_pop={mc} "
+                f"kelly={kelly}"
             )
         return "\n".join(lines)
 

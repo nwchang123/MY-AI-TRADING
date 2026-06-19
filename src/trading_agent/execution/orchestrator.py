@@ -28,6 +28,7 @@ from trading_agent.domain.risk import Mandate, PortfolioState, QuoteSnapshot, Ri
 from trading_agent.research.catalysts import build_candidate_context, derive_score_inputs
 from trading_agent.research.committee import Committee, CommitteeOutput
 from trading_agent.research.llm import usage_delta
+from trading_agent.research.redflags import detect_red_flags, nondirectional_critical_flags
 from trading_agent.storage.budget import DailyTokenBudget
 from trading_agent.storage.decisions import DecisionCache, decision_digest
 from trading_agent.research.scoring import score_candidate
@@ -725,12 +726,12 @@ class PaperTradingCycle:
             except Exception:  # noqa: BLE001
                 pass
 
-        # Prefer Moomoo price (real-time), enrich with CBOE iv30 if missing.
+        # Prefer Moomoo price (real-time), always enrich with CBOE iv30 if missing.
         snapshot = moomoo_snap or cboe_snap
         if snapshot is None:
             return None
 
-        if moomoo_snap and cboe_snap and not snapshot.get("iv30"):
+        if not snapshot.get("iv30") and cboe_snap:
             snapshot["iv30"] = cboe_snap.get("iv30", 0)
             snapshot["iv30_change"] = cboe_snap.get("iv30_change", 0)
 
@@ -818,8 +819,75 @@ class PaperTradingCycle:
             return None
 
         price_context = self._price_context(ticker, result)
+
+        # Pre-committee deterministic screen: gather evidence and check red
+        # flags BEFORE invoking the expensive LLM committee.  A ticker with
+        # critical red flags (dilution, stale catalyst) or weak catalyst score
+        # is rejected here at zero LLM cost, saving ~40k tokens per run.
+        evidence = self._gather_evidence(ticker, result)
+        context = build_candidate_context(ticker, evidence, now)
+        scores = score_candidate(derive_score_inputs(context.evidence, now))
+        red_flags = detect_red_flags(context, scores)
+        blockers = nondirectional_critical_flags(red_flags)
+        if blockers:
+            self.audit.append(
+                "pre_screen_reject",
+                {"ticker": ticker, "reasons": [f.code for f in blockers]},
+            )
+            result.rejected.append(
+                {
+                    "ticker": ticker,
+                    "stage": "pre_screen",
+                    "reasons": [
+                        f"blocked by deterministic red flag(s): "
+                        + ", ".join(f.code for f in blockers)
+                    ],
+                }
+            )
+            return None
+
+        # Skip committee when catalyst score is too weak to justify LLM cost.
+        if scores.total < 20.0:
+            self.audit.append(
+                "pre_screen_reject",
+                {"ticker": ticker, "reasons": ["weak_catalyst_score"],
+                 "catalyst_score": scores.total},
+            )
+            result.rejected.append(
+                {
+                    "ticker": ticker,
+                    "stage": "pre_screen",
+                    "reasons": [
+                        f"catalyst score {scores.total:.1f} below threshold 20.0"
+                    ],
+                }
+            )
+            return None
+
+        # Skip committee when ALL candidates have IV above the mandate ceiling.
+        iv_ceiling = self.active_mandate.options.max_entry_iv
+        if iv_ceiling > 0 and candidates:
+            all_over = all(c.iv > iv_ceiling for c in candidates if c.iv > 0)
+            if all_over:
+                self.audit.append(
+                    "pre_screen_reject",
+                    {"ticker": ticker, "reasons": ["all_candidates_iv_over_ceiling"],
+                     "iv_ceiling": iv_ceiling},
+                )
+                result.rejected.append(
+                    {
+                        "ticker": ticker,
+                        "stage": "pre_screen",
+                        "reasons": [
+                            f"all candidate IVs exceed ceiling {iv_ceiling:.0%}"
+                        ],
+                    }
+                )
+                return None
+
         output = self._get_or_run_committee(
-            now, ticker, candidates, snapshot, price_context, result
+            now, ticker, candidates, snapshot, price_context, result,
+            pre_context=context, pre_scores=scores,
         )
         if output is None or output.decision != "open_position" or output.proposal is None:
             return None
@@ -842,11 +910,17 @@ class PaperTradingCycle:
         snapshot: dict | None,
         price_context: dict | None,
         result: CycleResult,
+        pre_context=None,
+        pre_scores=None,
     ):
         """Return committee decision from cache or a fresh LLM run."""
-        evidence = self._gather_evidence(ticker, result)
-        context = build_candidate_context(ticker, evidence, now)
-        scores = score_candidate(derive_score_inputs(context.evidence, now))
+        if pre_context is not None and pre_scores is not None:
+            context = pre_context
+            scores = pre_scores
+        else:
+            evidence = self._gather_evidence(ticker, result)
+            context = build_candidate_context(ticker, evidence, now)
+            scores = score_candidate(derive_score_inputs(context.evidence, now))
 
         digest = decision_digest(
             ticker,
