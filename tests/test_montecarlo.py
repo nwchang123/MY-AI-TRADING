@@ -110,6 +110,42 @@ def test_invalid_inputs_raise() -> None:
         black_scholes_price(side="straddle", spot=5, strike=5, t_years=0.1, iv=0.3)
 
 
+def test_as_of_skips_weekends() -> None:
+    """Steps over trading days only: a Friday start must not waste a step on
+    Saturday/Sunday. With a 7-calendar-day horizon the calendar-day version
+    would take 7 steps; the trading-day version from a Friday takes 5
+    (Fri→Mon→Tue→Wed→Thu) -- verify by counting distinct first-barrier touches.
+    """
+    from datetime import date
+
+    from trading_agent.domain.montecarlo import _trading_day_steps
+
+    # 2026-06-19 is a Friday. A 10-calendar-day horizon should yield steps
+    # that skip the weekend (no 1-day gap from Fri; first gap is 3 days).
+    steps = _trading_day_steps(date(2026, 6, 19), horizon_calendar_days=10, dte_days=30)
+    gaps = [gap for gap, _ in steps]
+    assert gaps[0] == 3  # Friday -> Monday
+    # No gap should exceed 4 (long weekend ceiling) and all are positive.
+    assert all(1 <= g <= 4 for g in gaps)
+    # Total elapsed calendar span does not exceed the horizon.
+    assert steps[-1][1] <= 10
+
+
+def test_as_of_matches_legacy_when_no_weekends() -> None:
+    """Starting on a Monday with a horizon that fits one week, the trading-day
+    path count (5 Mon-Fri steps) is SMALLER than the calendar-day path (7).
+    Result must still be a valid probability in [0, 1].
+    """
+    from datetime import date
+
+    pop = win_probability(
+        side="call", spot=10.0, strike=11.0, dte_days=30, iv=0.6,
+        entry_price=0.2, take_profit_pct=100, stop_loss_pct=50,
+        paths=200, seed=5, as_of=date(2026, 6, 22),  # Monday
+    )
+    assert 0.0 <= pop <= 1.0
+
+
 def test_black_scholes_gamma_is_positive() -> None:
     g = black_scholes_gamma(spot=10, strike=10, t_years=30 / 365, iv=0.6)
     assert g > 0

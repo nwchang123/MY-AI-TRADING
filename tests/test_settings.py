@@ -63,3 +63,12 @@ def test_adversary_llm_defaults_blank(
 
     assert settings.llm_adversary_model == ""
 
+
+def test_telegram_readonly_chat_ids_parsed_from_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRADING_AGENT_TELEGRAM_READONLY_CHAT_IDS", "100, 200,,300")
+
+    settings = Settings.from_env(tmp_path)
+
+    assert settings.telegram_readonly_chat_ids == ("100", "200", "300")

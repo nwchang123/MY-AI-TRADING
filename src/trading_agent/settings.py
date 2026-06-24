@@ -47,6 +47,7 @@ class Settings:
     # Blank disables alerting; a notifier failure never blocks a cycle.
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    telegram_readonly_chat_ids: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls, root_dir: Path | None = None) -> "Settings":
@@ -100,6 +101,13 @@ class Settings:
                 "TRADING_AGENT_TELEGRAM_BOT_TOKEN", ""
             ).strip(),
             telegram_chat_id=os.getenv("TRADING_AGENT_TELEGRAM_CHAT_ID", "").strip(),
+            telegram_readonly_chat_ids=tuple(
+                part.strip()
+                for part in os.getenv(
+                    "TRADING_AGENT_TELEGRAM_READONLY_CHAT_IDS", ""
+                ).split(",")
+                if part.strip()
+            ),
         )
 
     @property

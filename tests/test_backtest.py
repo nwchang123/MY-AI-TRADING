@@ -8,7 +8,9 @@ from trading_agent.backtest import (
     BacktestScenario,
     BacktestStep,
     CostModel,
+    BacktestSweepConfig,
     run_backtest,
+    run_backtest_sweep,
 )
 from trading_agent.cli import main
 from trading_agent.domain.proposals import ExitPlan, OpenPositionProposal
@@ -284,3 +286,50 @@ def test_backtest_cli_outputs_summary(tmp_path: Path, monkeypatch, capsys) -> No
     payload = json.loads(capsys.readouterr().out)
     assert payload["summary"]["trades_opened"] == 1
     assert payload["summary"]["open_positions"] == 1
+
+
+def test_backtest_sweep_ranks_exit_parameters(tmp_path: Path) -> None:
+    scenario = BacktestScenario(
+        steps=[
+            BacktestStep(now=NOW, quote=_quote(), proposal=_proposal()),
+            BacktestStep(now=NEXT, quote=_quote(bid=0.32, ask=0.34, now=NEXT)),
+            BacktestStep(now=DAY3, quote=_quote(bid=0.10, ask=0.12, now=DAY3)),
+        ]
+    )
+
+    result = run_backtest_sweep(
+        BacktestSweepConfig(
+            scenario=scenario,
+            take_profit_pct=[50.0, 100.0],
+            stop_loss_pct=[50.0],
+        ),
+        mandate=_mandate(),
+        root_dir=tmp_path,
+    )
+
+    assert len(result.runs) == 2
+    assert result.best is not None
+    assert result.best.parameters["take_profit_pct"] == 50.0
+    assert result.best.summary["realized_pnl_usd"] == 9
+    assert result.runs[0].rank == 1
+    assert result.runs[1].rank == 2
+
+
+def test_backtest_sweep_deduplicates_parameter_grid(tmp_path: Path) -> None:
+    scenario = BacktestScenario(
+        steps=[BacktestStep(now=NOW, quote=_quote(), proposal=_proposal())]
+    )
+
+    result = run_backtest_sweep(
+        BacktestSweepConfig(
+            scenario=scenario,
+            take_profit_pct=[50.0, 50.0],
+            stop_loss_pct=[30.0, 30.0],
+            max_bid_ask_spread_pct=[10.0, 10.0],
+            min_estimated_win_probability=[0.55, 0.55],
+        ),
+        mandate=_mandate(),
+        root_dir=tmp_path,
+    )
+
+    assert len(result.runs) == 1

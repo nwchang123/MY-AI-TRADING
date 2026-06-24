@@ -91,6 +91,49 @@ def test_loop_can_ignore_market_hours() -> None:
     assert calls["n"] == 2
 
 
+def test_stop_after_close_ends_session_once_market_closes() -> None:
+    # Near-continuous loop: open for 2 ticks, then closed. With stop_after_close
+    # it runs the 2 in-hours cycles, then exits on the first closed tick instead
+    # of skip-spinning to max_iterations.
+    run_cycle, calls = _runner()
+    times = iter([OPEN_UTC, OPEN_UTC, CLOSED_UTC])
+    skips: list = []
+    ran = run_scheduler(
+        run_cycle=run_cycle,
+        is_halted=lambda: False,
+        interval_seconds=60,
+        sleep_fn=lambda _s: None,
+        now_fn=lambda: next(times),
+        max_iterations=50,
+        on_skip=skips.append,
+        stop_after_close=True,
+    )
+    assert ran == 2
+    assert calls["n"] == 2
+    assert skips == ["market closed -- session ended"]
+
+
+def test_stop_after_close_does_not_exit_during_preopen() -> None:
+    # Launched pre-open (closed), then market opens, then closes. The pre-open
+    # skip must NOT end the session (ran == 0); only a close AFTER running does.
+    run_cycle, calls = _runner()
+    times = iter([CLOSED_UTC, OPEN_UTC, CLOSED_UTC])
+    skips: list = []
+    ran = run_scheduler(
+        run_cycle=run_cycle,
+        is_halted=lambda: False,
+        interval_seconds=60,
+        sleep_fn=lambda _s: None,
+        now_fn=lambda: next(times),
+        max_iterations=50,
+        on_skip=skips.append,
+        stop_after_close=True,
+    )
+    assert ran == 1
+    assert calls["n"] == 1
+    assert skips == ["market closed", "market closed -- session ended"]
+
+
 def test_halt_takes_priority_over_market_hours() -> None:
     run_cycle, calls = _runner()
     skips: list = []

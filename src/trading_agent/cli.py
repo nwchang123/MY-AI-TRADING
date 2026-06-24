@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from trading_agent.backtest import run_backtest_file
+from trading_agent.backtest import run_backtest_file, run_backtest_sweep_file
 from trading_agent.brokers.moomoo import (
     MoomooBroker,
     MoomooConnection,
@@ -26,6 +26,7 @@ from trading_agent.domain.evidence import CandidateContext
 from trading_agent.domain.liquidity import LiquidityValidator
 from trading_agent.domain.proposals import OpenPositionProposal
 from trading_agent.domain.risk import Mandate, PortfolioState, QuoteSnapshot, RiskGate
+from trading_agent.domain.spreads import SpreadAnalysisRequest, analyze_spread
 from trading_agent.execution.live import LIVE_UNLOCK_CHECKLIST, live_position_cap
 from trading_agent.execution.lock import single_instance_lock
 from trading_agent.notify import TelegramNotifier, format_cycle_alert
@@ -35,6 +36,7 @@ from trading_agent.reporting import (
     build_calibration_report,
     build_daily_report,
     build_funnel_report,
+    build_portfolio_risk_report,
     read_audit_events,
 )
 from trading_agent.research.catalysts import build_candidate_context, derive_score_inputs
@@ -51,6 +53,7 @@ from trading_agent.settings import Settings
 from trading_agent.storage.audit import AuditWriter
 from trading_agent.storage.budget import DailyTokenBudget
 from trading_agent.storage.decisions import DecisionCache
+from trading_agent.storage.live_counter import LiveTradeCounter
 from trading_agent.storage.positions import PositionStore
 from trading_agent.storage.probes import ProbeCache
 from trading_agent.storage.sqlite import SnapshotStore
@@ -176,6 +179,8 @@ def _build_committee(settings: Settings) -> Committee:
         pre_earnings_exit_trading_days=mandate.options.pre_earnings_exit_trading_days,
         earnings_window_max_days=mandate.options.earnings_window_max_days,
         veto_win_prob_penalty=mandate.options.veto_win_prob_penalty,
+        default_take_profit_pct=mandate.options.default_take_profit_pct,
+        default_stop_loss_pct=mandate.options.default_stop_loss_pct,
     )
 
 
@@ -200,7 +205,14 @@ def _run_committee(settings: Settings, input_path: Path) -> bool:
             "output": output_payload,
         },
     )
-    audit.append("llm_usage", {"ticker": context.ticker, **usage.model_dump(mode="json")})
+    audit.append(
+        "llm_usage",
+        {
+            "ticker": context.ticker,
+            **usage.model_dump(mode="json"),
+            "total_tokens": usage.total_tokens,
+        },
+    )
     _print_json(output_payload)
     return output.decision == "open_position"
 
@@ -308,6 +320,7 @@ def _build_cycle(
     *,
     trd_env: str,
     max_open_positions_override: int | None = None,
+    on_position_closed: Callable[[str, str, float | None], None] | None = None,
 ) -> PaperTradingCycle:
     mandate = Mandate.load(settings.mandate_path)
     committee = _build_committee(settings)
@@ -341,6 +354,7 @@ def _build_cycle(
         price_history=YahooPriceHistory(),
         earnings_calendar=build_earnings_calendar(settings.finnhub_api_key),
         iv_history=IV30History(settings.root_dir / "runtime" / "iv30_history.json"),
+        on_position_closed=on_position_closed,
     )
 
 
@@ -349,6 +363,8 @@ def _cycle_payload(result: Any) -> dict[str, Any]:
         "halted": result.halted,
         "circuit_breaker": result.circuit_breaker,
         "reconciled_closed": result.reconciled_closed,
+        "adopted": result.adopted,
+        "open_orders_cancelled": result.open_orders_cancelled,
         "exits": result.exits,
         "entries": result.entries,
         "rejected": result.rejected,
@@ -387,20 +403,35 @@ def _alert_cycle(settings: Settings, result: Any) -> None:
         notifier.send(text)
 
 
+def _notify_web_dashboard(settings: Settings, url: str) -> None:
+    notifier = _notifier(settings)
+    if notifier is None:
+        print(f"web dashboard link: {url}")
+        return
+    sent = notifier.send(
+        "Web dashboard is online:\n"
+        f"{url}\n"
+        "This localhost link opens on the trading PC."
+    )
+    _audit_writer(settings).append(
+        "web_dashboard_link_sent",
+        {"url": url, "sent": sent},
+    )
+    print(f"web dashboard link sent: {url}")
+
+
 def _update_dashboard(settings: Settings, result: Any) -> None:
     """Regenerate the HTML dashboard after each cycle (best-effort)."""
     try:
         from trading_agent.dashboard import update_dashboard
-        from trading_agent.storage.positions import PositionStore
-
-        store = PositionStore(settings.root_dir / "runtime" / "positions.sqlite")
-        open_pos = [p.__dict__ for p in store.open_positions()]
-
         from trading_agent.data.iv_history import IV30History
+
+        store = _position_store(settings)
+        open_pos = [_plain_record(p) for p in store.open_positions()]
+
         iv_hist = IV30History(settings.root_dir / "runtime" / "iv30_history.json")
         iv_data = iv_hist._data
 
-        import sqlite3
         audit_path = settings.root_dir / "runtime" / "audit.jsonl"
         audit_summary = {}
         if audit_path.exists():
@@ -415,13 +446,27 @@ def _update_dashboard(settings: Settings, result: Any) -> None:
         update_dashboard(
             root_dir=settings.root_dir,
             positions=open_pos,
-            recent_exits=getattr(result, "exits", []),
-            recent_entries=getattr(result, "entries", []),
+            recent_exits=[_plain_record(p) for p in getattr(result, "exits", [])],
+            recent_entries=[_plain_record(p) for p in getattr(result, "entries", [])],
             iv_history=iv_data,
             audit_summary=audit_summary,
         )
-    except Exception:  # noqa: BLE001 - dashboard never blocks trading
-        pass
+    except ImportError:
+        pass  # dashboard module optional
+    except Exception as exc:  # noqa: BLE001 - dashboard never blocks trading
+        print(f"dashboard update failed: {exc}", file=sys.stderr)
+
+
+def _plain_record(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return model_dump(mode="json")
+    data = getattr(value, "__dict__", None)
+    if isinstance(data, dict):
+        return dict(data)
+    return {"value": value}
 
 
 def _write_heartbeat(settings: Settings, note: str) -> None:
@@ -494,32 +539,37 @@ def _auto_universe(settings: Settings, max_tickers: int) -> list[str]:
                 return {}
 
     watchlist = {t.strip().upper() for t in mandate.universe.watchlist if t.strip()}
-    tickers = select_universe(
-        market=market,
-        provider=provider,
-        universe=mandate.universe,
-        max_tickers=max_tickers,
-        probe=probe,
-        skip_tickers=skip,
-        priority_tickers=priority,
-        industry_of=industry_of,
-        earnings_of=earnings_of,
-        watchlist=watchlist,
-    )
-    _audit_writer(settings).append(
-        "universe_selected",
-        {
-            "tickers": tickers,
-            "max_tickers": max_tickers,
-            "skipped_fresh_rejections": sorted(skip),
-            "event_seeds": sorted(priority & set(tickers)),
-            "probe_fetches": probe.fetch_count,
-            "probe_cache_hits": probe.cache_hits,
-            "earnings_window": earnings_window,
-        },
-    )
-    print(f"auto universe: {', '.join(tickers) or '(none)'}", file=sys.stderr)
-    return tickers
+    try:
+        tickers = select_universe(
+            market=market,
+            provider=provider,
+            universe=mandate.universe,
+            max_tickers=max_tickers,
+            probe=probe,
+            skip_tickers=skip,
+            priority_tickers=priority,
+            industry_of=industry_of,
+            earnings_of=earnings_of,
+            watchlist=watchlist,
+        )
+        _audit_writer(settings).append(
+            "universe_selected",
+            {
+                "tickers": tickers,
+                "max_tickers": max_tickers,
+                "skipped_fresh_rejections": sorted(skip),
+                "event_seeds": sorted(priority & set(tickers)),
+                "probe_fetches": probe.fetch_count,
+                "probe_cache_hits": probe.cache_hits,
+                "earnings_window": earnings_window,
+            },
+        )
+        print(f"auto universe: {', '.join(tickers) or '(none)'}", file=sys.stderr)
+        return tickers
+    finally:
+        close = getattr(market, "close", None)
+        if close is not None:
+            close()
 
 
 def _resolve_tickers(settings: Settings, args: Any) -> list[str]:
@@ -561,9 +611,10 @@ def _run_loop(
             # Fail fast on a dead gateway: the SDK would otherwise retry the
             # connection forever and silently hang the whole session.
             assert_opend_reachable(settings.moomoo_host, settings.moomoo_port)
-            tickers = tickers_fn()
             with single_instance_lock(_cycle_lock_path(settings)):
-                result = _build_cycle(settings, trd_env="SIMULATE").run_once(tickers)
+                result = _build_cycle(settings, trd_env="SIMULATE").run_once_lazy(
+                    tickers_fn
+                )
         except Exception as exc:  # noqa: BLE001
             _audit_writer(settings).append("cycle_crashed", {"error": str(exc)})
             print(f"cycle crashed: {exc}", file=sys.stderr)
@@ -623,6 +674,10 @@ def _run_loop(
     print(f"run-loop finished: {ran} cycle(s) executed", file=sys.stderr)
 
 
+def _live_counter(settings: Settings) -> LiveTradeCounter:
+    return LiveTradeCounter(settings.root_dir / "runtime" / "live_counter.json")
+
+
 def _run_live(settings: Settings, tickers: list[str]) -> None:
     if settings.mode != "live":
         raise RuntimeError("run-live requires TRADING_AGENT_MODE=live.")
@@ -630,25 +685,71 @@ def _run_live(settings: Settings, tickers: list[str]) -> None:
     settings.assert_live_startup_allowed()
 
     mandate = Mandate.load(settings.mandate_path)
-    live_trades = len(_position_store(settings).all_positions())
-    cap = live_position_cap(mandate.portfolio.max_open_positions, live_trades)
+    counter = _live_counter(settings)
+    state = counter.load()
+    cap = live_position_cap(
+        mandate.portfolio.max_open_positions, state.reviewed_count
+    )
+
+    def _on_close(option_code: str, reason: str, price: float | None) -> None:
+        new_total = counter.increment_completed()
+        _audit_writer(settings).append(
+            "live_trade_completed",
+            {
+                "option_code": option_code,
+                "reason": reason,
+                "exit_price": price,
+                "trades_completed": new_total,
+                "reviewed_count": counter.load().reviewed_count,
+            },
+        )
 
     print(LIVE_UNLOCK_CHECKLIST, file=sys.stderr)
     _audit_writer(settings).append(
         "live_session_start",
         {
             "account_id": settings.account_id,
-            "live_trades_so_far": live_trades,
+            "trades_completed": state.trades_completed,
+            "reviewed_count": state.reviewed_count,
             "position_cap": cap,
             "tickers": tickers,
         },
     )
     with single_instance_lock(_cycle_lock_path(settings)):
         result = _build_cycle(
-            settings, trd_env="REAL", max_open_positions_override=cap
+            settings,
+            trd_env="REAL",
+            max_open_positions_override=cap,
+            on_position_closed=_on_close,
         ).run_once(tickers)
     _alert_cycle(settings, result)
     _print_json(_cycle_payload(result))
+
+
+def _review_live(settings: Settings) -> None:
+    """Increment the reviewed count and show the ramp status."""
+    counter = _live_counter(settings)
+    new_reviewed = counter.increment_reviewed()
+    state = counter.load()
+    mandate = Mandate.load(settings.mandate_path)
+    cap = live_position_cap(mandate.portfolio.max_open_positions, state.reviewed_count)
+    _audit_writer(settings).append(
+        "live_trade_reviewed",
+        {
+            "reviewed_count": new_reviewed,
+            "trades_completed": state.trades_completed,
+            "new_position_cap": cap,
+        },
+    )
+    _print_json(
+        {
+            "reviewed_count": new_reviewed,
+            "trades_completed": state.trades_completed,
+            "position_cap": cap,
+            "mandate_max": mandate.portfolio.max_open_positions,
+            "status": "ramp" if cap < mandate.portfolio.max_open_positions else "full",
+        }
+    )
 
 
 def _backup(settings: Settings) -> None:
@@ -661,7 +762,7 @@ def _backup(settings: Settings) -> None:
     target = runtime / "backups" / stamp
     target.mkdir(parents=True, exist_ok=True)
     copied: list[str] = []
-    for pattern in ("*.sqlite", "audit.jsonl", "heartbeat.json"):
+    for pattern in ("*.sqlite", "audit.jsonl", "heartbeat.json", "live_counter.json"):
         for source in runtime.glob(pattern):
             shutil.copy2(source, target / source.name)
             copied.append(source.name)
@@ -669,19 +770,23 @@ def _backup(settings: Settings) -> None:
 
 
 def _report(settings: Settings, on_date: date | None) -> None:
-    events = read_audit_events(settings.root_dir / "runtime" / "audit.jsonl")
     target = on_date or datetime.now(timezone.utc).date()
+    events = read_audit_events(settings.root_dir / "runtime" / "audit.jsonl", target)
     _print_json(build_daily_report(events, target))
 
 
 def _funnel(settings: Settings, on_date: date | None) -> None:
-    events = read_audit_events(settings.root_dir / "runtime" / "audit.jsonl")
+    events = read_audit_events(settings.root_dir / "runtime" / "audit.jsonl", on_date)
     _print_json(build_funnel_report(events, on_date))
 
 
 def _calibration(settings: Settings, on_date: date | None) -> None:
-    events = read_audit_events(settings.root_dir / "runtime" / "audit.jsonl")
+    events = read_audit_events(settings.root_dir / "runtime" / "audit.jsonl", on_date)
     _print_json(build_calibration_report(events, on_date))
+
+
+def _portfolio_risk(settings: Settings) -> None:
+    _print_json(build_portfolio_risk_report(_position_store(settings).open_positions()))
 
 
 def _run_backtest(settings: Settings, input_path: Path) -> None:
@@ -692,6 +797,29 @@ def _run_backtest(settings: Settings, input_path: Path) -> None:
         # Keep offline replays independent from the operator's live/paper HALT
         # file while still exercising RiskGate's kill-switch path.
         root_dir=settings.root_dir / "runtime" / "backtest_sandbox",
+    )
+    _print_json(result.model_dump(mode="json"))
+
+
+def _run_backtest_sweep(settings: Settings, input_path: Path) -> None:
+    mandate = Mandate.load(settings.mandate_path)
+    result = run_backtest_sweep_file(
+        input_path,
+        mandate=mandate,
+        root_dir=settings.root_dir / "runtime" / "backtest_sandbox",
+    )
+    _print_json(result.model_dump(mode="json"))
+
+
+def _analyze_strategy(input_path: Path) -> None:
+    request = SpreadAnalysisRequest.model_validate_json(
+        input_path.read_text(encoding="utf-8")
+    )
+    result = analyze_spread(
+        request.legs,
+        strategy=request.strategy,
+        underlying_price=request.underlying_price,
+        price_points=request.price_points,
     )
     _print_json(result.model_dump(mode="json"))
 
@@ -822,14 +950,48 @@ def _build_parser() -> argparse.ArgumentParser:
     calibration_parser.add_argument(
         "--date", default=None, help="UTC date YYYY-MM-DD (default: all events)"
     )
+    subparsers.add_parser(
+        "portfolio-risk",
+        help="Show open-position Greeks, theta decay, and simple shock P/L",
+    )
     backtest_parser = subparsers.add_parser(
         "backtest",
         help="Replay offline proposals and option quotes through the risk/exit engine",
     )
     backtest_parser.add_argument("--input", required=True, type=Path)
+    sweep_parser = subparsers.add_parser(
+        "backtest-sweep",
+        help="Batch-test TP/SL and gate thresholds over one offline scenario",
+    )
+    sweep_parser.add_argument("--input", required=True, type=Path)
+    strategy_parser = subparsers.add_parser(
+        "strategy-analyze",
+        help="Analyze payoff, breakevens, and max risk for a multi-leg option strategy",
+    )
+    strategy_parser.add_argument("--input", required=True, type=Path)
     halt_parser = subparsers.add_parser("halt", help="Activate the local kill switch")
     halt_parser.add_argument("--reason", default="operator halt")
     subparsers.add_parser("resume", help="Clear the local kill switch")
+    subparsers.add_parser(
+        "review-live",
+        help="Acknowledge one reviewed live trade (widens ramp toward mandate max)",
+    )
+    web_parser = subparsers.add_parser(
+        "web-dashboard",
+        help="Start the local read-only web dashboard (127.0.0.1:8765)",
+    )
+    web_parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    web_parser.add_argument("--port", type=int, default=8765, help="Port (default: 8765)")
+    web_parser.add_argument(
+        "--token",
+        default="",
+        help="Optional shared token required for dashboard/API access",
+    )
+    notify_web_parser = subparsers.add_parser(
+        "notify-web-dashboard",
+        help="Send the web dashboard URL to the configured Telegram chat",
+    )
+    notify_web_parser.add_argument("--url", required=True)
     return parser
 
 
@@ -918,8 +1080,17 @@ def main() -> None:
         on_date = date.fromisoformat(args.date) if args.date else None
         _calibration(settings, on_date)
         return
+    if args.command == "portfolio-risk":
+        _portfolio_risk(settings)
+        return
     if args.command == "backtest":
         _run_backtest(settings, args.input)
+        return
+    if args.command == "backtest-sweep":
+        _run_backtest_sweep(settings, args.input)
+        return
+    if args.command == "strategy-analyze":
+        _analyze_strategy(args.input)
         return
     if args.command == "halt":
         halt_path = _halt_path(settings)
@@ -938,5 +1109,26 @@ def main() -> None:
         )
         print(f"Kill switch cleared: {_display_path(halt_path, settings)}")
         return
+    if args.command == "review-live":
+        _review_live(settings)
+        return
+    if args.command == "web-dashboard":
+        from trading_agent.web_dashboard.server import serve
+
+        serve(
+            settings.root_dir,
+            host=args.host,
+            port=args.port,
+            mode=settings.mode,
+            web_token=args.token,
+        )
+        return
+    if args.command == "notify-web-dashboard":
+        _notify_web_dashboard(settings, args.url)
+        return
 
     raise RuntimeError(f"Unsupported command: {args.command}")
+
+
+if __name__ == "__main__":
+    main()

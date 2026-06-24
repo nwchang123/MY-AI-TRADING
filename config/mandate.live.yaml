@@ -38,6 +38,11 @@ options:
   min_estimated_win_probability: 0.55
   # Deterministic Monte Carlo no-edge baseline floor (see paper mandate).
   min_monte_carlo_pop: 0.2
+  min_abs_delta: 0.20
+  max_gamma_per_contract: 2.0
+  max_theta_decay_pct_per_day: 8.0
+  max_iv_rank_for_long_premium: 0.80
+  iv_crush_exit_drop_pct: 25.0
 
 portfolio:
   max_open_positions: 1
@@ -64,4 +69,3 @@ execution:
   kill_switch_file: runtime/HALT
   no_entry_minutes_after_open: 15
   max_daily_llm_tokens: 300000
-

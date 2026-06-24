@@ -169,6 +169,7 @@ def select_universe(
     industry_of: Callable[[list[str]], dict[str, str]] | None = None,
     max_per_industry: int = DEFAULT_MAX_PER_INDUSTRY,
     earnings_of: Callable[[list[str]], dict[str, date]] | None = None,
+    watchlist: Iterable[str] = (),
 ) -> list[str]:
     """Autonomously pick today's candidate tickers.
 
@@ -259,6 +260,9 @@ def select_universe(
             ),
             reverse=True,
         )
+
+    wl = [str(t).strip().upper() for t in watchlist if str(t).strip()]
+    ranked = _dedupe(wl) + [t for t in ranked if t not in set(wl)]
 
     industries: dict[str, str] = {}
     if industry_of is not None and (max_per_industry > 0 or excluded_industries):

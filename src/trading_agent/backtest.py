@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from trading_agent.domain.calendar import market_date
 from trading_agent.domain.liquidity import LiquidityValidator
@@ -78,6 +78,64 @@ class BacktestResult(BaseModel):
     events: list[dict[str, Any]]
     open_positions: list[dict[str, Any]]
     closed_trades: list[dict[str, Any]]
+
+
+class BacktestSweepConfig(BaseModel):
+    """Batch parameter grid over the same deterministic replay scenario."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scenario: BacktestScenario
+    take_profit_pct: list[float] = Field(default_factory=lambda: [100.0])
+    stop_loss_pct: list[float] = Field(default_factory=lambda: [50.0])
+    max_bid_ask_spread_pct: list[float] | None = None
+    min_estimated_win_probability: list[float] | None = None
+
+    @field_validator("take_profit_pct", "stop_loss_pct")
+    @classmethod
+    def validate_positive_grid(cls, values: list[float]) -> list[float]:
+        if not values:
+            raise ValueError("sweep grid cannot be empty")
+        if any(value <= 0 for value in values):
+            raise ValueError("sweep grid values must be positive")
+        return values
+
+    @field_validator("max_bid_ask_spread_pct")
+    @classmethod
+    def validate_spread_grid(cls, values: list[float] | None) -> list[float] | None:
+        if values is None:
+            return None
+        if not values:
+            raise ValueError("max_bid_ask_spread_pct cannot be empty")
+        if any(value <= 0 for value in values):
+            raise ValueError("max_bid_ask_spread_pct values must be positive")
+        return values
+
+    @field_validator("min_estimated_win_probability")
+    @classmethod
+    def validate_probability_grid(cls, values: list[float] | None) -> list[float] | None:
+        if values is None:
+            return None
+        if not values:
+            raise ValueError("min_estimated_win_probability cannot be empty")
+        if any(value < 0 or value > 1 for value in values):
+            raise ValueError("min_estimated_win_probability values must be in [0, 1]")
+        return values
+
+
+class BacktestSweepRun(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rank: int
+    parameters: dict[str, float]
+    summary: dict[str, Any]
+
+
+class BacktestSweepResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    best: BacktestSweepRun | None
+    runs: list[BacktestSweepRun]
 
 
 @dataclass
@@ -179,10 +237,99 @@ def load_backtest_scenario(path: Path) -> BacktestScenario:
     return BacktestScenario.model_validate_json(path.read_text(encoding="utf-8"))
 
 
+def load_backtest_sweep_config(path: Path) -> BacktestSweepConfig:
+    return BacktestSweepConfig.model_validate_json(path.read_text(encoding="utf-8"))
+
+
 def run_backtest_file(
     path: Path, *, mandate: Mandate, root_dir: Path
 ) -> BacktestResult:
     return run_backtest(load_backtest_scenario(path), mandate=mandate, root_dir=root_dir)
+
+
+def run_backtest_sweep_file(
+    path: Path, *, mandate: Mandate, root_dir: Path
+) -> BacktestSweepResult:
+    return run_backtest_sweep(
+        load_backtest_sweep_config(path), mandate=mandate, root_dir=root_dir
+    )
+
+
+def run_backtest_sweep(
+    config: BacktestSweepConfig, *, mandate: Mandate, root_dir: Path
+) -> BacktestSweepResult:
+    """Run a TP/SL and gate-threshold grid against one offline scenario."""
+
+    take_profit_grid = _unique_floats(config.take_profit_pct)
+    stop_loss_grid = _unique_floats(config.stop_loss_pct)
+    spread_grid = _unique_floats(config.max_bid_ask_spread_pct or [
+        mandate.options.max_bid_ask_spread_pct
+    ])
+    win_grid = _unique_floats(config.min_estimated_win_probability or [
+        mandate.options.min_estimated_win_probability
+    ])
+    runs: list[BacktestSweepRun] = []
+    for take_profit in take_profit_grid:
+        for stop_loss in stop_loss_grid:
+            scenario = _scenario_with_exit_grid(
+                config.scenario,
+                take_profit_pct=take_profit,
+                stop_loss_pct=stop_loss,
+            )
+            for spread_cap in spread_grid:
+                for win_floor in win_grid:
+                    run_mandate = mandate.model_copy(
+                        update={
+                            "options": mandate.options.model_copy(
+                                update={
+                                    "max_bid_ask_spread_pct": spread_cap,
+                                    "min_estimated_win_probability": win_floor,
+                                }
+                            )
+                        }
+                    )
+                    result = run_backtest(
+                        scenario, mandate=run_mandate, root_dir=root_dir
+                    )
+                    runs.append(
+                        BacktestSweepRun(
+                            rank=0,
+                            parameters={
+                                "take_profit_pct": take_profit,
+                                "stop_loss_pct": stop_loss,
+                                "max_bid_ask_spread_pct": spread_cap,
+                                "min_estimated_win_probability": win_floor,
+                            },
+                            summary=result.summary,
+                        )
+                    )
+
+    ranked = sorted(
+        runs,
+        key=lambda run: (
+            float(run.summary.get("ending_equity_usd") or 0.0),
+            -float(run.summary.get("max_drawdown_usd") or 0.0),
+            float(run.summary.get("profit_factor") or 0.0),
+        ),
+        reverse=True,
+    )
+    ranked = [
+        run.model_copy(update={"rank": idx + 1})
+        for idx, run in enumerate(ranked)
+    ]
+    return BacktestSweepResult(best=ranked[0] if ranked else None, runs=ranked)
+
+
+def _unique_floats(values: list[float]) -> list[float]:
+    unique: list[float] = []
+    seen: set[float] = set()
+    for value in values:
+        key = round(float(value), 10)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(float(value))
+    return unique
 
 
 def run_backtest(
@@ -260,6 +407,30 @@ def run_backtest(
         open_positions=[_open_payload(trade, last_quotes.get(trade.option_code)) for trade in open_trades],
         closed_trades=[_closed_payload(trade) for trade in closed_trades],
     )
+
+
+def _scenario_with_exit_grid(
+    scenario: BacktestScenario,
+    *,
+    take_profit_pct: float,
+    stop_loss_pct: float,
+) -> BacktestScenario:
+    steps: list[BacktestStep] = []
+    for step in scenario.steps:
+        proposal = step.proposal
+        if proposal is not None:
+            proposal = proposal.model_copy(
+                update={
+                    "exit_plan": proposal.exit_plan.model_copy(
+                        update={
+                            "take_profit_pct": take_profit_pct,
+                            "stop_loss_pct": stop_loss_pct,
+                        }
+                    )
+                }
+            )
+        steps.append(step.model_copy(update={"proposal": proposal}, deep=True))
+    return scenario.model_copy(update={"steps": steps}, deep=True)
 
 
 def _quotes_by_code(step: BacktestStep) -> dict[str, QuoteSnapshot]:

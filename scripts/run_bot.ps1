@@ -19,6 +19,11 @@ $log = Join-Path $logDir "bot.log"
 while ($true) {
     Add-Content -Path $log -Value "=== bot start $(Get-Date -Format o) ==="
     cmd /c "python -m trading_agent bot >> `"$log`" 2>&1"
-    Add-Content -Path $log -Value "=== bot exited $(Get-Date -Format o), restarting in 10s ==="
+    $code = $LASTEXITCODE
+    Add-Content -Path $log -Value "=== bot exited $(Get-Date -Format o), code=$code ==="
+    if ($code -eq 0) {
+        break
+    }
+    Add-Content -Path $log -Value "=== restarting in 10s ==="
     Start-Sleep -Seconds 10
 }

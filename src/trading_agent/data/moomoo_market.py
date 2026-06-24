@@ -207,13 +207,14 @@ def to_quote_snapshot(
 class MoomooMarket:
     """Quote-side adapter: small-cap screener, option chain, and live quotes.
 
-    Live methods open an ``OpenQuoteContext`` against OpenD and always close it.
+    Live methods reuse one ``OpenQuoteContext`` per adapter instance.
     Deterministic parsing lives in the module-level helpers above so it can be
     unit tested without OpenD.
     """
 
     def __init__(self, connection: MoomooConnection):
         self.connection = connection
+        self._quote_ctx: Any | None = None
 
     def scan_small_caps(
         self, universe: UniverseMandate, *, page_size: int = 200, max_rows: int = 1000
@@ -231,24 +232,21 @@ class MoomooMarket:
         quote_ctx = self._quote_context(sdk)
         parsed: list[dict[str, Any]] = []
         begin = 0
-        try:
-            filters = build_universe_filters(universe, sdk)
-            while len(parsed) < max_rows:
-                ret, data = quote_ctx.get_stock_filter(
-                    market=sdk.Market.US,
-                    filter_list=filters,
-                    begin=begin,
-                    num=page_size,
-                )
-                self._require_ok(sdk, ret, data, "get_stock_filter")
-                last_page, _all_count, rows = data
-                parsed.extend(parse_filter_rows(rows))
-                begin += len(rows)
-                if last_page or not rows:
-                    break
-            return parsed[:max_rows]
-        finally:
-            quote_ctx.close()
+        filters = build_universe_filters(universe, sdk)
+        while len(parsed) < max_rows:
+            ret, data = quote_ctx.get_stock_filter(
+                market=sdk.Market.US,
+                filter_list=filters,
+                begin=begin,
+                num=page_size,
+            )
+            self._require_ok(sdk, ret, data, "get_stock_filter")
+            last_page, _all_count, rows = data
+            parsed.extend(parse_filter_rows(rows))
+            begin += len(rows)
+            if last_page or not rows:
+                break
+        return parsed[:max_rows]
 
     def industry_plates(self, codes: list[str]) -> dict[str, str]:
         """Industry plate name per stock code, from one batched get_owner_plate.
@@ -263,30 +261,24 @@ class MoomooMarket:
             return {}
         sdk = self._sdk()
         quote_ctx = self._quote_context(sdk)
-        try:
-            ret, data = quote_ctx.get_owner_plate(code_list=codes)
-            self._require_ok(sdk, ret, data, "get_owner_plate")
-            plates: dict[str, str] = {}
-            for row in data.to_dict(orient="records"):
-                if str(row.get("plate_type") or "").upper() != "INDUSTRY":
-                    continue
-                code = row.get("code")
-                name = row.get("plate_name")
-                if code and name and code not in plates:
-                    plates[str(code)] = str(name)
-            return plates
-        finally:
-            quote_ctx.close()
+        ret, data = quote_ctx.get_owner_plate(code_list=codes)
+        self._require_ok(sdk, ret, data, "get_owner_plate")
+        plates: dict[str, str] = {}
+        for row in data.to_dict(orient="records"):
+            if str(row.get("plate_type") or "").upper() != "INDUSTRY":
+                continue
+            code = row.get("code")
+            name = row.get("plate_name")
+            if code and name and code not in plates:
+                plates[str(code)] = str(name)
+        return plates
 
     def option_expirations(self, code: str) -> list[dict[str, Any]]:
         sdk = self._sdk()
         quote_ctx = self._quote_context(sdk)
-        try:
-            ret, data = quote_ctx.get_option_expiration_date(code=code)
-            self._require_ok(sdk, ret, data, "get_option_expiration_date")
-            return data.to_dict(orient="records")
-        finally:
-            quote_ctx.close()
+        ret, data = quote_ctx.get_option_expiration_date(code=code)
+        self._require_ok(sdk, ret, data, "get_option_expiration_date")
+        return data.to_dict(orient="records")
 
     def is_optionable(self, code: str) -> bool:
         return bool(self.option_expirations(code))
@@ -300,14 +292,11 @@ class MoomooMarket:
     ) -> list[dict[str, Any]]:
         sdk = self._sdk()
         quote_ctx = self._quote_context(sdk)
-        try:
-            ret, data = quote_ctx.get_option_chain(
-                code=code, start=start, end=end, option_type=option_type
-            )
-            self._require_ok(sdk, ret, data, "get_option_chain")
-            return data.to_dict(orient="records")
-        finally:
-            quote_ctx.close()
+        ret, data = quote_ctx.get_option_chain(
+            code=code, start=start, end=end, option_type=option_type
+        )
+        self._require_ok(sdk, ret, data, "get_option_chain")
+        return data.to_dict(orient="records")
 
     def is_listed_option(self, option_code: str) -> bool:
         """Confirm a proposed option code is a real, listed contract.
@@ -332,32 +321,29 @@ class MoomooMarket:
         sdk = self._sdk()
         quote_ctx = self._quote_context(sdk)
         observed_at = now or datetime.now(timezone.utc)
-        try:
-            ret, data = quote_ctx.subscribe(
-                [option_code], [sdk.SubType.QUOTE, sdk.SubType.ORDER_BOOK]
-            )
-            self._require_ok(sdk, ret, data, "subscribe")
+        ret, data = quote_ctx.subscribe(
+            [option_code], [sdk.SubType.QUOTE, sdk.SubType.ORDER_BOOK]
+        )
+        self._require_ok(sdk, ret, data, "subscribe")
 
-            ret, order_book = quote_ctx.get_order_book(option_code)
-            self._require_ok(sdk, ret, order_book, "get_order_book")
-            bid, ask = best_bid_ask(order_book)
+        ret, order_book = quote_ctx.get_order_book(option_code)
+        self._require_ok(sdk, ret, order_book, "get_order_book")
+        bid, ask = best_bid_ask(order_book)
 
-            ret, snapshot = quote_ctx.get_market_snapshot([option_code])
-            self._require_ok(sdk, ret, snapshot, "get_market_snapshot")
-            row = snapshot.to_dict(orient="records")[0]
+        ret, snapshot = quote_ctx.get_market_snapshot([option_code])
+        self._require_ok(sdk, ret, snapshot, "get_market_snapshot")
+        row = snapshot.to_dict(orient="records")[0]
 
-            return to_quote_snapshot(
-                option_code=option_code,
-                bid=bid,
-                ask=ask,
-                open_interest=int(row.get("option_open_interest") or 0),
-                daily_volume=int(row.get("volume") or 0),
-                lot_size=lot_size,
-                expiry=expiry,
-                observed_at=observed_at,
-            )
-        finally:
-            quote_ctx.close()
+        return to_quote_snapshot(
+            option_code=option_code,
+            bid=bid,
+            ask=ask,
+            open_interest=int(row.get("option_open_interest") or 0),
+            daily_volume=int(row.get("volume") or 0),
+            lot_size=lot_size,
+            expiry=expiry,
+            observed_at=observed_at,
+        )
 
     def stock_snapshot(self, ticker: str) -> dict[str, Any]:
         """Get real-time stock snapshot from Moomoo OpenD.
@@ -367,56 +353,63 @@ class MoomooMarket:
         """
         sdk = self._sdk()
         quote_ctx = self._quote_context(sdk)
-        try:
-            # Add US. prefix if not present
-            code = ticker.upper() if ticker.upper().startswith("US.") else f"US.{ticker.upper()}"
+        # Add US. prefix if not present
+        code = ticker.upper() if ticker.upper().startswith("US.") else f"US.{ticker.upper()}"
 
-            # Subscribe to get real-time quotes
-            ret, data = quote_ctx.subscribe([code], [sdk.SubType.QUOTE])
-            self._require_ok(sdk, ret, data, "subscribe")
+        # Subscribe to get real-time quotes
+        ret, data = quote_ctx.subscribe([code], [sdk.SubType.QUOTE])
+        self._require_ok(sdk, ret, data, "subscribe")
 
-            # Get market snapshot
-            ret, snapshot = quote_ctx.get_market_snapshot([code])
-            self._require_ok(sdk, ret, snapshot, "get_market_snapshot")
+        # Get market snapshot
+        ret, snapshot = quote_ctx.get_market_snapshot([code])
+        self._require_ok(sdk, ret, snapshot, "get_market_snapshot")
 
-            row = snapshot.to_dict(orient="records")[0]
+        row = snapshot.to_dict(orient="records")[0]
 
-            # Extract relevant fields
-            last_price = float(row.get("last_price") or 0)
-            prev_close = float(row.get("prev_close_price") or 0)
-            open_price = float(row.get("open") or 0)
-            high = float(row.get("high_price") or 0)
-            low = float(row.get("low_price") or 0)
-            volume = int(row.get("volume") or 0)
-            turnover = float(row.get("turnover") or 0)
+        # Extract relevant fields
+        last_price = float(row.get("last_price") or 0)
+        prev_close = float(row.get("prev_close_price") or 0)
+        open_price = float(row.get("open") or 0)
+        high = float(row.get("high_price") or 0)
+        low = float(row.get("low_price") or 0)
+        volume = int(row.get("volume") or 0)
+        turnover = float(row.get("turnover") or 0)
 
-            # Calculate change
-            change_pct = 0.0
-            if prev_close > 0:
-                change_pct = ((last_price - prev_close) / prev_close) * 100
+        # Calculate change
+        change_pct = 0.0
+        if prev_close > 0:
+            change_pct = ((last_price - prev_close) / prev_close) * 100
 
-            # Keys mirror the CBOE underlying snapshot (parse_cboe_underlying) so
-            # this is a drop-in for the committee briefing, which reads
-            # day_high/day_low. iv30 is not available from a stock snapshot, so
-            # the committee simply omits the IV line under this source.
-            return {
-                "price": last_price,
-                "prev_close": prev_close,
-                "open": open_price,
-                "day_high": high,
-                "day_low": low,
-                "volume": volume,
-                "turnover": turnover,
-                "change_pct": round(change_pct, 2),
-                "source": "moomoo_realtime",
-            }
-        finally:
-            quote_ctx.close()
+        # Keys mirror the CBOE underlying snapshot (parse_cboe_underlying) so
+        # this is a drop-in for the committee briefing, which reads
+        # day_high/day_low. iv30 is not available from a stock snapshot, so
+        # the committee simply omits the IV line under this source.
+        return {
+            "price": last_price,
+            "prev_close": prev_close,
+            "open": open_price,
+            "day_high": high,
+            "day_low": low,
+            "volume": volume,
+            "turnover": turnover,
+            "change_pct": round(change_pct, 2),
+            "source": "moomoo_realtime",
+        }
 
     def _quote_context(self, sdk: Any) -> Any:
-        return sdk.OpenQuoteContext(
-            host=self.connection.host, port=self.connection.port
-        )
+        if self._quote_ctx is None:
+            self._quote_ctx = sdk.OpenQuoteContext(
+                host=self.connection.host, port=self.connection.port
+            )
+        return self._quote_ctx
+
+    def close(self) -> None:
+        if self._quote_ctx is None:
+            return
+        try:
+            self._quote_ctx.close()
+        finally:
+            self._quote_ctx = None
 
     @staticmethod
     def _sdk() -> Any:

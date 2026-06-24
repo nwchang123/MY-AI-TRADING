@@ -75,6 +75,7 @@ class OrderManager:
         limit_price: float,
         side: str,
         price_ladder: list[float] | None = None,
+        on_order_submitted: Callable[[dict[str, Any]], None] | None = None,
     ) -> FillResult:
         """Work a limit order through a price ladder until it fills.
 
@@ -105,6 +106,7 @@ class OrderManager:
                 limit_price=price,
                 side=side,
                 budget_seconds=budget,
+                on_order_submitted=on_order_submitted,
             )
             if result.filled:
                 return result
@@ -118,6 +120,7 @@ class OrderManager:
         limit_price: float,
         side: str,
         budget_seconds: float,
+        on_order_submitted: Callable[[dict[str, Any]], None] | None = None,
     ) -> FillResult:
         record = self.broker.place_limit_order(
             account_id=self.account_id,
@@ -130,6 +133,17 @@ class OrderManager:
         order_id = self._order_id(record)
         if order_id is None:
             return FillResult(filled=False, status="no_order_id")
+        if on_order_submitted is not None:
+            on_order_submitted(
+                {
+                    "order_id": order_id,
+                    "option_code": option_code,
+                    "contracts": contracts,
+                    "limit_price": limit_price,
+                    "side": side,
+                    "trd_env": self.trd_env,
+                }
+            )
 
         elapsed = 0.0
         while True:
@@ -139,14 +153,18 @@ class OrderManager:
             status = str((status_row or {}).get("order_status", "UNKNOWN"))
             classification = classify_order_status(status)
             if classification == "filled":
+                dealt_price = (status_row or {}).get("dealt_avg_price")
+                if not dealt_price:
+                    raise RuntimeError(
+                        f"Order {order_id} filled but broker returned no "
+                        f"dealt_avg_price (status_row={status_row})"
+                    )
                 return FillResult(
                     filled=True,
                     status=status,
                     order_id=order_id,
                     dealt_qty=float((status_row or {}).get("dealt_qty") or contracts),
-                    dealt_avg_price=float(
-                        (status_row or {}).get("dealt_avg_price") or limit_price
-                    ),
+                    dealt_avg_price=float(dealt_price),
                 )
             if classification == "dead":
                 return FillResult(filled=False, status=status, order_id=order_id)

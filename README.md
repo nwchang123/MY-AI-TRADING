@@ -27,6 +27,9 @@ an order.
 - position monitor (take-profit, stop-loss, time stop, forced close)
 - local position ledger and daily audit-log report
 - offline backtest v0 for proposal/quote replay through the risk and exit engine
+- multi-leg payoff analyzer for debit spreads, straddles/strangles, and iron condors
+- parameter sweep backtests for TP/SL, spread caps, and win-probability floors
+- portfolio Greeks risk report with simple underlying shock P/L
 - gated USD 100 live run: allowlist, ramp cap, circuit-breaker HALT
 
 ## Controlled Live Run (Phase 6)
@@ -106,10 +109,28 @@ to fall back to a flat per-side fee of the mandate's `fee_buffer_usd`.
 ```powershell
 trading-agent backtest --input examples/backtest-v0.example.json
 trading-agent backtest --input examples/backtest-costs.example.json
+trading-agent backtest-sweep --input examples/backtest-sweep.example.json
 ```
 
 Use this first to test loss stops, position caps, spread costs, unfilled orders,
 and exit behavior before spending API calls or running paper/live cycles.
+
+## Strategy Analysis And Portfolio Risk
+
+`strategy-analyze` computes expiration payoff, max loss/profit, breakevens, and
+a payoff grid for 2-4 leg option structures. This is analysis-only: live multi-
+leg order routing is not enabled by default.
+
+```powershell
+trading-agent strategy-analyze --input examples/strategy-analyze.bull-call-spread.json
+```
+
+`portfolio-risk` reads the local open-position ledger and summarizes portfolio
+delta, gamma, vega, theta decay, and approximate underlying shock P/L:
+
+```powershell
+trading-agent portfolio-risk
+```
 
 ## Public Catalyst Pipeline
 

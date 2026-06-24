@@ -97,7 +97,7 @@ options:
   # the floor was not the bottleneck; trimmed slightly toward breakeven anyway.
   # Do NOT drop below 0.55 -- 0.50 leaves only ~0.03 over breakeven, negative-EV
   # once the model's win-prob is even mildly over-optimistic.
-  min_estimated_win_probability: 0.25
+  min_estimated_win_probability: 0.55
   # Deterministic Monte Carlo baseline (no-edge GBM): rejects tickets so
   # hopeless that no catalyst edge could plausibly rescue them. LOWERED 0.3 ->
   # 0.25 on 2026-06-17 (toward the original 0.20); still well below the AI bar
@@ -123,6 +123,16 @@ options:
   earnings_window_max_days: 0   # 0 = volume-ratio selection (no earnings-window intersection)
   pre_earnings_exit_trading_days: 2   # KEPT as an EXIT safety: even with volume-ratio selection, a held position is closed 2 trading days before its own earnings (avoid IV-crush). Uses the Finnhub calendar that stays configured in .env.
   max_entry_iv: 0   # leave 0 at first; tune down from observed earnings-window IVs
+  min_abs_delta: 0.20
+  max_gamma_per_contract: 2.0
+  max_theta_decay_pct_per_day: 8.0
+  max_iv_rank_for_long_premium: 0.80
+  iv_crush_exit_drop_pct: 25.0
+  # Profit protection: after a position has shown >=30% profit at the bid,
+  # sell if 35% of that open profit is given back. This catches AAPL-like
+  # near-TP spikes that reverse before the fixed take-profit line.
+  trailing_profit_activation_pct: 30.0
+  trailing_profit_giveback_pct: 35.0
 
 portfolio:
   # The $2000 TOTAL LOSS BUDGET (operator 2026-06-15: "use what you want, never

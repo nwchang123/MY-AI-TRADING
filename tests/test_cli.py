@@ -1,12 +1,15 @@
 import json
 import sys
+from datetime import date
 from pathlib import Path
 from shutil import copyfile
+from types import SimpleNamespace
 
 import pytest
 
-from trading_agent.cli import _adversary_client, _build_committee, main
+from trading_agent.cli import _adversary_client, _build_committee, _update_dashboard, main
 from trading_agent.settings import Settings
+from trading_agent.storage.positions import PositionStore
 
 ROOT = Path(__file__).parents[1]
 
@@ -59,9 +62,72 @@ def test_build_committee_falls_back_without_adversary(tmp_path: Path) -> None:
     committee = _build_committee(_settings(tmp_path, root_dir=ROOT))
     assert committee.adversary_client is committee.client
     # The mandate's win-probability floor is threaded into the committee.
-    assert committee.min_win_probability == 0.25
+    assert committee.min_win_probability == 0.55
     # The soft-veto penalty is threaded through too (paper mandate sets 0.02).
     assert committee.veto_win_prob_penalty == 0.02
+
+
+def test_update_dashboard_accepts_dict_position_rows(
+    tmp_path: Path, capsys
+) -> None:
+    runtime = tmp_path / "runtime"
+    store = PositionStore(runtime / "positions.paper.sqlite")
+    store.open_position(
+        option_code="US.EXAMPLE260626C5000",
+        ticker="EXAMPLE",
+        option_side="call",
+        entry_price=0.2,
+        contracts=1,
+        lot_size=100,
+        expiry=date(2026, 6, 26),
+        take_profit_pct=100,
+        stop_loss_pct=50,
+        time_stop=date(2026, 6, 24),
+    )
+    result = SimpleNamespace(
+        exits=[{"option_code": "US.OLD260626P5000", "reason": "take profit"}],
+        entries=[{"ticker": "EXAMPLE", "option_code": "US.EXAMPLE260626C5000"}],
+    )
+
+    _update_dashboard(_settings(tmp_path), result)
+
+    assert "dashboard update failed" not in capsys.readouterr().err
+    html = (runtime / "dashboard.html").read_text(encoding="utf-8")
+    assert "US.EXAMPLE260626C5000" in html
+
+
+def test_notify_web_dashboard_command_sends_link(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    sent: list[str] = []
+
+    class FakeNotifier:
+        def send(self, text: str) -> bool:
+            sent.append(text)
+            return True
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("trading_agent.cli._notifier", lambda _settings: FakeNotifier())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "trading-agent",
+            "notify-web-dashboard",
+            "--url",
+            "http://127.0.0.1:8765/",
+        ],
+    )
+
+    main()
+
+    assert sent and "http://127.0.0.1:8765/" in sent[0]
+    assert "web dashboard link sent" in capsys.readouterr().out
+    record = json.loads(
+        (tmp_path / "runtime" / "audit.jsonl").read_text(encoding="utf-8")
+    )
+    assert record["event_type"] == "web_dashboard_link_sent"
+    assert record["payload"]["sent"] is True
 
 
 def _offline_input(tmp_path: Path, *, bid: float = 0.19) -> Path:

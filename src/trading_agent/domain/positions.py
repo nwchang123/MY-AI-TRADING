@@ -32,6 +32,10 @@ class MonitoredPosition(BaseModel):
     # BEFORE the print and never eats the event IV crush. Set to
     # earnings_date - pre_earnings_exit_trading_days. None keeps legacy behavior.
     pre_earnings_exit_date: date | None = None
+    entry_iv: float | None = None
+    current_iv: float | None = None
+    theta_decay_pct_per_day: float | None = None
+    peak_bid: float | None = None
     bid: float = Field(ge=0)
     ask: float = Field(ge=0)
     observed_at: datetime

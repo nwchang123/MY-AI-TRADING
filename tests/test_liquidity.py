@@ -49,7 +49,14 @@ def test_rejects_low_open_interest() -> None:
 
 
 def test_rejects_low_volume() -> None:
-    result = _validator().validate(_quote(daily_volume=0), now=NOW)
+    # The paper mandate sets min_daily_volume=0 (the free option feed reports no
+    # per-contract volume, so vol>=N would be unsatisfiable). This test still
+    # verifies the validator's volume-rejection LOGIC, so it pins a positive
+    # min_daily_volume rather than inheriting the disabled live value.
+    mandate = Mandate.load(Path("config/mandate.paper.yaml"))
+    options = mandate.options.model_copy(update={"min_daily_volume": 10})
+    validator = LiquidityValidator(options, mandate.execution)
+    result = validator.validate(_quote(daily_volume=0), now=NOW)
     assert "daily option volume is below minimum" in result.reasons
 
 

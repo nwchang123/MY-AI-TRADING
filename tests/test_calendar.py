@@ -6,6 +6,7 @@ from trading_agent.domain.calendar import (
     market_close_time,
     market_date,
     minutes_since_open,
+    parse_iso,
     subtract_trading_days,
     trading_days_until,
     us_early_close_dates,
@@ -92,3 +93,26 @@ def test_is_market_hours_honors_early_close() -> None:
     # A normal Friday at 14:00 ET is open.
     normal = datetime(2026, 11, 20, 19, 0, tzinfo=timezone.utc)
     assert is_market_hours(normal) is True
+
+
+# --- parse_iso ---
+
+
+def test_parse_iso_accepts_trailing_z() -> None:
+    parsed = parse_iso("2026-06-19T13:45:00Z")
+    assert parsed == datetime(2026, 6, 19, 13, 45, tzinfo=timezone.utc)
+
+
+def test_parse_iso_accepts_offset() -> None:
+    parsed = parse_iso("2026-06-19T13:45:00+00:00")
+    assert parsed == datetime(2026, 6, 19, 13, 45, tzinfo=timezone.utc)
+
+
+def test_parse_iso_passthrough_datetime() -> None:
+    dt = datetime(2026, 6, 19, 13, 45, tzinfo=timezone.utc)
+    assert parse_iso(dt) is dt
+
+
+def test_parse_iso_strips_whitespace() -> None:
+    parsed = parse_iso("  2026-06-19T13:45:00Z  ")
+    assert parsed == datetime(2026, 6, 19, 13, 45, tzinfo=timezone.utc)

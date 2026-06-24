@@ -20,6 +20,10 @@ class PositionMonitor:
         force_close_before_expiry_trading_days: int,
         stale_quote_seconds: int,
         delayed_quote_max_age_seconds: int | None = None,
+        iv_crush_exit_drop_pct: float = 0.0,
+        theta_decay_exit_pct_per_day: float = 0.0,
+        trailing_profit_activation_pct: float = 0.0,
+        trailing_profit_giveback_pct: float = 0.0,
     ):
         self.force_close_days = force_close_before_expiry_trading_days
         self.stale_quote_seconds = stale_quote_seconds
@@ -30,6 +34,10 @@ class PositionMonitor:
             if delayed_quote_max_age_seconds is not None
             else stale_quote_seconds
         )
+        self.iv_crush_exit_drop_pct = iv_crush_exit_drop_pct
+        self.theta_decay_exit_pct_per_day = theta_decay_exit_pct_per_day
+        self.trailing_profit_activation_pct = trailing_profit_activation_pct
+        self.trailing_profit_giveback_pct = trailing_profit_giveback_pct
 
     def evaluate(
         self, positions: list[MonitoredPosition], now: datetime | None = None
@@ -79,9 +87,26 @@ class PositionMonitor:
         elif market_date(now) >= position.time_stop:
             reason = "time stop reached"
         elif not stale:
-            if pnl_pct >= position.take_profit_pct:
+            if (
+                self.iv_crush_exit_drop_pct > 0
+                and position.entry_iv is not None
+                and position.current_iv is not None
+                and position.entry_iv > 0
+                and position.current_iv
+                <= position.entry_iv * (1 - self.iv_crush_exit_drop_pct / 100.0)
+            ):
+                reason = "IV crush exit"
+            elif (
+                self.theta_decay_exit_pct_per_day > 0
+                and position.theta_decay_pct_per_day is not None
+                and position.theta_decay_pct_per_day > self.theta_decay_exit_pct_per_day
+            ):
+                reason = "theta decay exit"
+            elif self._trailing_profit_triggered(position, mark):
+                reason = "trailing profit stop"
+            if reason is None and pnl_pct >= position.take_profit_pct:
                 reason = "take profit"
-            elif pnl_pct <= -position.stop_loss_pct:
+            elif reason is None and pnl_pct <= -position.stop_loss_pct:
                 reason = "stop loss"
 
         if reason is None:
@@ -92,3 +117,20 @@ class PositionMonitor:
             mark_price=round(mark, 4),
             pnl_pct=pnl_pct,
         )
+
+    def _trailing_profit_triggered(
+        self, position: MonitoredPosition, mark: float
+    ) -> bool:
+        activation = self.trailing_profit_activation_pct
+        giveback = self.trailing_profit_giveback_pct
+        if activation <= 0 or giveback <= 0:
+            return False
+        peak_bid = max(float(position.peak_bid or 0.0), mark)
+        if peak_bid <= position.entry_price:
+            return False
+        peak_profit = peak_bid - position.entry_price
+        peak_profit_pct = peak_profit / position.entry_price * 100.0
+        if peak_profit_pct < activation:
+            return False
+        trigger = position.entry_price + peak_profit * (1 - giveback / 100.0)
+        return mark <= trigger

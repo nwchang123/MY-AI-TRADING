@@ -60,20 +60,25 @@ def single_instance_lock(path: Path, stale_seconds: float = 3600.0) -> Iterator[
     try:
         fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
-        # Lock file exists - check if it is stale or held by a dead process
+        # Lock file exists - check if it is stale or held by a dead process.
+        # A live PID always wins, even when the mtime is old: long-running
+        # processes such as the Telegram bot can legitimately hold a lock for
+        # many hours.
         age = time.time() - path.stat().st_mtime
         holding_pid = _read_pid(path)
 
-        if age <= stale_seconds:
-            if holding_pid is not None and not _pid_alive(holding_pid):
-                pass  # Process is dead, reclaim the lock
-            else:
-                raise CycleLockError(
-                    f"Another cycle holds the lock at {path} (age {age:.0f}s). "
-                    "Refusing to start a concurrent cycle."
-                )
+        if holding_pid is not None and _pid_alive(holding_pid):
+            raise CycleLockError(
+                f"Another cycle holds the lock at {path} (pid {holding_pid}, "
+                f"age {age:.0f}s). Refusing to start a concurrent cycle."
+            )
+        if holding_pid is None and age <= stale_seconds:
+            raise CycleLockError(
+                f"Another cycle holds the lock at {path} (age {age:.0f}s). "
+                "Refusing to start a concurrent cycle."
+            )
 
-        # Stale lock or dead process - remove and recreate atomically
+        # Stale lock or dead process - remove and recreate atomically.
         try:
             path.unlink()
         except OSError:

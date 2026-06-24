@@ -1,0 +1,20 @@
+{
+  "strategy": "bull_call_spread",
+  "underlying_price": 5.5,
+  "legs": [
+    {
+      "option_code": "US.ABCD260626C5000",
+      "option_side": "call",
+      "action": "buy_to_open",
+      "contracts": 1,
+      "limit_price": 1.2
+    },
+    {
+      "option_code": "US.ABCD260626C7000",
+      "option_side": "call",
+      "action": "sell_to_open",
+      "contracts": 1,
+      "limit_price": 0.4
+    }
+  ]
+}

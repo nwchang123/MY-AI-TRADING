@@ -1,0 +1,73 @@
+{
+  "scenario": {
+    "initial_capital_usd": 100,
+    "steps": [
+      {
+        "now": "2026-06-02T15:00:00+00:00",
+        "quote": {
+          "option_code": "US.EXAMPLE260626C5000",
+          "bid": 0.19,
+          "ask": 0.21,
+          "open_interest": 200,
+          "daily_volume": 30,
+          "lot_size": 100,
+          "expiry": "2026-06-26",
+          "observed_at": "2026-06-02T15:00:00+00:00",
+          "is_delayed": false
+        },
+        "proposal": {
+          "decision": "open_position",
+          "ticker": "EXAMPLE",
+          "option_code": "US.EXAMPLE260626C5000",
+          "option_side": "call",
+          "action": "buy_to_open",
+          "contracts": 1,
+          "limit_price": 0.21,
+          "max_limit_price": 0.22,
+          "thesis": "Public catalyst with bounded premium risk.",
+          "evidence_ids": ["evt_1"],
+          "confidence": 0.7,
+          "expected_catalyst_window": "2026-06-10/2026-06-20",
+          "exit_plan": {
+            "take_profit_pct": 100,
+            "stop_loss_pct": 50,
+            "time_stop": "2026-06-24"
+          },
+          "invalidation": ["Catalyst is delayed"]
+        }
+      },
+      {
+        "now": "2026-06-03T15:00:00+00:00",
+        "quote": {
+          "option_code": "US.EXAMPLE260626C5000",
+          "bid": 0.32,
+          "ask": 0.34,
+          "open_interest": 200,
+          "daily_volume": 30,
+          "lot_size": 100,
+          "expiry": "2026-06-26",
+          "observed_at": "2026-06-03T15:00:00+00:00",
+          "is_delayed": false
+        }
+      },
+      {
+        "now": "2026-06-04T15:00:00+00:00",
+        "quote": {
+          "option_code": "US.EXAMPLE260626C5000",
+          "bid": 0.1,
+          "ask": 0.12,
+          "open_interest": 200,
+          "daily_volume": 30,
+          "lot_size": 100,
+          "expiry": "2026-06-26",
+          "observed_at": "2026-06-04T15:00:00+00:00",
+          "is_delayed": false
+        }
+      }
+    ]
+  },
+  "take_profit_pct": [50, 100],
+  "stop_loss_pct": [30, 50],
+  "max_bid_ask_spread_pct": [10, 15],
+  "min_estimated_win_probability": [0.55, 0.65]
+}

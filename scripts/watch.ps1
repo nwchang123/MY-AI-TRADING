@@ -1,8 +1,11 @@
-# Live monitor: a human-readable dashboard refreshed every few seconds.
+﻿# Live monitor: a human-readable dashboard refreshed every few seconds.
 # Reads heartbeat + the audit log and renders status / progress / recent
 # activity in plain Chinese. Read-only: closing this window stops nothing.
 param([switch]$Once)
 $root = Split-Path -Parent $PSScriptRoot
+Set-Location -LiteralPath $root
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+$env:PYTHONIOENCODING = "utf-8"
 try { $Host.UI.RawUI.WindowTitle = "交易代理 实时监控" } catch {}
 
 function Get-MarketOpen {

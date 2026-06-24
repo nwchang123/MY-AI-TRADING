@@ -73,7 +73,7 @@ def _fake_sdk(trade_ctx: FakeTradeContext):
     )
 
 
-def test_paper_order_is_forced_to_simulate_and_closes_context(monkeypatch) -> None:
+def test_paper_order_is_forced_to_simulate_and_reuses_context(monkeypatch) -> None:
     trade_ctx = FakeTradeContext()
     sdk, constructor_kwargs = _fake_sdk(trade_ctx)
     monkeypatch.setattr(MoomooBroker, "_sdk", staticmethod(lambda: sdk))
@@ -104,7 +104,47 @@ def test_paper_order_is_forced_to_simulate_and_closes_context(monkeypatch) -> No
         "acc_id": 123,
         "time_in_force": "DAY",
     }
+    assert trade_ctx.closed is False
+    broker.close()
     assert trade_ctx.closed is True
+
+
+def test_trade_context_is_created_once_until_close(monkeypatch) -> None:
+    contexts: list[FakeTradeContext] = []
+    constructor_kwargs: dict[str, object] = {}
+
+    def open_trade_context(**kwargs):
+        constructor_kwargs.update(kwargs)
+        ctx = FakeTradeContext()
+        contexts.append(ctx)
+        return ctx
+
+    sdk = SimpleNamespace(
+        RET_OK=0,
+        OpenSecTradeContext=open_trade_context,
+        SecurityFirm=SimpleNamespace(FUTUMY="FUTUMY"),
+        TrdMarket=SimpleNamespace(US="US"),
+        TrdSide=SimpleNamespace(BUY="BUY", SELL="SELL"),
+        OrderType=SimpleNamespace(NORMAL="NORMAL"),
+        TrdEnv=SimpleNamespace(SIMULATE="SIMULATE", REAL="REAL"),
+        TimeInForce=SimpleNamespace(DAY="DAY"),
+    )
+    monkeypatch.setattr(MoomooBroker, "_sdk", staticmethod(lambda: sdk))
+    broker = MoomooBroker(MoomooConnection(host="127.0.0.1", port=11111))
+
+    for price in (0.2, 0.21):
+        broker.place_paper_limit_order(
+            account_id=123,
+            option_code="US.EXAMPLE260626C00005000",
+            contracts=1,
+            limit_price=price,
+            side="buy",
+        )
+
+    assert len(contexts) == 1
+    assert contexts[0].closed is False
+    broker.close()
+    assert contexts[0].closed is True
 
 
 def test_live_order_passes_real_env(monkeypatch) -> None:

@@ -1,24 +1,44 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from trading_agent.data.moomoo_market import parse_us_option_code
+from trading_agent.domain.calendar import market_date, parse_iso
+from trading_agent.domain.montecarlo import black_scholes_price
 
-def read_audit_events(path: Path) -> list[dict[str, Any]]:
-    """Load append-only audit JSONL records; missing file yields no events."""
+_UNDERLYING_SHOCKS = {
+    "underlying_-5pct": -0.05,
+    "underlying_-2pct": -0.02,
+    "underlying_+2pct": 0.02,
+    "underlying_+5pct": 0.05,
+}
+
+
+def read_audit_events(path: Path, on_date: date | None = None) -> list[dict[str, Any]]:
+    """Load append-only audit JSONL records; missing file yields no events.
+
+    When ``on_date`` is supplied, filtering happens while streaming the file so
+    daily reports do not need to materialize the full audit log first.
+    """
 
     if not path.exists():
         return []
     events: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line:
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
             try:
-                events.append(json.loads(line))
+                event = json.loads(line)
             except json.JSONDecodeError:
-                pass
+                continue
+            if on_date is not None and _event_date(event) != on_date:
+                continue
+            events.append(event)
     return events
 
 
@@ -27,7 +47,7 @@ def _event_date(event: dict[str, Any]) -> date | None:
     if not raw:
         return None
     try:
-        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).date()
+        return market_date(parse_iso(str(raw)))
     except ValueError:
         return None
 
@@ -36,10 +56,146 @@ def _mean(values: list[float]) -> float | None:
     return round(sum(values) / len(values), 4) if values else None
 
 
+def _num(value: Any) -> float:
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def _int(value: Any) -> int:
+    return int(value) if isinstance(value, int) else 0
+
+
 def _events_on(events: list[dict[str, Any]], on_date: date | None) -> list[dict[str, Any]]:
     if on_date is None:
         return events
     return [e for e in events if _event_date(e) == on_date]
+
+
+def build_portfolio_risk_report(
+    open_positions: list[dict[str, Any]], *, as_of: date | None = None
+) -> dict[str, Any]:
+    """Portfolio-level Greeks and underlying-shock P/L from the ledger."""
+
+    rows = [row for row in open_positions if row.get("status", "open") == "open"]
+    totals = {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta_usd_per_day": 0.0}
+    premium = 0.0
+    positions: list[dict[str, Any]] = []
+    missing_greeks = 0
+
+    for row in rows:
+        contracts = _int(row.get("contracts"))
+        lot_size = _int(row.get("lot_size"))
+        multiplier = contracts * lot_size
+        premium_at_risk = _num(row.get("entry_price")) * multiplier
+        premium += premium_at_risk
+        exposures = {
+            "delta": _num(row.get("entry_delta")) * multiplier,
+            "gamma": _num(row.get("entry_gamma")) * multiplier,
+            "vega": _num(row.get("entry_vega")) * multiplier,
+            "theta_usd_per_day": _num(row.get("entry_theta")) * multiplier,
+        }
+        if any(row.get(key) is None for key in ("entry_delta", "entry_gamma", "entry_vega", "entry_theta")):
+            missing_greeks += 1
+        for key, value in exposures.items():
+            totals[key] += value
+        positions.append(
+            {
+                "ticker": row.get("ticker"),
+                "option_code": row.get("option_code"),
+                "premium_at_risk_usd": round(premium_at_risk, 4),
+                "delta": round(exposures["delta"], 4),
+                "gamma": round(exposures["gamma"], 4),
+                "vega": round(exposures["vega"], 4),
+                "theta_usd_per_day": round(exposures["theta_usd_per_day"], 4),
+                "theta_decay_pct_per_day": row.get("entry_theta_decay_pct_per_day"),
+                "iv_rank": row.get("entry_iv_rank"),
+                "entry_spot": row.get("entry_spot"),
+            }
+        )
+
+    shock_pnl = {
+        label: round(_shock_pnl(rows, move), 4)
+        for label, move in _UNDERLYING_SHOCKS.items()
+    }
+    reval_inputs, reval_skipped = _scenario_revaluation_inputs(
+        rows, as_of or datetime.now(timezone.utc).date()
+    )
+    scenario_revaluation_pnl = {
+        label: round(_scenario_revaluation_pnl(reval_inputs, move), 4)
+        for label, move in _UNDERLYING_SHOCKS.items()
+    }
+    return {
+        "open_positions": len(rows),
+        "premium_at_risk_usd": round(premium, 4),
+        "totals": {key: round(value, 4) for key, value in totals.items()},
+        "theta_decay_usd_per_day": round(abs(min(totals["theta_usd_per_day"], 0.0)), 4),
+        "shock_pnl_usd": shock_pnl,
+        "scenario_revaluation_pnl_usd": scenario_revaluation_pnl,
+        "scenario_revaluation_skipped": reval_skipped,
+        "positions": positions,
+        "missing_greeks": missing_greeks,
+    }
+
+
+def _shock_pnl(rows: list[dict[str, Any]], move_pct: float) -> float:
+    total = 0.0
+    for row in rows:
+        spot = _num(row.get("entry_spot"))
+        if spot <= 0:
+            continue
+        contracts = _int(row.get("contracts"))
+        lot_size = _int(row.get("lot_size"))
+        multiplier = contracts * lot_size
+        delta = _num(row.get("entry_delta")) * multiplier
+        gamma = _num(row.get("entry_gamma")) * multiplier
+        move = spot * move_pct
+        total += delta * move + 0.5 * gamma * move * move
+    return total
+
+
+def _scenario_revaluation_inputs(
+    rows: list[dict[str, Any]], as_of: date
+) -> tuple[list[tuple[str, float, float, float, float, int]], int]:
+    inputs: list[tuple[str, float, float, float, float, int]] = []
+    skipped = 0
+    for row in rows:
+        try:
+            option_code = str(row.get("option_code") or "")
+            _, expiry, side, strike = parse_us_option_code(option_code)
+        except ValueError:
+            skipped += 1
+            continue
+        spot = _num(row.get("entry_spot"))
+        iv = _num(row.get("entry_iv"))
+        multiplier = _int(row.get("contracts")) * _int(row.get("lot_size"))
+        if spot <= 0 or iv <= 0 or strike <= 0 or multiplier <= 0:
+            skipped += 1
+            continue
+        t_years = max((expiry - as_of).days, 0) / 365.0
+        inputs.append((side, spot, strike, t_years, iv, multiplier))
+    return inputs, skipped
+
+
+def _scenario_revaluation_pnl(
+    inputs: list[tuple[str, float, float, float, float, int]], move_pct: float
+) -> float:
+    total = 0.0
+    for side, spot, strike, t_years, iv, multiplier in inputs:
+        base = black_scholes_price(
+            side=side,
+            spot=spot,
+            strike=strike,
+            t_years=t_years,
+            iv=iv,
+        )
+        shocked = black_scholes_price(
+            side=side,
+            spot=max(0.01, spot * (1.0 + move_pct)),
+            strike=strike,
+            t_years=t_years,
+            iv=iv,
+        )
+        total += (shocked - base) * multiplier
+    return total
 
 
 def build_funnel_report(
@@ -184,7 +340,7 @@ def build_calibration_report(
 
 
 def build_daily_report(events: list[dict[str, Any]], on_date: date) -> dict[str, Any]:
-    """Aggregate one UTC day of audit events into a report.
+    """Aggregate one U.S. market date of audit events into a report.
 
     Counts committee decisions, risk-gate verdicts, validated contracts, orders,
     closed positions with realized P/L, and failures — the evidence behind a
@@ -202,17 +358,24 @@ def build_daily_report(events: list[dict[str, Any]], on_date: date) -> dict[str,
     realized_pnl = 0.0
     positions_closed = 0
     failures = 0
-    llm = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
+    llm = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     for event in day_events:
         etype = event.get("event_type", "")
         payload = event.get("payload", {})
 
         if etype == "llm_usage":
-            for key in llm:
+            for key in ("calls", "prompt_tokens", "completion_tokens"):
                 value = payload.get(key)
                 if isinstance(value, int):
                     llm[key] += value
+            total = payload.get("total_tokens")
+            if isinstance(total, int):
+                llm["total_tokens"] += total
+            else:
+                llm["total_tokens"] += int(payload.get("prompt_tokens") or 0) + int(
+                    payload.get("completion_tokens") or 0
+                )
         elif etype == "committee_run":
             decision = payload.get("decision")
             if decision in committee_decisions:
@@ -256,5 +419,5 @@ def build_daily_report(events: list[dict[str, Any]], on_date: date) -> dict[str,
         "close_reasons": close_reasons,
         "realized_pnl_usd": round(realized_pnl, 4),
         "failures": failures,
-        "llm_usage": {**llm, "total_tokens": llm["prompt_tokens"] + llm["completion_tokens"]},
+        "llm_usage": llm,
     }

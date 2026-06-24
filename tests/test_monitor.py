@@ -119,9 +119,76 @@ def test_take_profit_fires() -> None:
     assert signals[0].pnl_pct >= 100
 
 
+def test_trailing_profit_stop_fires_after_profit_giveback() -> None:
+    monitor = PositionMonitor(
+        force_close_before_expiry_trading_days=2,
+        stale_quote_seconds=15,
+        trailing_profit_activation_pct=30,
+        trailing_profit_giveback_pct=35,
+    )
+    # Entry 1.00, peak bid 1.50 = +50%. A 35% giveback of open profit triggers
+    # at 1.325, so a current bid of 1.30 should exit and still lock profit.
+    pos = _position(
+        entry_price=1.00,
+        take_profit_pct=100,
+        bid=1.30,
+        ask=1.34,
+        peak_bid=1.50,
+    )
+
+    signals = monitor.evaluate([pos], NOW)
+
+    assert signals[0].reason == "trailing profit stop"
+    assert signals[0].pnl_pct == 30.0
+
+
+def test_trailing_profit_stop_waits_for_activation() -> None:
+    monitor = PositionMonitor(
+        force_close_before_expiry_trading_days=2,
+        stale_quote_seconds=15,
+        trailing_profit_activation_pct=30,
+        trailing_profit_giveback_pct=35,
+    )
+    pos = _position(
+        entry_price=1.00,
+        take_profit_pct=100,
+        bid=1.10,
+        ask=1.12,
+        peak_bid=1.20,
+    )
+
+    assert monitor.evaluate([pos], NOW) == []
+
+
 def test_stop_loss_fires() -> None:
     signals = _monitor().evaluate([_position(bid=0.09, ask=0.11)], NOW)
     assert signals[0].reason == "stop loss"
+
+
+def test_iv_crush_exit_fires() -> None:
+    monitor = PositionMonitor(
+        force_close_before_expiry_trading_days=2,
+        stale_quote_seconds=15,
+        iv_crush_exit_drop_pct=25,
+    )
+    pos = _position(entry_iv=1.0, current_iv=0.70)
+
+    signals = monitor.evaluate([pos], NOW)
+
+    assert signals[0].reason == "IV crush exit"
+
+
+def test_theta_decay_exit_fires() -> None:
+    monitor = PositionMonitor(
+        force_close_before_expiry_trading_days=2,
+        stale_quote_seconds=15,
+        theta_decay_exit_pct_per_day=8,
+    )
+    pos = _position(theta_decay_pct_per_day=9.0)
+
+    signals = monitor.evaluate([pos], NOW)
+
+    assert signals[0].reason == "theta decay exit"
 
 
 def test_time_stop_fires() -> None:

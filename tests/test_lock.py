@@ -27,3 +27,14 @@ def test_stale_lock_is_reclaimed(tmp_path: Path) -> None:
     with single_instance_lock(lock):
         assert lock.exists()
     assert not lock.exists()
+
+
+def test_old_lock_with_live_pid_is_not_reclaimed(tmp_path: Path) -> None:
+    lock = tmp_path / "cycle.lock"
+    lock.write_text(f"pid={os.getpid()} ts=0\n", encoding="utf-8")
+    old = time.time() - 7200
+    os.utime(lock, (old, old))
+
+    with pytest.raises(CycleLockError):
+        with single_instance_lock(lock):
+            pass

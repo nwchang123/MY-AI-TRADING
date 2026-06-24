@@ -119,6 +119,42 @@ def test_rejects_cost_above_contract_limit(tmp_path: Path) -> None:
     assert "contract cost exceeds mandate" in result.reasons
 
 
+def test_rejects_entry_greeks_outside_mandate(tmp_path: Path) -> None:
+    portfolio = _portfolio(
+        proposal_abs_delta=0.10,
+        proposal_gamma_per_contract=0.40,
+        proposal_theta_decay_pct_per_day=9.0,
+        proposal_iv_rank=0.90,
+    )
+    result = RiskGate(_mandate(), tmp_path).evaluate_open(
+        _proposal(), _quote(), portfolio, NOW
+    )
+
+    assert result.approved is False
+    assert "absolute delta is below mandate minimum" in result.reasons
+    assert "theta decay exceeds mandate limit" in result.reasons
+    assert "IV rank exceeds mandate limit for long premium" in result.reasons
+
+
+def test_rejects_portfolio_greeks_caps_when_configured(tmp_path: Path) -> None:
+    mandate = _mandate()
+    portfolio_mandate = mandate.portfolio.model_copy(
+        update={"max_portfolio_gamma": 50.0, "max_portfolio_vega": 5.0}
+    )
+    mandate = mandate.model_copy(update={"portfolio": portfolio_mandate})
+
+    result = RiskGate(mandate, tmp_path).evaluate_open(
+        _proposal(),
+        _quote(),
+        _portfolio(total_gamma=40.0, proposal_gamma=20.0, total_vega=3.0, proposal_vega=3.0),
+        NOW,
+    )
+
+    assert result.approved is False
+    assert "portfolio gamma exposure would exceed mandate limit" in result.reasons
+    assert "portfolio vega exposure would exceed mandate limit" in result.reasons
+
+
 def test_rejects_when_halt_file_exists(tmp_path: Path) -> None:
     halt_path = tmp_path / "runtime" / "HALT"
     halt_path.parent.mkdir(parents=True)
@@ -152,3 +188,50 @@ def test_rejects_hard_drawdown(tmp_path: Path) -> None:
     assert result.approved is False
     assert "hard drawdown stop is active" in result.reasons
 
+
+def test_rejects_vix_above_cap(tmp_path: Path) -> None:
+    # Paper mandate has max_vix_for_entries=35. VIX=40 must be blocked.
+    result = RiskGate(_mandate(), tmp_path).evaluate_open(
+        _proposal(), _quote(), _portfolio(vix=40.0), NOW
+    )
+
+    assert result.approved is False
+    assert "VIX" in result.reasons[0]
+
+
+def test_allows_vix_below_cap(tmp_path: Path) -> None:
+    # VIX=20 is below the 35 cap -- must not block.
+    result = RiskGate(_mandate(), tmp_path).evaluate_open(
+        _proposal(), _quote(), _portfolio(vix=20.0), NOW
+    )
+
+    assert result.approved is True
+
+
+def test_vix_none_is_skipped(tmp_path: Path) -> None:
+    # None (data unavailable) must NOT block -- the check is skipped, not
+    # treated as a pass or a fail. The caller audits the gap separately.
+    result = RiskGate(_mandate(), tmp_path).evaluate_open(
+        _proposal(), _quote(), _portfolio(vix=None), NOW
+    )
+
+    assert result.approved is True
+
+
+def test_rejects_inside_open_window(tmp_path: Path) -> None:
+    # Paper mandate has no_entry_minutes_after_open=15. 10 minutes in must block.
+    result = RiskGate(_mandate(), tmp_path).evaluate_open(
+        _proposal(), _quote(), _portfolio(minutes_since_open=10.0), NOW
+    )
+
+    assert result.approved is False
+    assert "first 15 minutes" in result.reasons[0]
+
+
+def test_allows_after_open_window(tmp_path: Path) -> None:
+    # 20 minutes after open -- past the 15-minute window.
+    result = RiskGate(_mandate(), tmp_path).evaluate_open(
+        _proposal(), _quote(), _portfolio(minutes_since_open=20.0), NOW
+    )
+
+    assert result.approved is True

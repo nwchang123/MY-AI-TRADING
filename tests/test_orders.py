@@ -56,6 +56,31 @@ def test_fills_after_polling() -> None:
     assert broker.cancelled == []
 
 
+def test_order_submitted_callback_fires_after_broker_accepts() -> None:
+    broker = ScriptedBroker(["FILLED_ALL"])
+    submitted: list[dict] = []
+
+    result = _manager(broker).place_and_await(
+        option_code="US.X",
+        contracts=1,
+        limit_price=0.21,
+        side="buy",
+        on_order_submitted=submitted.append,
+    )
+
+    assert result.filled is True
+    assert submitted == [
+        {
+            "order_id": "ord-1",
+            "option_code": "US.X",
+            "contracts": 1,
+            "limit_price": 0.21,
+            "side": "buy",
+            "trd_env": "SIMULATE",
+        }
+    ]
+
+
 def test_dead_order_returns_unfilled_without_cancel() -> None:
     broker = ScriptedBroker(["FAILED"])
     result = _manager(broker).place_and_await(

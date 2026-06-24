@@ -16,6 +16,7 @@ def run_scheduler(
     max_iterations: int | None = None,
     market_hours_only: bool = True,
     on_skip: Callable[[str], None] | None = None,
+    stop_after_close: bool = False,
 ) -> int:
     """Drive ``run_cycle`` on a fixed interval, autonomously.
 
@@ -25,6 +26,12 @@ def run_scheduler(
     next tick (no sleep after the final iteration). ``max_iterations=None`` runs
     forever. All side-effecting dependencies are injected so the control flow is
     unit-testable without a real clock, broker, or sleep.
+
+    ``stop_after_close`` is for near-continuous loops (small ``interval_seconds``):
+    once at least one cycle has run AND the market is then closed, the loop exits
+    cleanly instead of spinning skip-ticks until ``max_iterations``. Pre-open
+    skips do NOT trigger it (``ran`` is still 0), so launching before the open is
+    safe. Default ``False`` preserves the fixed-interval behavior.
 
     Returns the number of cycles actually executed.
     """
@@ -37,6 +44,9 @@ def run_scheduler(
         if is_halted():
             _note(on_skip, "halted")
         elif market_hours_only and not is_market_hours(now_fn()):
+            if stop_after_close and ran > 0:
+                _note(on_skip, "market closed -- session ended")
+                break
             _note(on_skip, "market closed")
         else:
             run_cycle()

@@ -29,9 +29,11 @@ class IV30History:
         }
 
     Only the most recent ``max_days`` entries are kept per ticker.
+    ``max_days`` defaults to 371 (~365 calendar days ≈ 252 trading days),
+    matching the standard 1-year IV Rank lookback window.
     """
 
-    def __init__(self, path: Path, *, max_days: int = 252) -> None:
+    def __init__(self, path: Path, *, max_days: int = 371) -> None:
         self.path = path
         self.max_days = max_days
         self._data: dict[str, list[dict[str, Any]]] = {}
@@ -62,26 +64,62 @@ class IV30History:
         if iv30 <= 0:
             return
         day = (today or date.today()).isoformat()
-        entries = self._data.setdefault(ticker.upper(), [])
+        key = ticker.upper()
+        entries = self._data.setdefault(key, [])
 
         # One observation per day: replace if same date already present.
         if entries and entries[-1].get("date") == day:
+            if entries[-1].get("iv30") == iv30:
+                return
             entries[-1]["iv30"] = iv30
         else:
             entries.append({"date": day, "iv30": iv30})
 
         # Trim to max_days.
         if len(entries) > self.max_days:
-            self._data[ticker.upper()] = entries[-self.max_days:]
+            self._data[key] = entries[-self.max_days:]
         self._save()
+
+    def values(self, ticker: str) -> list[float]:
+        """Return clean IV30 observations for a ticker in stored order."""
+
+        entries = self._data.get(ticker.upper())
+        if not entries:
+            return []
+        return [
+            float(e["iv30"])
+            for e in entries
+            if isinstance(e.get("iv30"), (int, float)) and e["iv30"] > 0
+        ]
 
     def extremes(self, ticker: str) -> tuple[float, float] | None:
         """Return (52w_high, 52w_low) IV30 for a ticker, or None if empty."""
 
-        entries = self._data.get(ticker.upper())
-        if not entries:
-            return None
-        ivs = [e["iv30"] for e in entries if isinstance(e.get("iv30"), (int, float))]
+        ivs = self.values(ticker)
         if len(ivs) < 2:
             return None
         return (max(ivs), min(ivs))
+
+    def rank(self, ticker: str, current_iv: float) -> float | None:
+        """IV Rank: current IV's position inside the stored high/low range."""
+
+        if current_iv <= 0:
+            return None
+        ext = self.extremes(ticker)
+        if ext is None:
+            return None
+        high, low = ext
+        if high <= low:
+            return None
+        return round((current_iv - low) / (high - low), 4)
+
+    def percentile(self, ticker: str, current_iv: float) -> float | None:
+        """IV Percentile: share of stored observations below current IV."""
+
+        if current_iv <= 0:
+            return None
+        ivs = self.values(ticker)
+        if len(ivs) < 2:
+            return None
+        below = sum(1 for iv in ivs if iv < current_iv)
+        return round(below / len(ivs), 4)

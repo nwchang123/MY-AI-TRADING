@@ -5,6 +5,7 @@ from pathlib import Path
 from trading_agent.data.moomoo_market import build_us_option_code, parse_us_option_code
 from trading_agent.domain.evidence import EvidenceItem
 from trading_agent.domain.liquidity import LiquidityValidator
+from trading_agent.domain.positions import MonitoredPosition
 from trading_agent.domain.risk import Mandate, QuoteSnapshot, RiskGate
 from trading_agent.execution.orchestrator import (
     CycleResult,
@@ -94,8 +95,14 @@ class FakeMarket:
 
 
 class FakeBroker:
-    def __init__(self, positions=None, fill_status: str = "FILLED_ALL"):
+    def __init__(
+        self,
+        positions=None,
+        fill_status: str = "FILLED_ALL",
+        open_orders=None,
+    ):
         self.positions = positions or []
+        self.open_orders = open_orders or []
         self.placed: list[tuple[str, str]] = []
         self.trd_envs: list[str] = []
         self.cancelled: list[str] = []
@@ -106,6 +113,9 @@ class FakeBroker:
     def positions_query(self, account_id, trd_env="SIMULATE"):
         self.positions_queried = True
         return self.positions
+
+    def open_orders_query(self, account_id, trd_env="SIMULATE"):
+        return self.open_orders
 
     def place_limit_order(
         self, *, account_id, option_code, contracts, limit_price, side, trd_env="SIMULATE"
@@ -396,6 +406,10 @@ def test_eligible_candidates_annotate_delta_and_breakeven(tmp_path: Path) -> Non
     cand = cycle._eligible_candidates(NOW, "EXAMPLE", CycleResult(), spot=5.0)[0]
 
     assert cand.delta is not None and 0 < cand.delta < 1  # ATM call ~0.5
+    assert cand.gamma is not None and cand.gamma > 0
+    assert cand.vega is not None and cand.vega > 0
+    assert cand.theta is not None and cand.theta < 0
+    assert cand.theta_decay_pct_per_day is not None and cand.theta_decay_pct_per_day > 0
     # Call breakeven = strike + ask = 5.21, a +4.2% move from spot 5.0.
     assert cand.breakeven_move_pct == 4.2
 
@@ -475,6 +489,195 @@ def test_take_profit_exit_closes_position(tmp_path: Path) -> None:
 
     assert ("sell", OPTION_CODE) in broker.placed
     assert result.exits and result.exits[0]["reason"] == "take profit"
+    assert store.open_positions() == []
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    signal = next(event for event in events if event["event_type"] == "exit_signal")
+    assert signal["payload"]["option_code"] == OPTION_CODE
+    assert signal["payload"]["reason"] == "take profit"
+    assert signal["payload"]["bid"] == 0.4
+    assert signal["payload"]["ask"] == 0.42
+    assert signal["payload"]["take_profit_price"] == 0.4
+    assert signal["payload"]["price_ladder"] == [0.41, 0.4, 0.38]
+
+
+def test_exit_quote_uses_bid_when_ask_is_missing(tmp_path: Path) -> None:
+    class NoAskExitMarket(FakeMarket):
+        def option_quote(self, *, option_code, expiry, lot_size, now=None):
+            raise RuntimeError(f"{option_code} has no ask (no liquidity)")
+
+    broker = FakeBroker(positions=[{"code": OPTION_CODE, "qty": 1}])
+    store = PositionStore(tmp_path / "positions.sqlite")
+    store.open_position(
+        option_code=OPTION_CODE,
+        ticker="EXAMPLE",
+        option_side="call",
+        entry_price=0.20,
+        contracts=1,
+        lot_size=100,
+        expiry=date(2026, 6, 26),
+        take_profit_pct=100,
+        stop_loss_pct=50,
+        time_stop=date(2026, 6, 24),
+    )
+    cycle = _cycle(
+        tmp_path,
+        broker=broker,
+        market=NoAskExitMarket(bid=0.40, ask=0.0),
+        committee=_committee([]),
+        store=store,
+    )
+
+    result = cycle.run_once([])
+
+    assert result.errors == []
+    assert broker.placed == [("sell", OPTION_CODE)]
+    assert result.exits == [{"option_code": OPTION_CODE, "reason": "take profit"}]
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(event["event_type"] == "exit_quote_degraded" for event in events)
+    assert not any(event["event_type"] == "cycle_step_failed" for event in events)
+    signal = next(event for event in events if event["event_type"] == "exit_signal")
+    assert signal["payload"]["bid"] == 0.4
+    assert signal["payload"]["ask"] == 0.0
+    assert signal["payload"]["price_ladder"] == [0.4, 0.38]
+
+
+def test_lazy_cycle_skips_selector_when_position_capacity_full(tmp_path: Path) -> None:
+    broker = FakeBroker(positions=[{"code": OPTION_CODE, "qty": 1}])
+    store = PositionStore(tmp_path / "positions.sqlite")
+    _seed_open(store)
+    cycle = _cycle(
+        tmp_path,
+        broker=broker,
+        market=FakeMarket(),
+        committee=_committee(_open_responses()),
+        store=store,
+        max_open_positions_override=1,
+    )
+    called = False
+
+    def selector() -> list[str]:
+        nonlocal called
+        called = True
+        raise AssertionError("selector should not run while position capacity is full")
+
+    result = cycle.run_once_lazy(selector)
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert called is False
+    assert result.entries == []
+    assert broker.placed == []
+    assert any(
+        event["event_type"] == "entries_skipped"
+        and "maximum open positions reached" in event["payload"]["reason"]
+        for event in events
+    )
+
+
+def test_lazy_cycle_selects_after_exit_frees_capacity(tmp_path: Path) -> None:
+    broker = FakeBroker(positions=[{"code": OPTION_CODE, "qty": 1}])
+    store = PositionStore(tmp_path / "positions.sqlite")
+    _seed_open(store)
+    cycle = _cycle(
+        tmp_path,
+        broker=broker,
+        market=FakeMarket(bid=0.40, ask=0.42),  # +100% -> take profit first
+        committee=_committee([]),
+        store=store,
+        max_open_positions_override=1,
+    )
+    calls = 0
+
+    def selector() -> list[str]:
+        nonlocal calls
+        calls += 1
+        return []
+
+    result = cycle.run_once_lazy(selector)
+
+    assert calls == 1
+    assert ("sell", OPTION_CODE) in broker.placed
+    assert result.exits and result.exits[0]["reason"] == "take profit"
+    assert store.open_positions() == []
+
+
+def test_exit_sell_ladder_adds_marketable_final_rung() -> None:
+    position = MonitoredPosition(
+        option_code="US.TSLA260710C400000",
+        option_side="call",
+        entry_price=14.20,
+        contracts=1,
+        lot_size=100,
+        expiry=date(2026, 7, 10),
+        take_profit_pct=50,
+        stop_loss_pct=30,
+        time_stop=date(2026, 7, 10),
+        bid=21.30,
+        ask=21.84,
+        observed_at=NOW,
+        is_delayed=True,
+    )
+
+    ladder = PaperTradingCycle._exit_sell_ladder(
+        position=position,
+        limit=21.30,
+        max_chase_pct=5,
+    )
+
+    assert ladder == [21.57, 21.30, round(21.30 * 0.95, 2)]
+
+
+def test_trailing_profit_exit_closes_position(tmp_path: Path) -> None:
+    broker = FakeBroker(positions=[{"code": OPTION_CODE, "qty": 1}])
+    store = PositionStore(tmp_path / "positions.sqlite")
+    store.open_position(
+        option_code=OPTION_CODE,
+        ticker="EXAMPLE",
+        option_side="call",
+        entry_price=1.00,
+        contracts=1,
+        lot_size=100,
+        expiry=date(2026, 6, 26),
+        take_profit_pct=100,
+        stop_loss_pct=50,
+        time_stop=date(2026, 6, 24),
+        peak_bid=1.50,
+    )
+    mandate = _mandate()
+    options = mandate.options.model_copy(
+        update={
+            "trailing_profit_activation_pct": 30,
+            "trailing_profit_giveback_pct": 35,
+        }
+    )
+    cycle = PaperTradingCycle(
+        mandate=mandate.model_copy(update={"options": options}),
+        account_id=123,
+        market=FakeMarket(bid=1.30, ask=1.34),
+        broker=broker,
+        sec_client=FakeSec(),
+        committee=_committee([]),
+        gate=RiskGate(mandate.model_copy(update={"options": options}), tmp_path),
+        liquidity=LiquidityValidator(options, mandate.execution),
+        position_store=store,
+        audit=AuditWriter(tmp_path / "audit.jsonl"),
+        now_fn=lambda: NOW,
+        order_poll_interval_seconds=0.1,
+        sleep_fn=lambda _seconds: None,
+    )
+
+    result = cycle.run_once([])
+
+    assert broker.placed == [("sell", OPTION_CODE)]
+    assert result.exits == [{"option_code": OPTION_CODE, "reason": "trailing profit stop"}]
     assert store.open_positions() == []
 
 
@@ -613,6 +816,61 @@ def test_orphan_broker_position_is_adopted(tmp_path: Path) -> None:
     assert adopted is not None and adopted["status"] == "open"
     assert adopted["entry_price"] == 0.25
     assert adopted["take_profit_pct"] == 100.0 and adopted["stop_loss_pct"] == 50.0
+
+
+def test_orphan_adoption_rejects_position_cap_breach(tmp_path: Path) -> None:
+    other = "US.OTHER260626C00005000"
+    broker = FakeBroker(
+        positions=[
+            {"code": other, "qty": 1, "cost_price": 0.20},
+            {"code": OPTION_CODE, "qty": 1, "cost_price": 0.25},
+        ]
+    )
+    store = PositionStore(tmp_path / "positions.sqlite")
+    _seed_open(store, other)
+    mandate = _mandate()
+    portfolio = mandate.portfolio.model_copy(update={"max_open_positions": 1})
+    cycle = _cycle(
+        tmp_path,
+        broker=broker,
+        market=FakeMarket(),
+        committee=_committee([]),
+        store=store,
+        mandate=mandate.model_copy(update={"portfolio": portfolio}),
+    )
+
+    result = cycle.run_once([])
+
+    assert result.adopted == []
+    assert store.get(OPTION_CODE) is None
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(event["event_type"] == "orphan_adopt_rejected" for event in events)
+
+
+def test_pending_open_order_is_cancelled_before_entries(tmp_path: Path) -> None:
+    broker = FakeBroker(
+        open_orders=[
+            {
+                "order_id": "old-1",
+                "code": OPTION_CODE,
+                "order_status": "SUBMITTED",
+            }
+        ]
+    )
+    cycle = _cycle(
+        tmp_path,
+        broker=broker,
+        market=FakeMarket(),
+        committee=_committee([]),
+    )
+
+    result = cycle.run_once([])
+
+    assert broker.cancelled == ["old-1"]
+    assert result.open_orders_cancelled == ["old-1"]
 
 
 def test_stock_holdings_are_not_adopted(tmp_path: Path) -> None:
@@ -796,6 +1054,61 @@ def test_monte_carlo_passes_underpriced_atm_ticket(tmp_path: Path) -> None:
 
     assert broker.placed == [("buy", OPTION_CODE)]
     assert result.entries
+
+
+def test_entry_persists_greeks_and_audits_portfolio_greeks(tmp_path: Path) -> None:
+    store = PositionStore(tmp_path / "positions.sqlite")
+    cycle = _cycle(
+        tmp_path,
+        broker=FakeBroker(),
+        market=FakeMarket(spot=5.0, iv=0.5),
+        committee=_committee(_open_responses()),
+        store=store,
+    )
+
+    result = cycle.run_once(["EXAMPLE"])
+
+    assert result.entries
+    row = store.open_positions()[0]
+    assert row["entry_delta"] is not None
+    assert row["entry_gamma"] is not None
+    assert row["entry_vega"] is not None
+    assert row["entry_theta"] is not None
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(event["event_type"] == "portfolio_greeks" for event in events)
+
+
+def test_iv_crush_exit_places_sell_order(tmp_path: Path) -> None:
+    store = PositionStore(tmp_path / "positions.sqlite")
+    store.open_position(
+        option_code=OPTION_CODE,
+        ticker="EXAMPLE",
+        option_side="call",
+        entry_price=0.20,
+        contracts=1,
+        lot_size=100,
+        expiry=date(2026, 6, 26),
+        take_profit_pct=100,
+        stop_loss_pct=50,
+        time_stop=date(2026, 6, 24),
+        entry_iv=1.0,
+    )
+    broker = FakeBroker(positions=[{"code": OPTION_CODE, "qty": 1}])
+    cycle = _cycle(
+        tmp_path,
+        broker=broker,
+        market=FakeMarket(spot=5.0, iv=0.70, bid=0.19, ask=0.21),
+        committee=_committee([]),
+        store=store,
+    )
+
+    result = cycle.run_once([])
+
+    assert broker.placed == [("sell", OPTION_CODE)]
+    assert result.exits == [{"option_code": OPTION_CODE, "reason": "IV crush exit"}]
 
 
 def test_missing_spot_skips_monte_carlo_check(tmp_path: Path) -> None:

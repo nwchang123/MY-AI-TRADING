@@ -31,6 +31,13 @@ class OptionCandidate(BaseModel):
     # Black-Scholes delta (signed: puts are negative). How much the option
     # actually tracks the underlying. None when spot/IV were unavailable.
     delta: float | None = Field(default=None, ge=-1, le=1)
+    # Black-Scholes gamma per $1 underlying move, vega per 1 IV percentage point,
+    # and theta per calendar day. None when spot/IV were unavailable.
+    gamma: float | None = Field(default=None, ge=0)
+    vega: float | None = Field(default=None, ge=0)
+    theta: float | None = Field(default=None)
+    theta_decay_pct_per_day: float | None = Field(default=None, ge=0)
+    iv_rank: float | None = Field(default=None, ge=0, le=1)
     # Signed % move in the underlying needed to break even at expiry (positive =
     # up, negative = down). Surfaces how far OTM a contract is. None w/o spot.
     breakeven_move_pct: float | None = Field(default=None)

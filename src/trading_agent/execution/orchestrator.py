@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
@@ -10,11 +11,15 @@ from trading_agent.data.sec_edgar import SecEdgarClient
 from trading_agent.domain.calendar import (
     market_date,
     minutes_since_open,
+    parse_iso,
     subtract_trading_days,
 )
 from trading_agent.domain.montecarlo import (
     MAX_USABLE_IV,
     black_scholes_delta,
+    black_scholes_gamma,
+    black_scholes_theta,
+    black_scholes_vega,
     iv_rank,
     kelly_criterion,
     stable_seed,
@@ -22,6 +27,7 @@ from trading_agent.domain.montecarlo import (
 )
 from trading_agent.domain.liquidity import LiquidityValidator
 from trading_agent.domain.positions import MonitoredPosition
+from trading_agent.execution.orders import classify_order_status
 from trading_agent.execution.orders import OrderManager
 from trading_agent.domain.proposals import OpenPositionProposal, OptionCandidate
 from trading_agent.domain.risk import Mandate, PortfolioState, QuoteSnapshot, RiskGate
@@ -59,6 +65,14 @@ def _parse_window_end(window: str | None) -> date | None:
         return None
 
 
+@dataclass(frozen=True)
+class _ExitQuote:
+    bid: float
+    ask: float
+    observed_at: datetime
+    is_delayed: bool
+
+
 @dataclass
 class CycleResult:
     halted: bool = False
@@ -66,6 +80,7 @@ class CycleResult:
     cooldown: bool = False
     reconciled_closed: list[str] = field(default_factory=list)
     adopted: list[str] = field(default_factory=list)
+    open_orders_cancelled: list[str] = field(default_factory=list)
     exits: list[dict[str, Any]] = field(default_factory=list)
     entries: list[dict[str, Any]] = field(default_factory=list)
     rejected: list[dict[str, Any]] = field(default_factory=list)
@@ -107,6 +122,7 @@ class PaperTradingCycle:
         price_history: Any | None = None,
         earnings_calendar: Any | None = None,
         iv_history: IV30History | None = None,
+        on_position_closed: Callable[[str, str, float | None], None] | None = None,
     ):
         if trd_env not in {"SIMULATE", "REAL"}:
             raise ValueError("trd_env must be 'SIMULATE' or 'REAL'")
@@ -140,6 +156,7 @@ class PaperTradingCycle:
         # these carry the equity-scaled risk caps; otherwise they alias the
         # injected gate/liquidity unchanged.
         self.active_mandate = mandate
+        self.on_position_closed = on_position_closed
         self.active_gate = gate
         self.active_liquidity = liquidity
         self.orders = OrderManager(
@@ -158,6 +175,15 @@ class PaperTradingCycle:
         return min(self.max_open_positions_override, mandate_max)
 
     def run_once(self, tickers: list[str]) -> CycleResult:
+        return self.run_once_lazy(lambda: tickers)
+
+    def run_once_lazy(self, tickers_fn: Callable[[], list[str]]) -> CycleResult:
+        try:
+            return self._run_once_lazy(tickers_fn)
+        finally:
+            self._close_adapters()
+
+    def _run_once_lazy(self, tickers_fn: Callable[[], list[str]]) -> CycleResult:
         now = self.now_fn()
         result = CycleResult()
 
@@ -168,6 +194,7 @@ class PaperTradingCycle:
 
         self._refresh_sizing()
         held_codes = self._reconcile(now, result)
+        open_orders_ok = self._reconcile_open_orders(now, result)
         marks = self._run_exits(now, held_codes, result)
 
         # Refresh held_codes from the position store to get an accurate count
@@ -182,8 +209,23 @@ class PaperTradingCycle:
             if self._in_cooldown(now):
                 result.cooldown = True
                 self.audit.append("cooldown_active", {"at": now.isoformat()})
+            elif not open_orders_ok:
+                result.rejected.append(
+                    {
+                        "ticker": "*",
+                        "stage": "open_order_reconcile",
+                        "reasons": ["open orders could not be reconciled"],
+                    }
+                )
             else:
-                self._run_entries(now, tickers, held_codes, result)
+                capacity_block = self._entry_capacity_block(now, held_codes)
+                if capacity_block is not None:
+                    self.audit.append(
+                        "entries_skipped",
+                        {"reason": capacity_block, "at": now.isoformat()},
+                    )
+                else:
+                    self._run_entries(now, tickers_fn(), held_codes, result)
 
         self.audit.append(
             "cycle_completed",
@@ -200,6 +242,23 @@ class PaperTradingCycle:
             },
         )
         return result
+
+    def _close_adapters(self) -> None:
+        seen: set[int] = set()
+        for adapter in (self.market, self.moomoo_market, self.broker):
+            if adapter is None or id(adapter) in seen:
+                continue
+            seen.add(id(adapter))
+            close = getattr(adapter, "close", None)
+            if close is None:
+                continue
+            try:
+                close()
+            except Exception as exc:  # noqa: BLE001 - cleanup is best-effort
+                self.audit.append(
+                    "adapter_close_failed",
+                    {"adapter": type(adapter).__name__, "error": str(exc)},
+                )
 
     def _enforce_circuit_breakers(
         self, now: datetime, result: CycleResult, marks: dict[str, float]
@@ -271,7 +330,7 @@ class PaperTradingCycle:
                 continue
             pnl = (row["exit_price"] - row["entry_price"]) * row["contracts"] * row["lot_size"]
             if pnl < 0 and row.get("closed_at"):
-                closed_at = datetime.fromisoformat(str(row["closed_at"]).replace("Z", "+00:00"))
+                closed_at = parse_iso(row["closed_at"])
                 if latest is None or closed_at > latest:
                     latest = closed_at
         return latest
@@ -292,6 +351,10 @@ class PaperTradingCycle:
                     close_reason="reconciled: not held at broker",
                     exit_price=None,
                 )
+                if self.on_position_closed is not None:
+                    self.on_position_closed(
+                        ledger["option_code"], "reconciled: not held at broker", None
+                    )
                 result.reconciled_closed.append(ledger["option_code"])
                 self.audit.append(
                     "position_reconciled_closed",
@@ -299,6 +362,54 @@ class PaperTradingCycle:
                 )
         self._adopt_orphans(now, held_rows, result)
         return held_codes
+
+    def _reconcile_open_orders(self, now: datetime, result: CycleResult) -> bool:
+        """Cancel broker orders left behind by a crashed previous cycle.
+
+        The broker is authoritative for submitted-but-not-final orders. If a
+        process dies after broker acceptance but before local ledger write, the
+        next cycle first cancels any still-pending orders, then position
+        reconciliation/adoption handles anything that already filled.
+        """
+
+        method = getattr(self.broker, "open_orders_query", None)
+        if method is None:
+            return True
+        try:
+            rows = method(self.account_id, self.trd_env)
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(result, "open_orders_query", "*", exc)
+            return False
+
+        for row in rows:
+            status = str(row.get("order_status") or row.get("status") or "")
+            classification = classify_order_status(status)
+            if classification in {"filled", "dead"}:
+                continue
+            order_id = row.get("order_id")
+            if order_id is None:
+                self.audit.append(
+                    "open_order_reconcile_skipped",
+                    {"reason": "missing_order_id", "order": row, "at": now.isoformat()},
+                )
+                continue
+            order_id = str(order_id)
+            try:
+                self.broker.cancel_order(self.account_id, order_id, self.trd_env)
+            except Exception as exc:  # noqa: BLE001
+                self._record_error(result, "open_order_cancel", order_id, exc)
+                return False
+            result.open_orders_cancelled.append(order_id)
+            self.audit.append(
+                "open_order_cancelled",
+                {
+                    "order_id": order_id,
+                    "option_code": row.get("code") or row.get("option_code"),
+                    "status": status,
+                    "at": now.isoformat(),
+                },
+            )
+        return True
 
     def _adopt_orphans(
         self, now: datetime, held_rows: list[dict[str, Any]], result: CycleResult
@@ -337,10 +448,11 @@ class PaperTradingCycle:
             orphan_cost = entry * contracts * US_OPTION_LOT_SIZE
 
             # --- risk gate checks for orphan adoption ---
-            portfolio = self.mandate.portfolio
+            portfolio = self.active_mandate.portfolio
+            max_positions = self._max_positions()
             reject_reason = None
-            if current_count + 1 > portfolio.max_open_positions:
-                reject_reason = f"adopting {code} would exceed max open positions ({current_count}+1 > {portfolio.max_open_positions})"
+            if current_count + 1 > max_positions:
+                reject_reason = f"adopting {code} would exceed max open positions ({current_count}+1 > {max_positions})"
             elif portfolio.max_single_position_cost_usd > 0 and orphan_cost > portfolio.max_single_position_cost_usd:
                 reject_reason = f"adopting {code} cost ${orphan_cost:.0f} exceeds single position limit ${portfolio.max_single_position_cost_usd:.0f}"
             elif current_premium + orphan_cost > portfolio.max_total_premium_at_risk_usd:
@@ -380,9 +492,13 @@ class PaperTradingCycle:
         from trading_agent.execution.monitor import PositionMonitor
 
         monitor = PositionMonitor(
-            self.mandate.options.force_close_before_expiry_trading_days,
-            self.mandate.execution.stale_quote_seconds,
-            self.mandate.execution.delayed_quote_max_age_seconds,
+            self.active_mandate.options.force_close_before_expiry_trading_days,
+            self.active_mandate.execution.stale_quote_seconds,
+            self.active_mandate.execution.delayed_quote_max_age_seconds,
+            self.active_mandate.options.iv_crush_exit_drop_pct,
+            self.active_mandate.options.max_theta_decay_pct_per_day,
+            self.active_mandate.options.trailing_profit_activation_pct,
+            self.active_mandate.options.trailing_profit_giveback_pct,
         )
         monitored: list[MonitoredPosition] = []
         ledger_by_code: dict[str, dict[str, Any]] = {}
@@ -392,16 +508,35 @@ class PaperTradingCycle:
             if code not in held_codes:
                 continue
             try:
-                _, expiry, _, _ = parse_us_option_code(code)
-                quote = self.market.option_quote(
-                    option_code=code, expiry=expiry, lot_size=ledger["lot_size"], now=now
+                ticker, expiry, side, strike = parse_us_option_code(code)
+                quote = self._exit_quote(
+                    ticker=ticker,
+                    option_code=code,
+                    expiry=expiry,
+                    lot_size=ledger["lot_size"],
+                    now=now,
                 )
             except Exception as exc:  # noqa: BLE001
                 self._record_error(result, "exit_quote", code, exc)
                 continue
+            previous_peak = float(ledger.get("peak_bid") or 0.0)
+            peak_bid = max(previous_peak, float(quote.bid or 0.0))
+            if peak_bid > previous_peak:
+                self.position_store.update_peak_bid(code, peak_bid)
             ledger_by_code[code] = ledger
             window_end = ledger.get("catalyst_window_end")
             pre_earnings = ledger.get("pre_earnings_exit_date")
+            current_iv = self._current_option_iv(ticker, code, expiry, now)
+            theta_iv = current_iv or ledger.get("entry_iv")
+            theta_decay_pct = self._theta_decay_pct_per_day(
+                ticker=ticker,
+                side=side,
+                strike=strike,
+                expiry=expiry,
+                iv=float(theta_iv or 0.0),
+                mark=quote.bid,
+                now=now,
+            )
             position = MonitoredPosition(
                 option_code=code,
                 option_side=ledger["option_side"],
@@ -416,6 +551,10 @@ class PaperTradingCycle:
                 pre_earnings_exit_date=(
                     date.fromisoformat(pre_earnings) if pre_earnings else None
                 ),
+                entry_iv=ledger.get("entry_iv"),
+                current_iv=current_iv,
+                theta_decay_pct_per_day=theta_decay_pct,
+                peak_bid=peak_bid if peak_bid > 0 else None,
                 bid=quote.bid,
                 ask=quote.ask,
                 observed_at=quote.observed_at,
@@ -428,12 +567,36 @@ class PaperTradingCycle:
         for signal in monitor.evaluate(monitored, now):
             ledger = ledger_by_code[signal.option_code]
             limit = signal.mark_price if signal.mark_price > 0 else ledger["entry_price"]
-            # Sell ladder: try the mid first, fall back to the bid -- recovers
-            # roughly half the spread on fills that would happen anyway.
+            # Sell ladder: try the mid first, then the bid as a last resort
+            # before the limit (stop-loss). The bid rung recovers roughly half
+            # the spread on fills that would happen anyway; without it a
+            # mid→limit gap can leave an ITM position unhedged if the spread
+            # is wide and the signal fires near the bid.
             position = position_by_code.get(signal.option_code)
             ladder = [limit]
-            if position is not None and position.ask > position.bid > 0:
-                ladder = [round((position.bid + position.ask) / 2, 2), limit]
+            if position is not None and position.bid > 0:
+                ladder = self._exit_sell_ladder(
+                    position=position,
+                    limit=limit,
+                    max_chase_pct=self.active_mandate.execution.max_limit_chase_pct,
+                )
+            if position is not None:
+                self.audit.append(
+                    "exit_signal",
+                    self._exit_signal_payload(
+                        position=position,
+                        signal=signal,
+                        limit=limit,
+                        ladder=ladder,
+                        now=now,
+                        trailing_activation_pct=(
+                            self.active_mandate.options.trailing_profit_activation_pct
+                        ),
+                        trailing_giveback_pct=(
+                            self.active_mandate.options.trailing_profit_giveback_pct
+                        ),
+                    ),
+                )
             try:
                 fill = self.orders.place_and_await(
                     option_code=signal.option_code,
@@ -441,6 +604,9 @@ class PaperTradingCycle:
                     limit_price=limit,
                     side="sell",
                     price_ladder=ladder,
+                    on_order_submitted=lambda payload: self.audit.append(
+                        "order_submitted", payload
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001
                 self._record_error(result, "exit_order", signal.option_code, exc)
@@ -464,6 +630,8 @@ class PaperTradingCycle:
             self.position_store.mark_closed(
                 signal.option_code, close_reason=signal.reason, exit_price=exit_price
             )
+            if self.on_position_closed is not None:
+                self.on_position_closed(signal.option_code, signal.reason, exit_price)
             del marks[signal.option_code]
             self.audit.append(
                 "order_filled",
@@ -481,9 +649,247 @@ class PaperTradingCycle:
             result.exits.append({"option_code": signal.option_code, "reason": signal.reason})
         return marks
 
+    def _exit_quote(
+        self,
+        *,
+        ticker: str,
+        option_code: str,
+        expiry: date,
+        lot_size: int,
+        now: datetime,
+    ) -> _ExitQuote:
+        try:
+            quote = self.market.option_quote(
+                option_code=option_code, expiry=expiry, lot_size=lot_size, now=now
+            )
+            return _ExitQuote(
+                bid=float(quote.bid or 0.0),
+                ask=float(quote.ask or 0.0),
+                observed_at=quote.observed_at,
+                is_delayed=quote.is_delayed,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if not self._is_missing_ask_error(exc):
+                raise
+            fallback = self._exit_quote_from_chain(
+                ticker=ticker, option_code=option_code, expiry=expiry, now=now
+            )
+            if fallback is None:
+                raise
+            self.audit.append(
+                "exit_quote_degraded",
+                {
+                    "option_code": option_code,
+                    "reason": str(exc),
+                    "bid": round(fallback.bid, 4),
+                    "ask": round(fallback.ask, 4),
+                    "observed_at": fallback.observed_at.isoformat(),
+                    "is_delayed": fallback.is_delayed,
+                },
+            )
+            return fallback
+
+    @staticmethod
+    def _is_missing_ask_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "no ask" in message or (
+            "ask" in message and "greater than 0" in message
+        )
+
+    def _exit_quote_from_chain(
+        self,
+        *,
+        ticker: str,
+        option_code: str,
+        expiry: date,
+        now: datetime,
+    ) -> _ExitQuote | None:
+        chain = self.market.option_chain(ticker, expiry, expiry, "ALL")
+        row = next((r for r in chain if r.get("code") == option_code), None)
+        if row is None:
+            return None
+        bid = float(row.get("bid") or row.get("bid_price") or 0.0)
+        ask = float(row.get("ask") or row.get("ask_price") or 0.0)
+        if bid <= 0:
+            return None
+        observed = row.get("observed_at")
+        observed_at = parse_iso(observed) if observed else now
+        return _ExitQuote(
+            bid=bid,
+            ask=max(ask, 0.0),
+            observed_at=observed_at,
+            is_delayed=bool(row.get("is_delayed", True)),
+        )
+
+    @staticmethod
+    def _exit_sell_ladder(
+        *,
+        position: MonitoredPosition,
+        limit: float,
+        max_chase_pct: float,
+    ) -> list[float]:
+        """Sell-to-close ladder from patient to marketable.
+
+        Exit quotes can be delayed. A sell order parked exactly at the delayed
+        bid can miss a fast-moving live market, so the final rung is allowed to
+        concede up to ``max_chase_pct`` below the observed bid. This preserves
+        the existing mid/bid attempts while making a triggered exit much more
+        likely to actually leave the book.
+        """
+
+        bid = round(float(position.bid), 2)
+        ask = round(float(position.ask), 2)
+        base_limit = round(float(limit), 2)
+        if bid <= 0:
+            return [base_limit]
+
+        chase_pct = max(float(max_chase_pct or 0.0), 0.0)
+        aggressive = round(bid * (1.0 - chase_pct / 100.0), 2)
+        if aggressive <= 0 and bid > 0:
+            aggressive = 0.01
+
+        ladder: list[float] = []
+        prices = (bid, base_limit, aggressive)
+        if ask > bid:
+            prices = (round((bid + ask) / 2, 2), bid, base_limit, aggressive)
+        for price in prices:
+            if price > 0 and all(abs(price - seen) >= 0.005 for seen in ladder):
+                ladder.append(price)
+        return ladder
+
+    @staticmethod
+    def _exit_signal_payload(
+        *,
+        position: MonitoredPosition,
+        signal: Any,
+        limit: float,
+        ladder: list[float],
+        now: datetime,
+        trailing_activation_pct: float = 0.0,
+        trailing_giveback_pct: float = 0.0,
+    ) -> dict[str, Any]:
+        entry = float(position.entry_price)
+        take_profit_price = entry * (1 + position.take_profit_pct / 100.0)
+        stop_loss_price = entry * (1 - position.stop_loss_pct / 100.0)
+        payload: dict[str, Any] = {
+            "option_code": position.option_code,
+            "reason": signal.reason,
+            "mark_price": signal.mark_price,
+            "pnl_pct": signal.pnl_pct,
+            "entry_price": round(entry, 4),
+            "contracts": position.contracts,
+            "lot_size": position.lot_size,
+            "bid": round(float(position.bid), 4),
+            "ask": round(float(position.ask), 4),
+            "limit_price": round(float(limit), 4),
+            "price_ladder": [round(float(price), 4) for price in ladder],
+            "take_profit_pct": position.take_profit_pct,
+            "take_profit_price": round(take_profit_price, 4),
+            "stop_loss_pct": position.stop_loss_pct,
+            "stop_loss_price": round(max(stop_loss_price, 0.0), 4),
+            "observed_at": position.observed_at.isoformat(),
+            "quote_age_seconds": round((now - position.observed_at).total_seconds(), 3),
+            "is_delayed": position.is_delayed,
+        }
+        if position.peak_bid is not None:
+            peak_bid = float(position.peak_bid)
+            payload["peak_bid"] = round(peak_bid, 4)
+            if peak_bid > entry:
+                peak_profit = peak_bid - entry
+                payload["peak_profit_pct"] = round(peak_profit / entry * 100.0, 4)
+                if trailing_activation_pct > 0 and trailing_giveback_pct > 0:
+                    payload["trailing_profit_activation_pct"] = trailing_activation_pct
+                    payload["trailing_profit_giveback_pct"] = trailing_giveback_pct
+                    payload["trailing_activation_price"] = round(
+                        entry * (1 + trailing_activation_pct / 100.0), 4
+                    )
+                    payload["trailing_trigger_price"] = round(
+                        entry
+                        + peak_profit * (1 - trailing_giveback_pct / 100.0),
+                        4,
+                    )
+        return payload
+
+    def _current_option_iv(
+        self, ticker: str, option_code: str, expiry: date, now: datetime
+    ) -> float | None:
+        try:
+            chain = self.market.option_chain(ticker, now.date(), expiry, "ALL")
+        except Exception:  # noqa: BLE001 - exit Greeks are best-effort
+            return None
+        for row in chain:
+            if row.get("code") != option_code:
+                continue
+            iv = float(row.get("iv") or 0.0)
+            return iv if iv > 0 else None
+        return None
+
+    def _theta_decay_pct_per_day(
+        self,
+        *,
+        ticker: str,
+        side: str,
+        strike: float,
+        expiry: date,
+        iv: float,
+        mark: float,
+        now: datetime,
+    ) -> float | None:
+        if iv <= 0 or mark <= 0:
+            return None
+        spot = 0.0
+        method = getattr(self.market, "underlying_snapshot", None)
+        if method is not None:
+            try:
+                spot = float((method(ticker) or {}).get("price") or 0.0)
+            except Exception:  # noqa: BLE001 - exit Greeks are best-effort
+                spot = 0.0
+        if spot <= 0:
+            return None
+        dte = max((expiry - now.date()).days, 1)
+        theta = black_scholes_theta(
+            side=side,
+            spot=spot,
+            strike=strike,
+            t_years=dte / 365.0,
+            iv=iv,
+        ) / 365.0
+        if theta >= 0:
+            return 0.0
+        return round(abs(theta) / mark * 100.0, 3)
+
     # --- entries --------------------------------------------------------
+    def _vix(self, now: datetime) -> float | None:
+        """Current VIX level, or None when the feed has no index snapshot.
+
+        Used both by the cycle-wide entry block and as the value handed to the
+        deterministic risk gate (so the mandate's VIX cap is enforced inside the
+        gate too, not only here). A None return is audited as ``vix_unavailable``.
+        """
+
+        method = getattr(self.market, "underlying_snapshot", None)
+        if method is None:
+            return None
+        try:
+            vix = float((method("_VIX") or {}).get("price") or 0.0)
+        except Exception:  # noqa: BLE001 - missing data never blocks
+            vix = 0.0
+        if vix <= 0:
+            # Fail loud: a panic-regime guard that silently can't read the VIX is
+            # worse than no guard -- it looks active but isn't. Audit it so the
+            # gap is visible (the feed may lack an index snapshot).
+            self.audit.append("vix_unavailable", {"at": now.isoformat()})
+            return None
+        return vix
+
     def _entry_regime_block(self, now: datetime) -> str | None:
-        """Cycle-wide reason to skip ALL new entries, or None. Exits still run."""
+        """Cycle-wide reason to skip ALL new entries, or None. Exits still run.
+
+        This is a cheap pre-filter that avoids spending LLM tokens when the whole
+        market is in a panic regime or just opened. The same VIX/minutes rules
+        are ALSO enforced inside the deterministic risk gate (per-proposal), so a
+        caller that bypasses this orchestrator still cannot trade through them.
+        """
 
         window = self.active_mandate.execution.no_entry_minutes_after_open
         if window > 0:
@@ -493,20 +899,43 @@ class PaperTradingCycle:
 
         vix_cap = self.active_mandate.portfolio.max_vix_for_entries
         if vix_cap > 0:
-            vix = 0.0
-            method = getattr(self.market, "underlying_snapshot", None)
-            if method is not None:
-                try:
-                    vix = float((method("_VIX") or {}).get("price") or 0.0)
-                except Exception:  # noqa: BLE001 - missing data never blocks
-                    vix = 0.0
-            if vix <= 0:
-                # Fail loud: a panic-regime guard that silently can't read the
-                # VIX is worse than no guard -- it looks active but isn't. Audit
-                # it so the gap is visible (the feed may lack an index snapshot).
-                self.audit.append("vix_unavailable", {"at": now.isoformat()})
-            elif vix > vix_cap:
+            vix = self._vix(now)
+            if vix is not None and vix > vix_cap:
                 return f"VIX {vix:.1f} above the {vix_cap:.0f} entry cap"
+        return None
+
+    def _entry_capacity_block(self, now: datetime, held_codes: set[str]) -> str | None:
+        """Cheap reason to skip universe selection before spending scan/API work."""
+
+        open_rows = [
+            row
+            for row in self.position_store.open_positions()
+            if row["option_code"] in held_codes
+        ]
+        max_positions = self._max_positions()
+        if len(open_rows) >= max_positions:
+            return f"maximum open positions reached ({len(open_rows)}/{max_positions})"
+
+        premium = sum(
+            row["entry_price"] * row["contracts"] * row["lot_size"]
+            for row in open_rows
+        )
+        premium_cap = self.active_mandate.portfolio.max_total_premium_at_risk_usd
+        if premium_cap > 0 and premium >= premium_cap:
+            return (
+                f"total premium at risk at limit "
+                f"(${premium:.0f}/${premium_cap:.0f})"
+            )
+
+        today = market_date(now)
+        new_today = sum(
+            1
+            for opened_at in self.position_store.opened_at_values()
+            if self._date_of(opened_at) == today
+        )
+        max_new = self.active_mandate.portfolio.max_new_positions_per_day
+        if new_today >= max_new:
+            return f"daily new-position limit reached ({new_today}/{max_new})"
         return None
 
     def _run_entries(
@@ -533,7 +962,12 @@ class PaperTradingCycle:
                 held_codes.add(opened_code)
 
     def _eligible_candidates(
-        self, now: datetime, ticker: str, result: CycleResult, spot: float = 0.0
+        self,
+        now: datetime,
+        ticker: str,
+        result: CycleResult,
+        spot: float = 0.0,
+        iv_rank_val: float | None = None,
     ) -> list[OptionCandidate]:
         """Mandate-eligible contracts from the live chain, for the committee.
 
@@ -595,7 +1029,12 @@ class PaperTradingCycle:
             # paths: a guide, not the gate.
             mc_pop: float | None = None
             delta: float | None = None
+            gamma: float | None = None
+            vega: float | None = None
+            theta: float | None = None
+            theta_decay_pct: float | None = None
             if spot > 0 and 0 < iv <= MAX_USABLE_IV:
+                t_years = max(verdict.dte, 1) / 365.0
                 mc_pop = round(
                     win_probability(
                         side=row["side"],
@@ -616,11 +1055,43 @@ class PaperTradingCycle:
                         side=row["side"],
                         spot=spot,
                         strike=row["strike"],
-                        t_years=max(verdict.dte, 1) / 365.0,
+                        t_years=t_years,
                         iv=iv,
                     ),
                     3,
                 )
+                gamma = round(
+                    black_scholes_gamma(
+                        spot=spot,
+                        strike=row["strike"],
+                        t_years=t_years,
+                        iv=iv,
+                    ),
+                    4,
+                )
+                vega = round(
+                    black_scholes_vega(
+                        spot=spot,
+                        strike=row["strike"],
+                        t_years=t_years,
+                        iv=iv,
+                    )
+                    * 0.01,
+                    4,
+                )
+                theta = round(
+                    black_scholes_theta(
+                        side=row["side"],
+                        spot=spot,
+                        strike=row["strike"],
+                        t_years=t_years,
+                        iv=iv,
+                    )
+                    / 365.0,
+                    4,
+                )
+                if ask > 0 and theta < 0:
+                    theta_decay_pct = round(abs(theta) / ask * 100.0, 3)
             candidates.append(
                 OptionCandidate(
                     option_code=row["code"],
@@ -636,6 +1107,11 @@ class PaperTradingCycle:
                     estimated_contract_cost_usd=verdict.estimated_contract_cost_usd,
                     mc_pop=mc_pop,
                     delta=delta,
+                    gamma=gamma,
+                    vega=vega,
+                    theta=theta,
+                    theta_decay_pct_per_day=theta_decay_pct,
+                    iv_rank=iv_rank_val,
                     breakeven_move_pct=self._breakeven_move_pct(
                         row["side"], spot, row["strike"], ask
                     ),
@@ -678,26 +1154,48 @@ class PaperTradingCycle:
         so single-word tickers (TE, BULL) stop pulling unrelated headlines.
         """
 
-        evidence = list(self.sec_client.fetch_evidence(ticker, fetch_bodies=True))
-        if self.news_client is not None:
+        def fetch_sec() -> list[Any]:
+            return list(self.sec_client.fetch_evidence(ticker, fetch_bodies=True))
+
+        def fetch_news() -> list[Any]:
+            if self.news_client is None:
+                return []
             query_name = None
             try:
                 query_name = self.sec_client.company_name(ticker)
             except Exception:  # noqa: BLE001 - name lookup is best-effort
                 query_name = None
-            try:
-                evidence.extend(
-                    self.news_client.fetch_evidence(ticker, query_name=query_name)
-                )
-            except Exception as exc:  # noqa: BLE001
-                self._record_error(result, "news_fetch", ticker, exc)
-        if self.earnings_client is not None:
-            # Upcoming earnings inside the holding window: feeds the existing
-            # earnings_iv_crush red flag BEFORE the print, not after it.
-            try:
-                evidence.extend(self.earnings_client.fetch_evidence(ticker))
-            except Exception as exc:  # noqa: BLE001
-                self._record_error(result, "earnings_fetch", ticker, exc)
+            return list(self.news_client.fetch_evidence(ticker, query_name=query_name))
+
+        def fetch_earnings() -> list[Any]:
+            if self.earnings_client is None:
+                return []
+            # Upcoming earnings inside the holding window feeds the existing
+            # earnings_iv_crush red flag before the print, not after it.
+            return list(self.earnings_client.fetch_evidence(ticker))
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = {
+                "sec_fetch": pool.submit(fetch_sec),
+                "news_fetch": pool.submit(fetch_news),
+                "earnings_fetch": pool.submit(fetch_earnings),
+            }
+            results: dict[str, list[Any]] = {}
+            sec_error: Exception | None = None
+            for stage, future in futures.items():
+                try:
+                    results[stage] = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    if stage == "sec_fetch":
+                        sec_error = exc
+                    else:
+                        self._record_error(result, stage, ticker, exc)
+            if sec_error is not None:
+                raise sec_error
+        evidence: list[Any] = []
+        evidence.extend(results.get("sec_fetch", []))
+        evidence.extend(results.get("news_fetch", []))
+        evidence.extend(results.get("earnings_fetch", []))
         return evidence
 
     def _underlying_snapshot(
@@ -709,22 +1207,29 @@ class PaperTradingCycle:
         from the CBOE/Yahoo fallback so IV Rank can be computed.
         """
 
-        # Try Moomoo first (real-time)
-        moomoo_snap = None
-        if self.moomoo_market is not None:
-            try:
-                moomoo_snap = self.moomoo_market.stock_snapshot(ticker)
-            except Exception as exc:  # noqa: BLE001
-                self._record_error(result, "moomoo_stock_snapshot", ticker, exc)
+        def fetch_moomoo() -> dict[str, Any] | None:
+            if self.moomoo_market is None:
+                return None
+            return self.moomoo_market.stock_snapshot(ticker)
 
-        # Fallback to option data provider (delayed) for iv30 enrichment.
-        cboe_snap = None
-        method = getattr(self.market, "underlying_snapshot", None)
-        if method is not None:
+        def fetch_delayed() -> dict[str, Any] | None:
+            method = getattr(self.market, "underlying_snapshot", None)
+            if method is None:
+                return None
+            return method(ticker) or None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            moomoo_future = pool.submit(fetch_moomoo)
+            delayed_future = pool.submit(fetch_delayed)
             try:
-                cboe_snap = method(ticker) or None
+                moomoo_snap = moomoo_future.result()
+            except Exception as exc:  # noqa: BLE001
+                moomoo_snap = None
+                self._record_error(result, "moomoo_stock_snapshot", ticker, exc)
+            try:
+                cboe_snap = delayed_future.result()
             except Exception:  # noqa: BLE001
-                pass
+                cboe_snap = None
 
         # Prefer Moomoo price (real-time), always enrich with CBOE iv30 if missing.
         snapshot = moomoo_snap or cboe_snap
@@ -792,6 +1297,19 @@ class PaperTradingCycle:
             return None
         return subtract_trading_days(earnings_day, k)
 
+    def _iv_rank_value(self, ticker: str, snapshot: dict | None) -> float | None:
+        current_iv30 = float((snapshot or {}).get("iv30") or 0.0)
+        if current_iv30 <= 0 or self.iv_history is None:
+            return None
+        extremes = self.iv_history.extremes(ticker)
+        if extremes is None:
+            return None
+        return iv_rank(
+            current_iv=current_iv30,
+            iv_52w_high=extremes[0],
+            iv_52w_low=extremes[1],
+        )
+
     def _try_enter(
         self, now: datetime, ticker: str, held_codes: set[str], result: CycleResult
     ) -> str | None:
@@ -803,8 +1321,11 @@ class PaperTradingCycle:
             if current_iv30 > 0:
                 self.iv_history.record(ticker, current_iv30, today=market_date(now))
 
+        iv_rank_val = self._iv_rank_value(ticker, snapshot)
         spot = float((snapshot or {}).get("price") or 0.0)
-        candidates = self._eligible_candidates(now, ticker, result, spot=spot)
+        candidates = self._eligible_candidates(
+            now, ticker, result, spot=spot, iv_rank_val=iv_rank_val
+        )
         if not candidates:
             self.audit.append(
                 "no_eligible_contracts", {"ticker": ticker, "at": now.isoformat()}
@@ -887,7 +1408,7 @@ class PaperTradingCycle:
 
         output = self._get_or_run_committee(
             now, ticker, candidates, snapshot, price_context, result,
-            pre_context=context, pre_scores=scores,
+            pre_context=context, pre_scores=scores, iv_rank_val=iv_rank_val,
         )
         if output is None or output.decision != "open_position" or output.proposal is None:
             return None
@@ -912,6 +1433,7 @@ class PaperTradingCycle:
         result: CycleResult,
         pre_context=None,
         pre_scores=None,
+        iv_rank_val: float | None = None,
     ):
         """Return committee decision from cache or a fresh LLM run."""
         if pre_context is not None and pre_scores is not None:
@@ -959,18 +1481,6 @@ class PaperTradingCycle:
             )
             return None
 
-        # Compute IV Rank from snapshot iv30 and local history.
-        current_iv30 = float((snapshot or {}).get("iv30") or 0.0)
-        iv_rank_val = None
-        if current_iv30 > 0 and self.iv_history is not None:
-            extremes = self.iv_history.extremes(ticker)
-            if extremes is not None:
-                iv_rank_val = iv_rank(
-                    current_iv=current_iv30,
-                    iv_52w_high=extremes[0],
-                    iv_52w_low=extremes[1],
-                )
-
         before = self.committee.usage_total()
         output = self.committee.run(
             context, scores, candidates=candidates, market_snapshot=snapshot,
@@ -981,7 +1491,14 @@ class PaperTradingCycle:
             "committee_run",
             {"ticker": ticker, "decision": output.decision, "output": output.model_dump(mode="json")},
         )
-        self.audit.append("llm_usage", {"ticker": ticker, **usage.model_dump(mode="json")})
+        self.audit.append(
+            "llm_usage",
+            {
+                "ticker": ticker,
+                **usage.model_dump(mode="json"),
+                "total_tokens": usage.total_tokens,
+            },
+        )
         if self.llm_budget is not None:
             self.llm_budget.add(usage.total_tokens, today)
         if self.decision_cache is not None:
@@ -1034,6 +1551,7 @@ class PaperTradingCycle:
                     stop_loss_pct=proposal.exit_plan.stop_loss_pct,
                     hold_days=hold_days if hold_days > 0 else None,
                     seed=stable_seed(proposal.option_code),
+                    as_of=now.date(),
                 )
                 self.audit.append(
                     "monte_carlo_pop",
@@ -1098,7 +1616,34 @@ class PaperTradingCycle:
             )
             return None
 
-        portfolio = self._portfolio_state(now, held_codes, proposal)
+        portfolio = self._portfolio_state(now, held_codes, proposal, candidate, quote.lot_size)
+        self.audit.append(
+            "portfolio_greeks",
+            {
+                "ticker": ticker,
+                "option_code": proposal.option_code,
+                "total_delta": portfolio.total_delta,
+                "total_gamma": portfolio.total_gamma,
+                "total_vega": portfolio.total_vega,
+                "total_theta": portfolio.total_theta,
+                "proposal_delta": portfolio.proposal_delta,
+                "proposal_gamma": portfolio.proposal_gamma,
+                "proposal_vega": portfolio.proposal_vega,
+                "proposal_theta": portfolio.proposal_theta,
+                "after_delta": round(
+                    portfolio.total_delta + (portfolio.proposal_delta or 0.0), 4
+                ),
+                "after_gamma": round(
+                    portfolio.total_gamma + (portfolio.proposal_gamma or 0.0), 4
+                ),
+                "after_vega": round(
+                    portfolio.total_vega + (portfolio.proposal_vega or 0.0), 4
+                ),
+                "after_theta": round(
+                    portfolio.total_theta + (portfolio.proposal_theta or 0.0), 4
+                ),
+            },
+        )
         decision = self.active_gate.evaluate_open(proposal, quote, portfolio, now)
         self.audit.append(
             "proposal_checked",
@@ -1121,6 +1666,9 @@ class PaperTradingCycle:
             limit_price=proposal.limit_price,
             side="buy",
             price_ladder=buy_ladder,
+            on_order_submitted=lambda payload: self.audit.append(
+                "order_submitted", payload
+            ),
         )
         self.audit.append("order_placed", {"option_code": proposal.option_code, "side": "buy"})
         if not fill.filled:
@@ -1147,6 +1695,14 @@ class PaperTradingCycle:
             time_stop=proposal.exit_plan.time_stop,
             catalyst_window_end=_parse_window_end(proposal.expected_catalyst_window),
             pre_earnings_exit_date=self._pre_earnings_exit_date(ticker),
+            entry_spot=spot if spot > 0 else None,
+            entry_iv=candidate.iv,
+            entry_delta=candidate.delta,
+            entry_gamma=candidate.gamma,
+            entry_vega=candidate.vega,
+            entry_theta=candidate.theta,
+            entry_theta_decay_pct_per_day=candidate.theta_decay_pct_per_day,
+            entry_iv_rank=candidate.iv_rank,
         )
         self.audit.append(
             "order_filled",
@@ -1159,13 +1715,7 @@ class PaperTradingCycle:
     def _closed_rows(self) -> list[dict[str, Any]]:
         """Closed ledger rows in close order (ISO timestamps sort correctly)."""
 
-        closed = [
-            r
-            for r in self.position_store.all_positions()
-            if r["status"] == "closed" and r["exit_price"] is not None
-        ]
-        closed.sort(key=lambda r: str(r.get("closed_at") or ""))
-        return closed
+        return self.position_store.closed_positions()
 
     def _net_pnl(
         self, entry_price: float, exit_price: float, contracts: int, lot_size: int
@@ -1249,17 +1799,32 @@ class PaperTradingCycle:
         return round(daily_pnl, 4), round(drawdown, 4), consecutive_losses
 
     def _portfolio_state(
-        self, now: datetime, held_codes: set[str], proposal: OpenPositionProposal
+        self,
+        now: datetime,
+        held_codes: set[str],
+        proposal: OpenPositionProposal,
+        candidate: OptionCandidate | None = None,
+        lot_size: int = US_OPTION_LOT_SIZE,
     ) -> PortfolioState:
-        ledger_all = self.position_store.all_positions()
+        open_rows = self.position_store.open_positions()
         today = market_date(now)
         premium = sum(
             r["entry_price"] * r["contracts"] * r["lot_size"]
-            for r in ledger_all
-            if r["status"] == "open" and r["option_code"] in held_codes
+            for r in open_rows
+            if r["option_code"] in held_codes
         )
-        new_today = sum(1 for r in ledger_all if self._date_of(r["opened_at"]) == today)
+        new_today = sum(
+            1
+            for opened_at in self.position_store.opened_at_values()
+            if self._date_of(opened_at) == today
+        )
         daily_pnl, drawdown, consecutive_losses = self._realized_pnl(now)
+        totals = self._portfolio_greeks(open_rows, held_codes)
+        proposal_greeks = (
+            self._candidate_greek_exposure(candidate, proposal.contracts, lot_size)
+            if candidate is not None
+            else {}
+        )
 
         return PortfolioState(
             open_positions=len(held_codes),
@@ -1272,7 +1837,52 @@ class PaperTradingCycle:
             underlying_already_held=self._same_underlying_held(
                 proposal.option_code, held_codes
             ),
+            vix=self._vix(now),
+            minutes_since_open=minutes_since_open(now),
+            total_delta=totals["delta"],
+            total_gamma=totals["gamma"],
+            total_vega=totals["vega"],
+            total_theta=totals["theta"],
+            proposal_delta=proposal_greeks.get("delta"),
+            proposal_gamma=proposal_greeks.get("gamma"),
+            proposal_vega=proposal_greeks.get("vega"),
+            proposal_theta=proposal_greeks.get("theta"),
+            proposal_abs_delta=abs(candidate.delta) if candidate and candidate.delta is not None else None,
+            proposal_gamma_per_contract=(
+                candidate.gamma if candidate is not None else None
+            ),
+            proposal_theta_decay_pct_per_day=(
+                candidate.theta_decay_pct_per_day if candidate is not None else None
+            ),
+            proposal_iv_rank=candidate.iv_rank if candidate is not None else None,
         )
+
+    @staticmethod
+    def _portfolio_greeks(
+        ledger_rows: list[dict[str, Any]], held_codes: set[str]
+    ) -> dict[str, float]:
+        totals = {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0}
+        for row in ledger_rows:
+            if row["status"] != "open" or row["option_code"] not in held_codes:
+                continue
+            multiplier = float(row["contracts"] * row["lot_size"])
+            totals["delta"] += float(row.get("entry_delta") or 0.0) * multiplier
+            totals["gamma"] += float(row.get("entry_gamma") or 0.0) * multiplier
+            totals["vega"] += float(row.get("entry_vega") or 0.0) * multiplier
+            totals["theta"] += float(row.get("entry_theta") or 0.0) * multiplier
+        return {key: round(value, 4) for key, value in totals.items()}
+
+    @staticmethod
+    def _candidate_greek_exposure(
+        candidate: OptionCandidate, contracts: int, lot_size: int
+    ) -> dict[str, float]:
+        multiplier = float(contracts * lot_size)
+        return {
+            "delta": round(float(candidate.delta or 0.0) * multiplier, 4),
+            "gamma": round(float(candidate.gamma or 0.0) * multiplier, 4),
+            "vega": round(float(candidate.vega or 0.0) * multiplier, 4),
+            "theta": round(float(candidate.theta or 0.0) * multiplier, 4),
+        }
 
     @staticmethod
     def _same_underlying_held(option_code: str, held_codes: set[str]) -> bool:
@@ -1294,7 +1904,7 @@ class PaperTradingCycle:
 
     @staticmethod
     def _date_of(iso: str) -> date:
-        return market_date(datetime.fromisoformat(str(iso).replace("Z", "+00:00")))
+        return market_date(parse_iso(iso))
 
     def _record_error(
         self, result: CycleResult, stage: str, ref: str, exc: Exception

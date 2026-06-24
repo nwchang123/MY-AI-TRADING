@@ -226,6 +226,8 @@ class Committee:
         pre_earnings_exit_trading_days: int = 0,
         earnings_window_max_days: int = 0,
         veto_win_prob_penalty: float = 0.0,
+        default_take_profit_pct: float = 100.0,
+        default_stop_loss_pct: float = 50.0,
     ):
         self.client = client
         self.pro_client = pro_client or client
@@ -256,6 +258,11 @@ class Committee:
         # was a pre-earnings IV-ramp entry, so the skeptic vetoed all of them for
         # not having an upcoming earnings date / a post-earnings expiry.
         self.earnings_window_max_days = earnings_window_max_days
+        # Default TP/SL for the Kelly sizing hint shown alongside each
+        # candidate contract (no proposal exists yet at briefing time). Mirrors
+        # the mandate's exit ladder so the brief and the prompt agree.
+        self.default_take_profit_pct = default_take_profit_pct
+        self.default_stop_loss_pct = default_stop_loss_pct
 
     def usage_total(self) -> LLMUsage:
         """Aggregate token/call usage across the distinct clients in use.
@@ -334,7 +341,12 @@ class Committee:
         # In candidate mode the options_analyst/PM pick a real listed contract
         # from ``effective`` instead of guessing one; the PM's option_code is
         # then constrained to that set. ``candidates=None`` keeps legacy behavior.
-        candidate_block = self._format_candidates(effective, iv_rank=iv_rank)
+        candidate_block = self._format_candidates(
+            effective,
+            iv_rank=iv_rank,
+            kelly_tp_pct=self.default_take_profit_pct,
+            kelly_sl_pct=self.default_stop_loss_pct,
+        )
         candidate_codes = (
             {c.option_code for c in effective} if effective else None
         )
@@ -706,7 +718,6 @@ class Committee:
         )
 
     @staticmethod
-    @staticmethod
     def _format_candidates(
         candidates: list[OptionCandidate] | None,
         iv_rank: float | None = None,
@@ -722,7 +733,9 @@ class Committee:
             "WIN_PROB above it is a claim that the catalyst adds real edge. "
             "delta is how much the option tracks the stock (|delta| near 0.5 = "
             "near the money); breakeven_move is the % the stock must move by "
-            "expiry just to break even (closer to 0 = less has to go right)."
+            "expiry just to break even (closer to 0 = less has to go right). "
+            "gamma shows how quickly delta changes, vega is $ sensitivity per "
+            "1 IV point, and theta is expected daily time decay."
         ]
         if iv_rank is not None:
             iv_pct = round(iv_rank * 100)
@@ -738,6 +751,14 @@ class Committee:
         for c in candidates:
             mc = "n/a" if c.mc_pop is None else f"{c.mc_pop}"
             delta = "n/a" if c.delta is None else f"{c.delta:+.2f}"
+            gamma = "n/a" if c.gamma is None else f"{c.gamma:.4f}"
+            vega = "n/a" if c.vega is None else f"{c.vega:.4f}"
+            theta = "n/a" if c.theta is None else f"{c.theta:+.4f}"
+            theta_decay = (
+                "n/a"
+                if c.theta_decay_pct_per_day is None
+                else f"{c.theta_decay_pct_per_day:.1f}%/day"
+            )
             be = (
                 "n/a"
                 if c.breakeven_move_pct is None
@@ -757,7 +778,8 @@ class Committee:
                 f"  {c.option_code} {c.option_side} strike={c.strike} "
                 f"expiry={c.expiry.isoformat()} DTE={c.dte} bid={c.bid} ask={c.ask} "
                 f"OI={c.open_interest} vol={c.daily_volume} iv={c.iv} "
-                f"delta={delta} breakeven_move={be} "
+                f"delta={delta} gamma={gamma} vega={vega} theta={theta} "
+                f"theta_decay={theta_decay} breakeven_move={be} "
                 f"est_cost=${c.estimated_contract_cost_usd} mc_pop={mc} "
                 f"kelly={kelly}"
             )

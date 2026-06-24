@@ -3,6 +3,9 @@ from __future__ import annotations
 import math
 import random
 import zlib
+from datetime import date, timedelta
+
+from trading_agent.domain.calendar import is_trading_day
 
 # Deterministic, math-based probability-of-profit for one long-option trade.
 #
@@ -205,16 +208,23 @@ def win_probability(
     paths: int = 2000,
     rate: float = 0.04,
     seed: int | None = None,
+    as_of: date | None = None,
 ) -> float:
     """P(option mark reaches take-profit before stop-loss or the horizon).
 
-    Simulates daily GBM steps of the underlying and re-prices the option with
+    Simulates GBM steps of the underlying and re-prices the option with
     Black-Scholes (same IV) along each path, mirroring how the position
     monitor actually exits: the FIRST barrier touched decides. Paths that
     reach the horizon (time stop / forced close before expiry) without
     touching take-profit are losses for this purpose, matching the committee's
     WIN_PROB definition. No edge or IV change is modeled -- this is the
     no-catalyst baseline.
+
+    ``as_of`` (recommended) steps the simulation over TRADING days starting
+    from that calendar date, skipping weekends/holidays -- a step then spans
+    the actual calendar days elapsed (a Friday→Monday step uses 3/365y),
+    which is how the position monitor actually samples marks. Without it the
+    legacy calendar-day cadence is used so existing seeded tests stay stable.
     """
 
     if spot <= 0 or strike <= 0 or iv <= 0 or entry_price <= 0:
@@ -224,23 +234,35 @@ def win_probability(
 
     # Stop simulating where the monitor force-closes (~2 trading days before
     # expiry) or at the proposal's own time stop, whichever comes first.
-    horizon = max(1, dte_days - 3)
+    # ``dte_days`` is in CALENDAR days (broker convention), so when stepping
+    # over trading days we still cap the step count by the same horizon but
+    # convert via the trading-day calendar so weekends don't burn a step.
+    horizon_calendar_days = max(1, dte_days - 3)
     if hold_days is not None:
-        horizon = max(1, min(horizon, hold_days))
+        horizon_calendar_days = max(1, min(horizon_calendar_days, hold_days))
 
     tp_level = entry_price * (1.0 + take_profit_pct / 100.0)
     sl_level = entry_price * (1.0 - stop_loss_pct / 100.0)
     rng = random.Random(seed)
-    dt = 1.0 / 365.0
-    drift = (rate - 0.5 * iv * iv) * dt
-    vol = iv * math.sqrt(dt)
+
+    # Build the list of (step_calendar_days_elapsed) for each simulated step.
+    # Each step's dt is the calendar days since the previous step / 365y, so
+    # option pricing (always actual/365) stays correct while the cadence
+    # matches real market sessions.
+    if as_of is not None:
+        steps = _trading_day_steps(as_of, horizon_calendar_days, dte_days)
+    else:
+        steps = [(1, day) for day in range(1, horizon_calendar_days + 1)]
 
     wins = 0
     for _ in range(paths):
         s = spot
-        for day in range(1, horizon + 1):
+        for step_dt_days, day_elapsed in steps:
+            dt = step_dt_days / 365.0
+            drift = (rate - 0.5 * iv * iv) * dt
+            vol = iv * math.sqrt(dt)
             s *= math.exp(drift + vol * rng.gauss(0.0, 1.0))
-            t_remaining = max(dte_days - day, 0) / 365.0
+            t_remaining = max(dte_days - day_elapsed, 0) / 365.0
             mark = black_scholes_price(
                 side=side, spot=s, strike=strike, t_years=t_remaining, iv=iv,
                 rate=rate,
@@ -251,6 +273,39 @@ def win_probability(
             if mark <= sl_level:
                 break
     return wins / paths
+
+
+def _trading_day_steps(
+    start: date, horizon_calendar_days: int, dte_days: int
+) -> list[tuple[int, int]]:
+    """Return ``(calendar_days_in_step, total_calendar_days_elapsed)`` per step.
+
+    Walks forward from ``start`` over trading days only, stopping once the
+    cumulative calendar span reaches ``horizon_calendar_days`` or we run out
+    of DTE. Each entry's first element is the gap (in calendar days) from the
+    previous session -- typically 1, but 3 over a weekend and more over a
+    holiday weekend -- so drift/vol scale to the real elapsed time.
+    """
+
+    steps: list[tuple[int, int]] = []
+    prev = start
+    cur = start + timedelta(days=1)
+    guard = 0
+    while guard < 4 * (horizon_calendar_days + 14):
+        guard += 1
+        if is_trading_day(cur):
+            gap = (cur - prev).days
+            elapsed = (cur - start).days
+            if elapsed > horizon_calendar_days or elapsed >= dte_days:
+                break
+            steps.append((gap, elapsed))
+            prev = cur
+        cur += timedelta(days=1)
+    if not steps:
+        # Degenerate horizon (e.g. expiry today): one minimal step so the
+        # inner loop runs at least once and pricing still works.
+        steps.append((1, 1))
+    return steps
 
 
 # ---------------------------------------------------------------------------

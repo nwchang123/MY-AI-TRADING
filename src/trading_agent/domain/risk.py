@@ -87,6 +87,26 @@ class OptionsMandate(BaseModel):
     # exceeds this -- a name that has already ramped is the peak-IV trap we are
     # trying to avoid. 0 (default) disables the IV ceiling.
     max_entry_iv: float = Field(default=0.0, ge=0)
+    # Hard Greeks filters for long-premium entries. 0 disables each threshold.
+    min_abs_delta: float = Field(default=0.0, ge=0, le=1)
+    max_gamma_per_contract: float = Field(default=0.0, ge=0)
+    max_theta_decay_pct_per_day: float = Field(default=0.0, ge=0)
+    max_iv_rank_for_long_premium: float = Field(default=0.0, ge=0, le=1)
+    # Exit long premium when current option IV has fallen this many percent from
+    # entry IV. 25 means entry 80% IV exits at/below 60% IV. 0 disables.
+    iv_crush_exit_drop_pct: float = Field(default=0.0, ge=0, le=100)
+    # Profit-protection trailing exit. Once the best observed bid is at least
+    # this many percent above entry, exit if that open profit gives back
+    # ``trailing_profit_giveback_pct``. Both 0 disables the rule.
+    trailing_profit_activation_pct: float = Field(default=0.0, ge=0)
+    trailing_profit_giveback_pct: float = Field(default=0.0, ge=0, le=100)
+    # Default exit ladder the committee briefs against when no LLM proposal
+    # exists yet (used for the Kelly sizing hint on the candidate block).
+    # Keep aligned with the prompt's exit_plan example so the model isn't
+    # nudged toward a different TP/SL than the brief assumes. Defaults preserve
+    # the historical +100 / -50 baseline.
+    default_take_profit_pct: float = Field(default=100.0, gt=0)
+    default_stop_loss_pct: float = Field(default=50.0, gt=0, le=100)
 
 
 class PortfolioMandate(BaseModel):
@@ -104,6 +124,12 @@ class PortfolioMandate(BaseModel):
     # (panic regimes blow out small-cap option spreads and inflate IV; buying
     # premium into them is structurally bad). Exits still run. 0 disables.
     max_vix_for_entries: float = Field(default=0.0, ge=0)
+    # Optional portfolio Greeks caps. 0 disables each cap. The gate evaluates
+    # the open book plus the proposed new trade.
+    max_portfolio_abs_delta: float = Field(default=0.0, ge=0)
+    max_portfolio_gamma: float = Field(default=0.0, ge=0)
+    max_portfolio_vega: float = Field(default=0.0, ge=0)
+    max_portfolio_theta_decay_usd_per_day: float = Field(default=0.0, ge=0)
 
 
 class ExecutionMandate(BaseModel):
@@ -234,6 +260,31 @@ class PortfolioState(BaseModel):
     # strike/expiry included): with a 2-position book, two contracts on one
     # name concentrates the whole account in a single ticker.
     underlying_already_held: bool = False
+    # --- market-regime guards (Optional: None = caller could not read it). ---
+    # These live in the deterministic gate, not the orchestrator, so the
+    # mandate's "no entries above VIX X / in the first N minutes after the
+    # open" rules can never be bypassed by a different caller (e.g. the
+    # ``proposal-check`` CLI or a future execution path). None means "no
+    # reading available" -- the check is skipped rather than silently passing,
+    # because a market-data outage should not change whether a panic-regime
+    # guard fires; the orchestrator audits the unavailability separately.
+    vix: float | None = None
+    minutes_since_open: float | None = None
+    # Current open-book Greeks from the local ledger, plus the proposed trade's
+    # Greeks. Delta is signed share-equivalent; gamma/vega are dollar-greek
+    # equivalents after multiplying by contracts*lot_size; theta is USD/day.
+    total_delta: float = 0.0
+    total_gamma: float = 0.0
+    total_vega: float = 0.0
+    total_theta: float = 0.0
+    proposal_delta: float | None = None
+    proposal_gamma: float | None = None
+    proposal_vega: float | None = None
+    proposal_theta: float | None = None
+    proposal_abs_delta: float | None = None
+    proposal_gamma_per_contract: float | None = None
+    proposal_theta_decay_pct_per_day: float | None = None
+    proposal_iv_rank: float | None = None
 
 
 class RiskDecision(BaseModel):
@@ -303,6 +354,60 @@ class RiskGate:
         if proposal.confidence < self.mandate.options.min_estimated_win_probability:
             reasons.append("estimated win probability below mandate minimum")
 
+        if (
+            self.mandate.options.min_abs_delta > 0
+            and portfolio.proposal_abs_delta is not None
+            and portfolio.proposal_abs_delta < self.mandate.options.min_abs_delta
+        ):
+            reasons.append("absolute delta is below mandate minimum")
+        if (
+            self.mandate.options.max_gamma_per_contract > 0
+            and portfolio.proposal_gamma_per_contract is not None
+            and portfolio.proposal_gamma_per_contract
+            > self.mandate.options.max_gamma_per_contract
+        ):
+            reasons.append("gamma exceeds mandate limit")
+        if (
+            self.mandate.options.max_theta_decay_pct_per_day > 0
+            and portfolio.proposal_theta_decay_pct_per_day is not None
+            and portfolio.proposal_theta_decay_pct_per_day
+            > self.mandate.options.max_theta_decay_pct_per_day
+        ):
+            reasons.append("theta decay exceeds mandate limit")
+        if (
+            self.mandate.options.max_iv_rank_for_long_premium > 0
+            and portfolio.proposal_iv_rank is not None
+            and portfolio.proposal_iv_rank
+            > self.mandate.options.max_iv_rank_for_long_premium
+        ):
+            reasons.append("IV rank exceeds mandate limit for long premium")
+
+        after_delta = portfolio.total_delta + (portfolio.proposal_delta or 0.0)
+        after_gamma = portfolio.total_gamma + (portfolio.proposal_gamma or 0.0)
+        after_vega = portfolio.total_vega + (portfolio.proposal_vega or 0.0)
+        after_theta_decay = abs(portfolio.total_theta + (portfolio.proposal_theta or 0.0))
+        if (
+            self.mandate.portfolio.max_portfolio_abs_delta > 0
+            and abs(after_delta) > self.mandate.portfolio.max_portfolio_abs_delta
+        ):
+            reasons.append("portfolio delta exposure would exceed mandate limit")
+        if (
+            self.mandate.portfolio.max_portfolio_gamma > 0
+            and after_gamma > self.mandate.portfolio.max_portfolio_gamma
+        ):
+            reasons.append("portfolio gamma exposure would exceed mandate limit")
+        if (
+            self.mandate.portfolio.max_portfolio_vega > 0
+            and after_vega > self.mandate.portfolio.max_portfolio_vega
+        ):
+            reasons.append("portfolio vega exposure would exceed mandate limit")
+        if (
+            self.mandate.portfolio.max_portfolio_theta_decay_usd_per_day > 0
+            and after_theta_decay
+            > self.mandate.portfolio.max_portfolio_theta_decay_usd_per_day
+        ):
+            reasons.append("portfolio theta decay would exceed mandate limit")
+
         if proposal.limit_price > proposal.max_limit_price:
             reasons.append("limit price exceeds proposal maximum")
         maximum_chase = quote.ask * (1 + self.mandate.execution.max_limit_chase_pct / 100)
@@ -335,6 +440,27 @@ class RiskGate:
             reasons.append("duplicate order already exists")
         if portfolio.underlying_already_held:
             reasons.append("an open position already exists on this underlying")
+
+        # Market-regime guards. These are mandate rules, so they belong in the
+        # deterministic gate rather than only in the orchestrator -- any caller
+        # that hands the gate a VIX reading or a minutes-since-open value gets
+        # the same protection. A None reading (data unavailable) is audited by
+        # the caller and skipped here, not treated as a pass or a block.
+        vix_cap = self.mandate.portfolio.max_vix_for_entries
+        if vix_cap > 0 and portfolio.vix is not None and portfolio.vix > vix_cap:
+            reasons.append(
+                f"VIX {portfolio.vix:.1f} above the {vix_cap:.0f} entry cap"
+            )
+        open_window = self.mandate.execution.no_entry_minutes_after_open
+        if (
+            open_window > 0
+            and portfolio.minutes_since_open is not None
+            and portfolio.minutes_since_open < open_window
+        ):
+            reasons.append(
+                f"within the first {open_window} minutes after the open"
+                " (widest spreads)"
+            )
 
         return RiskDecision(
             approved=not reasons,

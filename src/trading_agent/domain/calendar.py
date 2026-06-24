@@ -95,6 +95,24 @@ def is_trading_day(day: date) -> bool:
     return day.weekday() < 5 and day not in us_market_holidays(day.year)
 
 
+def parse_iso(value: str | datetime) -> datetime:
+    """Parse an ISO-8601 timestamp, tolerating a trailing ``Z``.
+
+    ``datetime.fromisoformat`` (pre-3.11) rejects ``Z``; the position store
+    writes ``+00:00`` but external/broker payloads often use ``Z``. This
+    normalizes both so callers don't sprinkle ``.replace("Z", "+00:00")``
+    across the codebase. Accepts an already-parsed ``datetime`` for ergonomic
+    pass-through.
+    """
+
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    return datetime.fromisoformat(text)
+
+
 @lru_cache(maxsize=32)
 def us_early_close_dates(year: int) -> frozenset[date]:
     """NYSE/Nasdaq 13:00 ET half days (observed dates).

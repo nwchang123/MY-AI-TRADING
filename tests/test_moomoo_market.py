@@ -66,15 +66,20 @@ def test_build_universe_filters_maps_mandate() -> None:
         StockField=_stock_field(),
         SortDir=_sort_dir(),
     )
-    filters = build_universe_filters(_universe(), sdk)
+    universe = _universe()
+    filters = build_universe_filters(universe, sdk)
 
     by_field = {f.stock_field: f for f in filters}
-    assert by_field["CUR_PRICE"].filter_min == 2
-    assert by_field["MARKET_VAL"].filter_min == 100000000
-    assert by_field["MARKET_VAL"].filter_max == 5000000000
+    # Assert the MAPPING (mandate value -> Moomoo filter slot) rather than
+    # hardcoded magic numbers, so tuning the universe (e.g. the 2026-06-15
+    # liquidity pivot: price 2->5, mcap 100M-5B -> 1B-50B, turnover 5M->30M)
+    # never silently breaks this test.
+    assert by_field["CUR_PRICE"].filter_min == universe.min_underlying_price_usd
+    assert by_field["MARKET_VAL"].filter_min == universe.min_market_cap_usd
+    assert by_field["MARKET_VAL"].filter_max == universe.max_market_cap_usd
     # TURNOVER is accumulate-class: SimpleFilter is rejected by OpenD.
     assert isinstance(by_field["TURNOVER"], FakeAccumulateFilter)
-    assert by_field["TURNOVER"].filter_min == 5000000
+    assert by_field["TURNOVER"].filter_min == universe.min_average_daily_turnover_usd
     assert by_field["TURNOVER"].days == 1
     # VOLUME_RATIO is retrieve-and-sort only: the server orders the FULL match
     # set by it, so pagination sees the most abnormal names first.
@@ -256,10 +261,12 @@ def test_stock_snapshot_uses_cboe_shaped_keys(monkeypatch) -> None:
     assert "high" not in snap and "low" not in snap
     assert snap["price"] == 18.5
     assert snap["change_pct"] == round((18.5 - 17.0) / 17.0 * 100, 2)
+    assert ctx.closed is False
+    market.close()
     assert ctx.closed is True
 
 
-def test_scan_small_caps_parses_and_closes(monkeypatch) -> None:
+def test_scan_small_caps_parses_and_reuses_context(monkeypatch) -> None:
     ctx = FakeQuoteContext()
     monkeypatch.setattr(MoomooMarket, "_sdk", staticmethod(lambda: _fake_sdk(ctx)))
     market = MoomooMarket(MoomooConnection(host="127.0.0.1", port=11111))
@@ -277,6 +284,8 @@ def test_scan_small_caps_parses_and_closes(monkeypatch) -> None:
             "change_rate": None,
         }
     ]
+    assert ctx.closed is False
+    market.close()
     assert ctx.closed is True
 
 
@@ -294,6 +303,8 @@ def test_scan_small_caps_paginates_until_last_page(monkeypatch) -> None:
     assert [c["code"] for c in candidates] == ["US.AAA", "US.BBB", "US.CCC"]
     # begin advances by rows received, not by page size assumptions.
     assert ctx.filter_calls == [(0, 2), (2, 2)]
+    assert ctx.closed is False
+    market.close()
     assert ctx.closed is True
 
 
@@ -320,6 +331,8 @@ def test_industry_plates_keeps_only_industry_rows(monkeypatch) -> None:
     plates = market.industry_plates(["US.AAA", "US.BBB"])
 
     assert plates == {"US.AAA": "Gold"}
+    assert ctx.closed is False
+    market.close()
     assert ctx.closed is True
 
 
@@ -346,4 +359,6 @@ def test_option_quote_builds_snapshot_and_closes(monkeypatch) -> None:
     assert quote.daily_volume == 30
     assert quote.lot_size == 100
     assert quote.expiry == date(2026, 6, 26)
+    assert ctx.closed is False
+    market.close()
     assert ctx.closed is True

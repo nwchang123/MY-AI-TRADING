@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Trading Agent · Glass Cockpit</title>
+<link rel="preload" href="fonts/chakra-petch-600.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/jetbrains-mono-700.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <div class="top-left">
+    <div class="brand">
+      <span class="logo"></span>
+      <span class="wordmark"><b>Trading Agent</b><span>Cockpit</span></span>
+    </div>
+    <span class="divider-v"></span>
+    <span id="mode-badge" class="badge badge-paper">PAPER</span>
+    <span id="halt-badge" class="badge badge-clear">HALT CLEAR</span>
+    <span class="info-text"><span id="hb-dot" class="dot"></span><span id="heartbeat-info">heartbeat --</span></span>
+  </div>
+  <div class="top-right">
+    <span class="info-text" id="cycle-info">last cycle: <b>--</b></span>
+    <span class="info-text" id="position-count">positions: <b>0</b></span>
+    <span class="info-text" id="daily-pnl">daily P/L: <b>--</b></span>
+    <span class="divider-v"></span>
+    <span class="clock" id="clock">--:--:--</span>
+    <button id="refresh-btn" class="btn icon-btn" title="立即刷新 / Refresh now">↻</button>
+    <button id="theme-toggle" class="btn icon-btn" title="深色 / 浅色切换">◐</button>
+  </div>
+</header>
+
+<main>
+  <!-- Signature: risk-budget instrument cluster -->
+  <section class="cluster" id="cluster"></section>
+
+  <section id="risk-panel" class="panel">
+    <div class="panel-head"><h2>Greeks &amp; Stress <span class="zh">组合希腊值 · 情景压测</span></h2></div>
+    <div id="risk-cards" class="cards"></div>
+  </section>
+
+  <section id="funnel-panel" class="panel">
+    <div class="panel-head"><h2>Decision Pipeline <span class="zh">今日决策漏斗 · 扫描→成交</span></h2></div>
+    <div id="funnel-cards"></div>
+  </section>
+
+  <section id="positions-panel" class="panel">
+    <div class="panel-head"><h2>Open Positions <span class="zh">当前持仓</span></h2></div>
+    <div id="positions-table"></div>
+  </section>
+
+  <div class="grid-2">
+    <section id="report-panel" class="panel">
+      <div class="panel-head"><h2>Today's Report <span class="zh">今日报告</span></h2></div>
+      <div id="report-cards" class="cards"></div>
+    </section>
+    <section id="iv-panel" class="panel">
+      <div class="panel-head"><h2>IV30 Trend <span class="zh">隐含波动率走势</span></h2></div>
+      <div id="iv-table"></div>
+    </section>
+  </div>
+
+  <section id="events-panel" class="panel">
+    <div class="panel-head">
+      <h2>Recent Events <span class="zh">最近事件与错误</span></h2>
+      <div id="event-filters" class="filter-bar">
+        <button class="filter-btn active" data-filter="all">All</button>
+        <button class="filter-btn" data-filter="error">Errors</button>
+        <button class="filter-btn" data-filter="order">Orders</button>
+        <button class="filter-btn" data-filter="committee">Committee</button>
+        <span class="filter-sep">|</span>
+        <button class="filter-btn active" data-scope="today">Today</button>
+        <button class="filter-btn" data-scope="24h">24h</button>
+      </div>
+    </div>
+    <div id="events-list" class="events-list"></div>
+  </section>
+
+  <section id="control-panel" class="panel">
+    <div class="panel-head"><h2>Controls <span class="zh">受控操作 · 需二次确认</span></h2></div>
+    <div id="control-buttons">
+      <button id="btn-halt" class="btn btn-danger" disabled>Halt Trading</button>
+      <button id="btn-resume" class="btn btn-success" disabled>Resume Trading</button>
+      <button id="btn-run-cycle" class="btn btn-primary" disabled>Run Paper Cycle</button>
+    </div>
+    <div id="control-status"></div>
+  </section>
+</main>
+
+<footer>
+  Trading Agent Console
+  <span class="sep">·</span> <span id="last-update">--</span>
+  <span class="sep">·</span> 本地只读 / Read-only · 127.0.0.1
+</footer>
+
+<div id="confirm-modal" class="modal hidden">
+  <div class="modal-content">
+    <p id="confirm-text"></p>
+    <div class="modal-actions">
+      <button id="confirm-yes" class="btn btn-danger">Confirm</button>
+      <button id="confirm-no" class="btn">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

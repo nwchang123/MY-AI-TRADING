@@ -19,12 +19,14 @@ if ($port) {
     Write-Step "OpenD" "网关已在线 (127.0.0.1:11111) ✓"
 } else {
     $candidates = @(
+        "$env:APPDATA\moomoo_OpenD\moomoo_OpenD.exe",
         "C:\Users\HP\Downloads\MoomooOpenDInstaller\extracted_10.6.6608\moomoo_OpenD_10.6.6608_Windows\moomoo_OpenD-GUI_10.6.6608_Windows\moomoo_OpenD-GUI_10.6.6608_Windows.exe"
     )
     $exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $exe) {
         $exe = Get-ChildItem "C:\Users\HP\Downloads\MoomooOpenDInstaller", "$env:APPDATA\moomoo_OpenD" `
-            -Recurse -Filter "*OpenD-GUI*.exe" -ErrorAction SilentlyContinue |
+            -Recurse -File -Filter "*OpenD*.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notmatch "CrashReporter|Update|uninstall|WebSocket" } |
             Select-Object -First 1 -ExpandProperty FullName
     }
     if ($exe) {
@@ -42,24 +44,30 @@ Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
 Write-Step "Bot " "控制机器人已确保运行 (24 小时,可在 Telegram 用命令/问答)"
 
 # --- 3. Autonomous trading loop ------------------------------------------------
-# Use cmd.exe to launch python with output redirected to the daily log.
-# /k keeps the window alive if python crashes (for debugging); /min starts
-# minimized. The run-loop handles scheduling and market-hours internally.
-$loopLogDir = Join-Path $root "runtime\logs"
-$loopLog = Join-Path $loopLogDir ("loop-{0:yyyy-MM-dd}.log" -f (Get-Date))
-New-Item -ItemType Directory -Force -Path $loopLogDir | Out-Null
-$cmdLine = "python -m trading_agent run-loop --auto-universe --interval-seconds 1800 --max-iterations 18 >> `"$loopLog`" 2>&1"
-Start-Process cmd.exe -ArgumentList "/k", $cmdLine -WindowStyle Minimized -WorkingDirectory $root
-Write-Step "Loop" "交易循环已确保运行 (闭市自动跳过,盘中每 30 分钟一轮)"
+# Launch via run_paper_loop.ps1 -- the SAME self-healing wrapper the scheduled
+# task uses. It has a process-level single-instance guard (skips if a run-loop
+# is already running) and restarts the loop if it dies mid-session. This is what
+# makes start_all safe to re-run: the previous version launched `cmd /k python
+# run-loop` directly, which had NO process guard, so running start_all while the
+# scheduled task's loop was already up created a SECOND loop -- double LLM spend
+# and two cycles fighting over the per-cycle lock. The wrapper logs to
+# runtime/logs/loop-<date>.log itself, so no redirection is needed here.
+Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
+    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ('"' + (Join-Path $scripts "run_paper_loop.ps1") + '"')
+)
+Write-Step "Loop" "交易循环已确保运行 (闭市自动跳过,盘中每 30 分钟一轮;重复启动安全)"
+Write-Step "Web " "Dashboard 只在美股开盘时启动; 公网链接会发到 Telegram"
 
 Start-Sleep -Seconds 3
 Write-Host ""
 Write-Host "------------------------  当前状态  ------------------------"
 $bot = Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -match "trading_agent\s+bot" }
 $loop = Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -match "trading_agent\s+run-loop" }
+$web = Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -match "trading_agent\s+web-dashboard" }
 Write-Host ("  OpenD 端口 11111 : " + $(if ((Test-NetConnection 127.0.0.1 -Port 11111 -WarningAction SilentlyContinue).TcpTestSucceeded) { "在线 ✓" } else { "未登录 (请登录 OpenD)" }))
 Write-Host ("  Telegram 机器人  : " + $(if ($bot) { "运行中 (pid $($bot.ProcessId)) ✓" } else { "启动中..." }))
 Write-Host ("  交易循环         : " + $(if ($loop) { "运行中 (pid $($loop.ProcessId)) ✓" } else { "启动中..." }))
+Write-Host ("  Web dashboard    : " + $(if ($web) { "运行中；公网链接见 Telegram ✓" } else { "等待开盘启动" }))
 Write-Host ""
 Write-Host "全部就绪。手机 Telegram 会收到上线通知;有交易动作会推送给你。"
 Write-Host "(各组件在后台隐藏运行;想看实时活动请双击 Watch-TradingAgent)"

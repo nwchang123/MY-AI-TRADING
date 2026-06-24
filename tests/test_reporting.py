@@ -1,9 +1,12 @@
+import json
 from datetime import date
 
 from trading_agent.reporting import (
     build_calibration_report,
     build_daily_report,
     build_funnel_report,
+    build_portfolio_risk_report,
+    read_audit_events,
 )
 
 DAY = "2026-06-02"
@@ -26,7 +29,15 @@ def _events() -> list[dict]:
         _ev("order_placed", {"side": "sell"}),
         _ev("position_closed", {"reason": "take profit", "realized_pnl_usd": 12.5}),
         _ev("position_closed", {"reason": "stop loss", "realized_pnl_usd": -5.0}),
-        _ev("llm_usage", {"calls": 5, "prompt_tokens": 100, "completion_tokens": 40}),
+        _ev(
+            "llm_usage",
+            {
+                "calls": 5,
+                "prompt_tokens": 100,
+                "completion_tokens": 40,
+                "total_tokens": 155,
+            },
+        ),
         _ev("llm_usage", {"calls": 5, "prompt_tokens": 50, "completion_tokens": 10}),
         _ev("cycle_step_failed", {"stage": "entry"}),
         _ev("committee_run", {"decision": "hold"}, day=OTHER_DAY),  # different day, excluded
@@ -49,14 +60,43 @@ def test_report_aggregates_single_day() -> None:
         "calls": 10,
         "prompt_tokens": 150,
         "completion_tokens": 50,
-        "total_tokens": 200,
+        "total_tokens": 215,
     }
+
+
+def test_report_uses_us_market_date_not_utc_date() -> None:
+    event = {
+        "recorded_at": "2026-06-02T01:00:00+00:00",
+        "event_type": "committee_run",
+        "payload": {"decision": "open_position"},
+    }
+
+    assert build_daily_report([event], date(2026, 6, 1))["proposals_processed"] == 1
+    assert build_daily_report([event], date(2026, 6, 2))["proposals_processed"] == 0
 
 
 def test_report_excludes_other_days() -> None:
     report = build_daily_report(_events(), date(2026, 6, 1))
     assert report["committee_decisions"]["hold"] == 1
     assert report["proposals_processed"] == 1
+
+
+def test_read_audit_events_can_filter_while_streaming(tmp_path) -> None:
+    path = tmp_path / "audit.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps(_ev("committee_run", {"decision": "open_position"})),
+                json.dumps(_ev("committee_run", {"decision": "hold"}, day=OTHER_DAY)),
+                "not-json",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    events = read_audit_events(path, date(2026, 6, 2))
+
+    assert [event["payload"]["decision"] for event in events] == ["open_position"]
 
 
 def test_empty_report() -> None:
@@ -147,3 +187,56 @@ def test_calibration_empty_until_trades_close() -> None:
     cal = build_calibration_report([])
     assert cal["closed_trades_matched"] == 0
     assert all(b["trades"] == 0 for b in cal["buckets"])
+
+
+def test_portfolio_risk_report_sums_greeks_and_shocks() -> None:
+    report = build_portfolio_risk_report(
+        [
+            {
+                "status": "open",
+                "ticker": "AAA",
+                "option_code": "US.AAA260626C5000",
+                "entry_price": 0.50,
+                "contracts": 1,
+                "lot_size": 100,
+                "entry_spot": 10.0,
+                "entry_iv": 0.5,
+                "entry_delta": 0.5,
+                "entry_gamma": 0.02,
+                "entry_vega": 0.03,
+                "entry_theta": -0.01,
+                "entry_theta_decay_pct_per_day": 2.0,
+                "entry_iv_rank": 0.4,
+            },
+            {
+                "status": "open",
+                "ticker": "BBB",
+                "option_code": "US.BBB260626P5000",
+                "entry_price": 0.40,
+                "contracts": 1,
+                "lot_size": 100,
+                "entry_spot": 20.0,
+                "entry_iv": 0.7,
+                "entry_delta": -0.4,
+                "entry_gamma": 0.01,
+                "entry_vega": 0.02,
+                "entry_theta": -0.02,
+            },
+        ],
+        as_of=date(2026, 6, 2),
+    )
+
+    assert report["open_positions"] == 2
+    assert report["premium_at_risk_usd"] == 90
+    assert report["totals"] == {
+        "delta": 10.0,
+        "gamma": 3.0,
+        "vega": 5.0,
+        "theta_usd_per_day": -3.0,
+    }
+    assert report["theta_decay_usd_per_day"] == 3.0
+    assert report["shock_pnl_usd"]["underlying_+2pct"] == -5.88
+    assert set(report["scenario_revaluation_pnl_usd"]) == set(report["shock_pnl_usd"])
+    assert report["scenario_revaluation_pnl_usd"]["underlying_+2pct"] > 0
+    assert report["scenario_revaluation_skipped"] == 0
+    assert report["missing_greeks"] == 0
