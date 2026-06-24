@@ -1,7 +1,12 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from trading_agent.storage.decisions import DecisionCache, decision_digest
+from trading_agent.storage.decisions import (
+    DecisionCache,
+    candidate_digest,
+    decision_digest,
+    thesis_digest,
+)
 
 NOW = datetime(2026, 6, 11, 15, 0, tzinfo=timezone.utc)
 
@@ -60,6 +65,46 @@ def test_fresh_rejections_within_hours_shortens_the_bench(tmp_path: Path) -> Non
     # under a 2h selection window; the older name competes for a slot again.
     assert cache.fresh_rejections(NOW) == {"OLD", "NEW"}
     assert cache.fresh_rejections(NOW, within_hours=2.0) == {"NEW"}
+
+
+def test_thesis_digest_ignores_contract_drift() -> None:
+    # Same evidence, different eligible contracts: the full digest changes
+    # (busting the cache) but the thesis sub-digest is stable.
+    full_a = decision_digest("SOFI", ["e1", "e2"], ["US.X1"])
+    full_b = decision_digest("SOFI", ["e1", "e2"], ["US.X2"])
+    assert full_a != full_b
+    assert thesis_digest("SOFI", ["e1", "e2"]) == thesis_digest("sofi", ["e2", "e1"])
+    assert candidate_digest(["US.X1"]) != candidate_digest(["US.X2"])
+
+
+def test_classify_miss_distinguishes_drift_from_fresh_evidence(tmp_path: Path) -> None:
+    cache = DecisionCache(tmp_path / "decisions.json", ttl_hours=6)
+    th = thesis_digest("SOFI", ["e1", "e2"])
+    cd = candidate_digest(["US.X1"])
+    cache.put("SOFI", "d1", '{"decision":"reject"}', NOW, thesis=th, candidates=cd)
+
+    # Thesis unchanged, contracts drifted -> the dominant, tolerable cause.
+    assert cache.classify_miss("SOFI", th, candidate_digest(["US.X2"]), NOW) == (
+        "candidates_changed"
+    )
+    # New evidence, same contracts -> a genuine re-evaluation.
+    assert cache.classify_miss(
+        "SOFI", thesis_digest("SOFI", ["e1", "e2", "e3"]), cd, NOW
+    ) == "evidence_changed"
+    assert cache.classify_miss(
+        "SOFI", thesis_digest("SOFI", ["e9"]), candidate_digest(["US.X9"]), NOW
+    ) == "both_changed"
+    assert cache.classify_miss("SOFI", th, cd, NOW) == "match"
+    assert cache.classify_miss("PLUG", th, cd, NOW) == "no_prior"
+    assert cache.classify_miss(
+        "SOFI", th, cd, NOW + timedelta(hours=7)
+    ) == "expired"
+
+
+def test_classify_miss_legacy_entry_without_subdigests(tmp_path: Path) -> None:
+    cache = DecisionCache(tmp_path / "decisions.json")
+    cache.put("SOFI", "d1", "{}", NOW)  # written before sub-digests existed
+    assert cache.classify_miss("SOFI", "th", "cd", NOW) == "legacy_entry"
 
 
 def test_corrupt_file_is_treated_as_empty(tmp_path: Path) -> None:

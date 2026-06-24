@@ -36,7 +36,12 @@ from trading_agent.research.committee import Committee, CommitteeOutput
 from trading_agent.research.llm import usage_delta
 from trading_agent.research.redflags import detect_red_flags, nondirectional_critical_flags
 from trading_agent.storage.budget import DailyTokenBudget
-from trading_agent.storage.decisions import DecisionCache, decision_digest
+from trading_agent.storage.decisions import (
+    DecisionCache,
+    candidate_digest,
+    decision_digest,
+    thesis_digest,
+)
 from trading_agent.research.scoring import score_candidate
 from trading_agent.storage.audit import AuditWriter
 from trading_agent.storage.positions import PositionStore
@@ -1444,11 +1449,11 @@ class PaperTradingCycle:
             context = build_candidate_context(ticker, evidence, now)
             scores = score_candidate(derive_score_inputs(context.evidence, now))
 
-        digest = decision_digest(
-            ticker,
-            [e.evidence_id for e in context.evidence],
-            [c.option_code for c in candidates],
-        )
+        evidence_ids = [e.evidence_id for e in context.evidence]
+        candidate_codes = [c.option_code for c in candidates]
+        digest = decision_digest(ticker, evidence_ids, candidate_codes)
+        th_digest = thesis_digest(ticker, evidence_ids)
+        cand_digest = candidate_digest(candidate_codes)
         output = None
         if self.decision_cache is not None:
             cached = self.decision_cache.get(ticker, digest, now)
@@ -1463,6 +1468,19 @@ class PaperTradingCycle:
                         {"ticker": ticker, "decision": output.decision,
                          "digest": digest[:16]},
                     )
+            if output is None:
+                # The cache did not save us -- record WHY so we can confirm the
+                # 4.8% hit rate is contract drift (candidates_changed) rather
+                # than genuinely fresh evidence. Diagnostic only.
+                self.audit.append(
+                    "committee_cache_miss",
+                    {
+                        "ticker": ticker,
+                        "reason": self.decision_cache.classify_miss(
+                            ticker, th_digest, cand_digest, now
+                        ),
+                    },
+                )
         if output is not None:
             return output
 
@@ -1502,7 +1520,10 @@ class PaperTradingCycle:
         if self.llm_budget is not None:
             self.llm_budget.add(usage.total_tokens, today)
         if self.decision_cache is not None:
-            self.decision_cache.put(ticker, digest, output.model_dump_json(), now)
+            self.decision_cache.put(
+                ticker, digest, output.model_dump_json(), now,
+                thesis=th_digest, candidates=cand_digest,
+            )
         return output
 
     def _validate_proposal(
