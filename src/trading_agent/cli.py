@@ -583,6 +583,42 @@ def _resolve_tickers(settings: Settings, args: Any) -> list[str]:
     return manual
 
 
+def _format_session_summary(
+    ran: int,
+    totals: dict[str, int],
+    rejected_by_stage: dict[str, int],
+    used_tokens: int | None,
+    cap_tokens: int,
+) -> str:
+    """One-line, greppable end-of-session digest for the loop log.
+
+    Folds a whole session into a single line so "what happened last night" is
+    answerable without grepping tens of thousands of cycle/JSON lines. Rejection
+    stages are sorted most-frequent-first; tokens show used vs the daily cap.
+    """
+    if not rejected_by_stage:
+        rej = "none"
+    else:
+        rej = ", ".join(
+            f"{stage}:{count}"
+            for stage, count in sorted(
+                rejected_by_stage.items(), key=lambda kv: (-kv[1], kv[0])
+            )
+        )
+    if used_tokens is None:
+        tokens = "n/a"
+    elif cap_tokens > 0:
+        tokens = f"{used_tokens:,}/{cap_tokens:,} ({used_tokens / cap_tokens:.0%})"
+    else:
+        tokens = f"{used_tokens:,}/uncapped"
+    return (
+        f"run-loop session summary: {ran} cycles | "
+        f"entries {totals['entries']} | exits {totals['exits']} | "
+        f"rejected{{{rej}}} | tokens {tokens} | "
+        f"errors {totals['errors']} | crashes {totals['crashes']}"
+    )
+
+
 def _run_loop(
     settings: Settings,
     tickers_fn: Callable[[], list[str]],
@@ -599,6 +635,7 @@ def _run_loop(
 
     notifier = _notifier(settings)
     totals = {"entries": 0, "exits": 0, "errors": 0, "crashes": 0}
+    rejected_by_stage: dict[str, int] = {}
     last_crash: list[str] = [""]
 
     def run_cycle() -> None:
@@ -634,6 +671,13 @@ def _run_loop(
         totals["entries"] += len(result.entries)
         totals["exits"] += len(result.exits)
         totals["errors"] += len(result.errors)
+        for rej in result.rejected:
+            stage = (
+                rej.get("stage", "unknown")
+                if isinstance(rej, dict)
+                else getattr(rej, "stage", "unknown")
+            )
+            rejected_by_stage[stage] = rejected_by_stage.get(stage, 0) + 1
         _alert_cycle(settings, result)
         _update_dashboard(settings, result)
         _write_heartbeat(settings, "cycle done")
@@ -671,6 +715,22 @@ def _run_loop(
             f"开仓 {totals['entries']} | 平仓 {totals['exits']} | "
             f"错误 {totals['errors']} | 崩溃 {totals['crashes']}"
         )
+    used_tokens: int | None = None
+    cap_tokens = 0
+    try:
+        cap_tokens = Mandate.load(settings.mandate_path).execution.max_daily_llm_tokens
+        budget_path = (
+            settings.root_dir / "runtime" / f"llm_budget.{settings.mode}.json"
+        )
+        used_tokens = json.loads(budget_path.read_text(encoding="utf-8")).get("tokens")
+    except Exception:  # noqa: BLE001 - summary is best-effort, never blocks shutdown
+        pass
+    print(
+        _format_session_summary(
+            ran, totals, rejected_by_stage, used_tokens, cap_tokens
+        ),
+        file=sys.stderr,
+    )
     print(f"run-loop finished: {ran} cycle(s) executed", file=sys.stderr)
 
 

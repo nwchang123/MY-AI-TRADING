@@ -7,11 +7,45 @@ from types import SimpleNamespace
 
 import pytest
 
-from trading_agent.cli import _adversary_client, _build_committee, _update_dashboard, main
+from trading_agent.cli import (
+    _adversary_client,
+    _build_committee,
+    _format_session_summary,
+    _update_dashboard,
+    main,
+)
 from trading_agent.settings import Settings
 from trading_agent.storage.positions import PositionStore
 
 ROOT = Path(__file__).parents[1]
+
+
+def test_format_session_summary_folds_a_session_into_one_line() -> None:
+    line = _format_session_summary(
+        ran=113,
+        totals={"entries": 0, "exits": 2, "errors": 1, "crashes": 9},
+        rejected_by_stage={"pre_screen": 206, "llm_budget": 1977, "exit_quote": 6},
+        used_tokens=5_027_787,
+        cap_tokens=5_000_000,
+    )
+    assert "113 cycles" in line
+    assert "entries 0 | exits 2" in line
+    # stages sorted most-frequent-first; tokens show used/cap and over-budget %.
+    assert "llm_budget:1977, pre_screen:206, exit_quote:6" in line
+    assert "5,027,787/5,000,000 (101%)" in line
+    assert "crashes 9" in line
+
+
+def test_format_session_summary_handles_no_rejections_and_missing_tokens() -> None:
+    line = _format_session_summary(
+        ran=0,
+        totals={"entries": 0, "exits": 0, "errors": 0, "crashes": 0},
+        rejected_by_stage={},
+        used_tokens=None,
+        cap_tokens=0,
+    )
+    assert "rejected{none}" in line
+    assert "tokens n/a" in line
 
 
 def _settings(tmp_path: Path, **overrides) -> Settings:
