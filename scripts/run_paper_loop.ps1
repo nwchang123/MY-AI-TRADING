@@ -6,12 +6,14 @@
 # the U.S. market is still open, it restarts it -- so one killed process no
 # longer ends the trading day.
 #
-# CONTINUOUS SELECTION (2026-06-17, operator "一直选"): interval is 60s, so as soon
-# as one selection round finishes the next begins (near-continuous), catching new
-# catalysts sooner. A per-ticker decision cache keeps re-evaluating UNCHANGED names
-# cheap (cache hit, no LLM call); only fresh evidence / newly-eligible contracts
-# cost tokens, and the daily token budget still hard-caps spend. --stop-after-close
-# ends the session cleanly at the close; MaxIterations is just a high backstop.
+# CADENCE (interval is 60s): every tick reconciles the book and monitors exits
+# (stops/take-profits/trailing -- cheap, no LLM). New-entry EVALUATION (universe
+# + committee, the token-hungry part) is throttled to the mandate's
+# execution.entry_evaluation_interval_seconds (paper: 300s) so the daily token
+# budget is not front-loaded and exhausted mid-session; set it to 0 there to
+# restore the old every-tick "一直选" selection. A per-ticker decision cache
+# additionally skips re-evaluating UNCHANGED names. --stop-after-close ends the
+# session cleanly at the close; MaxIterations is just a high backstop.
 #
 # Output logging uses .NET Process with file streams (robust with Unicode paths
 # like the full-width ！ in the project folder name; avoids cmd.exe and

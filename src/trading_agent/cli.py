@@ -637,12 +637,28 @@ def _run_loop(
     totals = {"entries": 0, "exits": 0, "errors": 0, "crashes": 0}
     rejected_by_stage: dict[str, int] = {}
     last_crash: list[str] = [""]
+    # Decouple cadence: exits run every tick; the token-hungry entry evaluation
+    # (universe + committee) only runs every entry_evaluation_interval_seconds.
+    entry_interval = Mandate.load(
+        settings.mandate_path
+    ).execution.entry_evaluation_interval_seconds
+    last_entry_eval: list[datetime | None] = [None]
 
     def run_cycle() -> None:
         # Resolved per tick so an auto universe follows the market day by day.
         # A crashed cycle is alerted and absorbed: one transient failure (OpenD
         # restart, feed outage) must not kill a multi-week unattended run, and
         # the fixed interval below means this cannot become a tight retry loop.
+        now_tick = datetime.now(timezone.utc)
+        evaluate_entries = (
+            entry_interval <= 0
+            or last_entry_eval[0] is None
+            or (now_tick - last_entry_eval[0]).total_seconds() >= entry_interval
+        )
+        if evaluate_entries:
+            # Mark the slot up front so the cadence stays regular even if this
+            # cycle crashes before entries run; exits still run every tick.
+            last_entry_eval[0] = now_tick
         _write_heartbeat(settings, "cycle start")
         try:
             # Fail fast on a dead gateway: the SDK would otherwise retry the
@@ -650,7 +666,7 @@ def _run_loop(
             assert_opend_reachable(settings.moomoo_host, settings.moomoo_port)
             with single_instance_lock(_cycle_lock_path(settings)):
                 result = _build_cycle(settings, trd_env="SIMULATE").run_once_lazy(
-                    tickers_fn
+                    tickers_fn, evaluate_entries=evaluate_entries
                 )
         except Exception as exc:  # noqa: BLE001
             _audit_writer(settings).append("cycle_crashed", {"error": str(exc)})

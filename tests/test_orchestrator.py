@@ -609,6 +609,43 @@ def test_lazy_cycle_selects_after_exit_frees_capacity(tmp_path: Path) -> None:
     assert store.open_positions() == []
 
 
+def test_evaluate_entries_false_runs_exits_but_skips_committee(tmp_path: Path) -> None:
+    # Cadence decoupling: an off-cadence tick still monitors exits (take profit
+    # fires) but skips the token-hungry universe+committee pass entirely -- even
+    # with capacity free and a committee that would otherwise open.
+    broker = FakeBroker(positions=[{"code": OPTION_CODE, "qty": 1}])
+    store = PositionStore(tmp_path / "positions.sqlite")
+    _seed_open(store)
+    cycle = _cycle(
+        tmp_path,
+        broker=broker,
+        market=FakeMarket(bid=0.40, ask=0.42),  # +100% -> take profit
+        committee=_committee(_open_responses()),  # would open if it ran
+        store=store,
+    )
+
+    def selector() -> list[str]:
+        raise AssertionError("selector must not run off the entry-evaluation cadence")
+
+    result = cycle.run_once_lazy(selector, evaluate_entries=False)
+
+    # Exit still fired this tick...
+    assert ("sell", OPTION_CODE) in broker.placed
+    assert result.exits and result.exits[0]["reason"] == "take profit"
+    # ...but no entry was attempted and the selector/committee never ran.
+    assert result.entries == []
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(
+        event["event_type"] == "entries_skipped"
+        and event["payload"]["reason"] == "off entry-evaluation cadence"
+        for event in events
+    )
+    assert not any(event["event_type"] == "committee_run" for event in events)
+
+
 def test_exit_sell_ladder_adds_marketable_final_rung() -> None:
     position = MonitoredPosition(
         option_code="US.TSLA260710C400000",

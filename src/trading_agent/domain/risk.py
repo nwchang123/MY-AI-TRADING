@@ -150,6 +150,12 @@ class ExecutionMandate(BaseModel):
     # the committee is skipped until the next market day. Protects the API
     # balance from a runaway loop. 0 disables.
     max_daily_llm_tokens: int = Field(default=0, ge=0)
+    # Decouple cadence: exits/risk are monitored every tick (cheap, no LLM),
+    # but new-entry EVALUATION (universe + committee, the token-hungry part)
+    # only runs this often. At a 60s tick a value of 300 means the committee
+    # fires every ~5 min instead of every minute, cutting token burn ~5x while
+    # stops/take-profits still react each tick. 0 evaluates entries every tick.
+    entry_evaluation_interval_seconds: int = Field(default=0, ge=0)
     # Broker commission per contract PER SIDE, deducted from realized ledger
     # P/L (a round trip costs 2x this). Keep 0 in paper -- Moomoo SIMULATE
     # charges no fees, and the local ledger must mirror the broker sim. Set it

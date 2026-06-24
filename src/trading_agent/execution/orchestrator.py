@@ -179,16 +179,28 @@ class PaperTradingCycle:
             return mandate_max
         return min(self.max_open_positions_override, mandate_max)
 
-    def run_once(self, tickers: list[str]) -> CycleResult:
-        return self.run_once_lazy(lambda: tickers)
+    def run_once(
+        self, tickers: list[str], *, evaluate_entries: bool = True
+    ) -> CycleResult:
+        return self.run_once_lazy(lambda: tickers, evaluate_entries=evaluate_entries)
 
-    def run_once_lazy(self, tickers_fn: Callable[[], list[str]]) -> CycleResult:
+    def run_once_lazy(
+        self,
+        tickers_fn: Callable[[], list[str]],
+        *,
+        evaluate_entries: bool = True,
+    ) -> CycleResult:
         try:
-            return self._run_once_lazy(tickers_fn)
+            return self._run_once_lazy(tickers_fn, evaluate_entries=evaluate_entries)
         finally:
             self._close_adapters()
 
-    def _run_once_lazy(self, tickers_fn: Callable[[], list[str]]) -> CycleResult:
+    def _run_once_lazy(
+        self,
+        tickers_fn: Callable[[], list[str]],
+        *,
+        evaluate_entries: bool = True,
+    ) -> CycleResult:
         now = self.now_fn()
         result = CycleResult()
 
@@ -214,6 +226,13 @@ class PaperTradingCycle:
             if self._in_cooldown(now):
                 result.cooldown = True
                 self.audit.append("cooldown_active", {"at": now.isoformat()})
+            elif not evaluate_entries:
+                # Off the entry-evaluation cadence: exits/risk already ran this
+                # tick; skip the token-hungry universe+committee pass.
+                self.audit.append(
+                    "entries_skipped",
+                    {"reason": "off entry-evaluation cadence", "at": now.isoformat()},
+                )
             elif not open_orders_ok:
                 result.rejected.append(
                     {

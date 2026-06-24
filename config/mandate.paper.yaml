@@ -183,4 +183,11 @@ execution:
   # 2M was still exhausted by 25-ticker universes. 5M (~125 committee passes)
   # covers a full session with headroom. DeepSeek pricing: ~$0.05/day.
   max_daily_llm_tokens: 5000000
+  # Decouple cadence (2026-06-24): exits/stops are checked every 60s tick, but
+  # the universe+committee entry evaluation only runs every 5 min. A committee
+  # pass costs ~33k tokens, so a 25-name universe burns ~800k per full pass --
+  # at 60s that exhausts 5M in minutes (1977 candidates went dark mid-session
+  # on 2026-06-23). At 300s the committee fires ~once/5min, cutting burn ~5x
+  # while take-profit/stop-loss still react each tick. 0 = evaluate every tick.
+  entry_evaluation_interval_seconds: 300
 
