@@ -1,6 +1,7 @@
 """Moomoo MY small-cap options agent foundation."""
 
 import logging
+import warnings
 
 # yfinance logs HTTP 404s at ERROR level when a symbol has no fundamentals
 # (e.g. the QQQ/SPY benchmarks have no earnings calendar). Every such call is
@@ -10,3 +11,12 @@ import logging
 # per session. Silence it once here so it is suppressed for every entry point
 # (bot, paper loop, CLI). Genuine CRITICALs still surface.
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+# yfinance still calls the pandas-deprecated Timestamp.utcnow() on every quote
+# scrape, emitting a Pandas4Warning we cannot fix upstream. It fired ~5,858
+# times in one session (≈1/3 of the loop log). Filter it by message so the
+# noise is gone regardless of the warning's category; unrelated warnings are
+# untouched.
+warnings.filterwarnings(
+    "ignore", message=r"Timestamp\.utcnow is deprecated"
+)

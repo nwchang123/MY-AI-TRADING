@@ -199,6 +199,29 @@ if ($existing) {
 # Helper: run python and merge stdout+stderr into the log file using .NET
 # Process API. This avoids cmd.exe (which can mishandle Unicode paths in
 # hidden-window contexts) and PowerShell 5.1's stderr-to-ErrorRecord mangling.
+function Wait-OpenDReady {
+    # The moomoo OpenD gateway must be listening on 127.0.0.1:11111 before the
+    # run-loop opens quote/trade contexts. When the scheduled task fires before
+    # OpenD has finished launching (e.g. both starting at login), the first
+    # cycles abort with "OpenD gateway is not reachable" -- 9 such crashed
+    # cycles on 2026-06-23. Poll briefly so the common concurrent-startup race
+    # is absorbed; if OpenD is still down after the bound, proceed anyway (the
+    # run-loop already survives a per-cycle gateway outage and self-recovers).
+    param([string]$LogFile, [int]$TimeoutSeconds = 120)
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $ok = (Test-NetConnection 127.0.0.1 -Port 11111 -WarningAction SilentlyContinue).TcpTestSucceeded
+        if ($ok) {
+            Add-Content -Path $LogFile -Value "=== OpenD gateway ready on 127.0.0.1:11111 $(Get-Date -Format o) ==="
+            return $true
+        }
+        Start-Sleep -Seconds 2
+    }
+    Add-Content -Path $LogFile -Value "=== OpenD gateway not reachable after ${TimeoutSeconds}s; starting loop anyway $(Get-Date -Format o) ==="
+    return $false
+}
+
 function Run-PythonLogged {
     param([string]$Arguments, [string]$LogFile)
 
@@ -244,6 +267,10 @@ function Run-PythonLogged {
 
     return $p.ExitCode
 }
+
+# Absorb the OpenD startup race before the first run-loop tick so the session
+# does not open with a burst of "gateway not reachable" crashed cycles.
+Wait-OpenDReady -LogFile $log | Out-Null
 
 while ($true) {
     Add-Content -Path $log -Value "=== loop start $(Get-Date -Format o) (max $MaxIterations ticks @ ${IntervalSeconds}s) ==="
