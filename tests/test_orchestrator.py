@@ -609,6 +609,84 @@ def test_lazy_cycle_selects_after_exit_frees_capacity(tmp_path: Path) -> None:
     assert store.open_positions() == []
 
 
+def test_exit_quote_falls_back_to_moomoo_when_free_feed_has_no_bid(
+    tmp_path: Path,
+) -> None:
+    # Free feed (self.market) raises "no ask" AND its chain bid is 0, so today's
+    # fallback chain fails and the exit defers. The real-time moomoo feed -- a
+    # different source -- supplies a bid and the triggered exit fires this cycle.
+    class BlankFreeFeed(FakeMarket):
+        def option_quote(self, *, option_code, expiry, lot_size, now=None):
+            raise RuntimeError(f"{option_code} has no ask (no liquidity)")
+
+    class FakeMoomooQuote:
+        def option_quote(self, *, option_code, expiry, lot_size, now=None):
+            return QuoteSnapshot(
+                option_code=option_code,
+                bid=0.40,  # +100% over the 0.20 entry -> take profit
+                ask=0.42,
+                open_interest=10,
+                daily_volume=10,
+                lot_size=lot_size,
+                expiry=expiry,
+                observed_at=NOW,
+            )
+
+    broker = FakeBroker(positions=[{"code": OPTION_CODE, "qty": 1}])
+    store = PositionStore(tmp_path / "positions.sqlite")
+    _seed_open(store)
+    cycle = _cycle(
+        tmp_path,
+        broker=broker,
+        market=BlankFreeFeed(bid=0.0, ask=0.0),  # chain bid 0 -> chain fallback None
+        committee=_committee([]),
+        store=store,
+    )
+    cycle.moomoo_market = FakeMoomooQuote()
+
+    result = cycle.run_once([])
+
+    assert broker.placed == [("sell", OPTION_CODE)]
+    assert result.exits and result.exits[0]["reason"] == "take profit"
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    degraded = next(e for e in events if e["event_type"] == "exit_quote_degraded")
+    assert degraded["payload"]["source"] == "moomoo_realtime"
+    assert degraded["payload"]["bid"] == 0.4
+
+
+def test_exit_quote_defers_when_no_source_has_a_bid(tmp_path: Path) -> None:
+    # Neither the free feed nor moomoo has a bid: the exit must defer (raise,
+    # absorbed as a step failure) rather than price off a bad/zero quote.
+    class BlankFreeFeed(FakeMarket):
+        def option_quote(self, *, option_code, expiry, lot_size, now=None):
+            raise RuntimeError(f"{option_code} has no ask (no liquidity)")
+
+    class DeadMoomoo:
+        def option_quote(self, *, option_code, expiry, lot_size, now=None):
+            raise RuntimeError("moomoo data not entitled")
+
+    broker = FakeBroker(positions=[{"code": OPTION_CODE, "qty": 1}])
+    store = PositionStore(tmp_path / "positions.sqlite")
+    _seed_open(store)
+    cycle = _cycle(
+        tmp_path,
+        broker=broker,
+        market=BlankFreeFeed(bid=0.0, ask=0.0),
+        committee=_committee([]),
+        store=store,
+    )
+    cycle.moomoo_market = DeadMoomoo()
+
+    result = cycle.run_once([])
+
+    assert broker.placed == []  # no exit priced off a bad quote
+    assert result.exits == []
+    assert store.open_positions()  # position still open, retried next cycle
+
+
 def test_evaluate_entries_false_runs_exits_but_skips_committee(tmp_path: Path) -> None:
     # Cadence decoupling: an off-cadence tick still monitors exits (take profit
     # fires) but skips the token-hungry universe+committee pass entirely -- even

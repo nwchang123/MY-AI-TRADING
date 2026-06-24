@@ -698,6 +698,16 @@ class PaperTradingCycle:
             fallback = self._exit_quote_from_chain(
                 ticker=ticker, option_code=option_code, expiry=expiry, now=now
             )
+            source = "option_chain"
+            if fallback is None:
+                # Last resort: the real-time moomoo feed, a different source.
+                # The delayed CBOE/Yahoo feed regularly has neither bid nor ask
+                # on a contract moomoo prices fine, which deferred a triggered
+                # TSLA exit several cycles on 2026-06-23.
+                fallback = self._exit_quote_from_moomoo(
+                    option_code=option_code, expiry=expiry, lot_size=lot_size, now=now
+                )
+                source = "moomoo_realtime"
             if fallback is None:
                 raise
             self.audit.append(
@@ -705,6 +715,7 @@ class PaperTradingCycle:
                 {
                     "option_code": option_code,
                     "reason": str(exc),
+                    "source": source,
                     "bid": round(fallback.bid, 4),
                     "ask": round(fallback.ask, 4),
                     "observed_at": fallback.observed_at.isoformat(),
@@ -743,6 +754,40 @@ class PaperTradingCycle:
             ask=max(ask, 0.0),
             observed_at=observed_at,
             is_delayed=bool(row.get("is_delayed", True)),
+        )
+
+    def _exit_quote_from_moomoo(
+        self,
+        *,
+        option_code: str,
+        expiry: date,
+        lot_size: int,
+        now: datetime,
+    ) -> _ExitQuote | None:
+        """Real-time moomoo bid as a last-resort exit price (best-effort).
+
+        A genuinely different feed from ``self.market`` (delayed CBOE/Yahoo):
+        when that feed has neither bid nor ask, moomoo often still prices the
+        contract. Returns None on any error or when no usable bid exists, so a
+        triggered exit simply defers as before rather than pricing off a bad
+        quote -- this can only ever ADD an exit opportunity, never worsen one.
+        """
+        if self.moomoo_market is None:
+            return None
+        try:
+            quote = self.moomoo_market.option_quote(
+                option_code=option_code, expiry=expiry, lot_size=lot_size, now=now
+            )
+        except Exception:  # noqa: BLE001 - real-time feed is a best-effort backstop
+            return None
+        bid = float(getattr(quote, "bid", 0.0) or 0.0)
+        if bid <= 0:
+            return None
+        return _ExitQuote(
+            bid=bid,
+            ask=max(float(getattr(quote, "ask", 0.0) or 0.0), 0.0),
+            observed_at=getattr(quote, "observed_at", now) or now,
+            is_delayed=bool(getattr(quote, "is_delayed", False)),
         )
 
     @staticmethod

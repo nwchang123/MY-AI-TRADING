@@ -4,6 +4,8 @@ import re
 from datetime import date, datetime, timezone
 from typing import Any
 
+from trading_agent.data.moomoo_logging import quiet_moomoo_console_logs
+
 from trading_agent.brokers.moomoo import MoomooConnection
 from trading_agent.domain.risk import QuoteSnapshot, UniverseMandate
 
@@ -415,6 +417,7 @@ class MoomooMarket:
     def _sdk() -> Any:
         import moomoo
 
+        quiet_moomoo_console_logs(moomoo)
         return moomoo
 
     @staticmethod
