@@ -88,8 +88,13 @@ function Ensure-PublicTunnel {
     $err = Join-Path $logDir "cloudflared.err.log"
     Remove-Item $out, $err -ErrorAction SilentlyContinue
 
+    # --edge-ip-version 4 + --protocol http2 stabilize the tunnel on a flaky
+    # network: the default QUIC path and AAAA edge-discovery were timing out the
+    # periodic DNS refresh of region1.v2.argotunnel.com (~every 25-35 min in the
+    # err log on 2026-06-25). IPv4-only edge lookups + http2/TCP avoid the hung
+    # UDP/IPv6 resolution; the dashboard does not need QUIC's low latency.
     Start-Process $exe -WindowStyle Hidden -WorkingDirectory $root `
-        -ArgumentList @("tunnel", "--url", "http://127.0.0.1:$Port", "--no-autoupdate") `
+        -ArgumentList @("tunnel", "--url", "http://127.0.0.1:$Port", "--no-autoupdate", "--edge-ip-version", "4", "--protocol", "http2") `
         -RedirectStandardOutput $out -RedirectStandardError $err
 
     $baseUrl = $null
