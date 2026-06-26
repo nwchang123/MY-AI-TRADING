@@ -39,9 +39,9 @@ class YahooEarningsCalendar:
 
     @staticmethod
     def _yfinance_ticker(symbol: str) -> Any:
-        import yfinance as yf
+        from trading_agent.data.yf_compat import import_yfinance
 
-        return yf.Ticker(symbol)
+        return import_yfinance().Ticker(symbol)
 
     def next_earnings_date(self, ticker: str) -> date | None:
         """The next scheduled earnings date, or None when unknown/unavailable."""

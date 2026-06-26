@@ -16,7 +16,10 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 # scrape, emitting a Pandas4Warning we cannot fix upstream. It fired ~5,858
 # times in one session (≈1/3 of the loop log). Filter it by message so the
 # noise is gone regardless of the warning's category; unrelated warnings are
-# untouched.
+# untouched. NOTE: importing yfinance later PREPENDS its own filters above this
+# one, burying it (the warning still leaked ~1196x on 2026-06-26) -- so
+# data.yf_compat.import_yfinance() RE-applies this filter right after the import
+# to re-hoist it. This line still covers the window before yfinance is imported.
 warnings.filterwarnings(
     "ignore", message=r"Timestamp\.utcnow is deprecated"
 )

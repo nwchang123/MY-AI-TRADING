@@ -95,7 +95,9 @@ class YahooOptionData:
     @staticmethod
     def _yfinance_ticker(symbol: str) -> Any:
         try:
-            import yfinance as yf
+            from trading_agent.data.yf_compat import import_yfinance
+
+            yf = import_yfinance()
         except ImportError as exc:
             raise OptionDataError(
                 "yfinance not installed. Run: pip install yfinance"

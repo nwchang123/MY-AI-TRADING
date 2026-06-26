@@ -75,9 +75,9 @@ class YahooPriceHistory:
 
     @staticmethod
     def _yfinance_ticker(symbol: str) -> Any:
-        import yfinance as yf
+        from trading_agent.data.yf_compat import import_yfinance
 
-        return yf.Ticker(symbol)
+        return import_yfinance().Ticker(symbol)
 
     def context(self, ticker: str) -> dict[str, Any]:
         from trading_agent.data.option_data import underlying_symbol
