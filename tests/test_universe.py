@@ -102,6 +102,34 @@ def test_select_universe_ranks_by_volume_ratio_over_turnover() -> None:
     assert provider.probed == ["HOT", "MID"]
 
 
+def test_select_universe_premove_penalty_prefers_accumulation() -> None:
+    # Two names with the SAME volume ratio: MOVED has already run +20% today,
+    # CALM has barely moved. With the pre-move penalty OFF, the turnover tiebreak
+    # puts MOVED first; with it ON, MOVED's big move halves its rank score so the
+    # accumulation name (CALM, catalyst not yet priced in) is selected first.
+    def rows():
+        return [
+            _row("US.MOVED", 9e7, volume_ratio=10.0, change_rate=20.0),
+            _row("US.CALM", 5e7, volume_ratio=10.0, change_rate=0.5),
+        ]
+
+    off = select_universe(
+        market=FakeScanMarket(rows()),
+        provider=FakeProvider(optionable={"MOVED", "CALM"}),
+        universe=_universe().model_copy(update={"premove_change_penalty": 0.0}),
+        max_tickers=2,
+    )
+    assert off == ["MOVED", "CALM"]  # equal score -> turnover tiebreak
+
+    on = select_universe(
+        market=FakeScanMarket(rows()),
+        provider=FakeProvider(optionable={"MOVED", "CALM"}),
+        universe=_universe().model_copy(update={"premove_change_penalty": 0.1}),
+        max_tickers=2,
+    )
+    assert on == ["CALM", "MOVED"]  # +20% mover deprioritized
+
+
 def test_select_universe_falls_back_to_turnover_without_volume_ratio() -> None:
     # Off-hours scans can return no volume-ratio data; ranking degrades to the
     # old turnover order instead of becoming arbitrary.

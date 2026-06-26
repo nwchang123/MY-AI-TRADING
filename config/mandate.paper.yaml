@@ -39,6 +39,15 @@ universe:
   # Moomoo industry plates that never get an optionability probe (SPAC shells
   # flood the volume-ratio ranking but essentially never have eligible options).
   excluded_industries: ["Shell Companies"]
+  # Pre-move accumulation bias (P1, 2026-06-26). Volume-ratio selection kept
+  # picking names that ALREADY spiked, which the committee then vetoed as
+  # "catalyst already priced in" (the dominant 0-entries cause). This down-ranks a
+  # name by penalty * |day-move %|: score = volume_ratio / (1 + 0.1*|chg%|), so a
+  # name up 10% is ranked ~half a same-volume name that has not moved yet (volume
+  # building before the move). 0 = legacy pure volume_ratio. EVALUATION -- raise
+  # to bias harder toward accumulation, lower/0 to revert. Only affects the
+  # volume backfill now that earnings-window names are preferred first.
+  premove_change_penalty: 0.1
   watchlist:
     - NVDA
     - TSLA

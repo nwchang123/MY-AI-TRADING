@@ -35,6 +35,12 @@ class UniverseMandate(BaseModel):
     reject_halted: bool
     excluded_industries: list[str] = Field(default_factory=lambda: ["Shell Companies"])
     watchlist: list[str] = Field(default_factory=list)
+    # Pre-move accumulation bias: down-rank a high-volume name by this factor times
+    # its absolute % day-move, so volume-ratio selection favors names where volume
+    # is building BEFORE the price move (catalyst not yet priced in) over already-
+    # spiked names the committee vetoes as "priced in". score = volume_ratio /
+    # (1 + penalty * |change_pct|). 0 = legacy pure volume_ratio ranking.
+    premove_change_penalty: float = Field(default=0.0, ge=0)
 
 
 class OptionsMandate(BaseModel):

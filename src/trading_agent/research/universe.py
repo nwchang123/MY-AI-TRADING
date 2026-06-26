@@ -207,6 +207,13 @@ def select_universe(
     }
 
     rows = market.scan_small_caps(universe)
+    # Pre-move accumulation bias (P1): a high-volume name is ranked DOWN the more
+    # it has ALREADY moved today, so volume-ratio selection favors names where
+    # volume is building before the price move (catalyst not yet priced in) over
+    # post-spike names the committee vetoes as "already priced in". Stored in the
+    # volume slot so the existing volume sort + backfill use it; the earnings
+    # ranking keys on the earnings date + turnover and is unaffected. 0 = legacy.
+    premove_penalty = max(0.0, float(getattr(universe, "premove_change_penalty", 0.0)))
     normalized: list[tuple[str, float, float]] = []
     turnover_of: dict[str, float] = {}
     for row in rows:
@@ -224,7 +231,9 @@ def select_universe(
         if volume_ratio > WASH_VOLUME_RATIO and abs(change_rate) < FLAT_CHANGE_PCT:
             continue
         turnover = float(row.get("turnover") or 0.0)
-        normalized.append((ticker, volume_ratio, turnover))
+        # change_rate is a PERCENT; a larger absolute move shrinks the rank score.
+        premove_score = volume_ratio / (1.0 + premove_penalty * abs(change_rate))
+        normalized.append((ticker, premove_score, turnover))
         turnover_of.setdefault(ticker, turnover)
 
     def _dedupe(tickers: Iterable[str]) -> list[str]:
