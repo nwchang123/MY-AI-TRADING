@@ -497,8 +497,8 @@ class PaperTradingCycle:
                 contracts=contracts,
                 lot_size=US_OPTION_LOT_SIZE,
                 expiry=expiry,
-                take_profit_pct=100.0,
-                stop_loss_pct=50.0,
+                take_profit_pct=self.active_mandate.options.default_take_profit_pct,
+                stop_loss_pct=self.active_mandate.options.default_stop_loss_pct,
                 time_stop=expiry,
             )
             current_count += 1
@@ -1112,8 +1112,8 @@ class PaperTradingCycle:
                         dte_days=verdict.dte,
                         iv=iv,
                         entry_price=ask,
-                        take_profit_pct=100.0,
-                        stop_loss_pct=50.0,
+                        take_profit_pct=self.active_mandate.options.default_take_profit_pct,
+                        stop_loss_pct=self.active_mandate.options.default_stop_loss_pct,
                         paths=500,
                         seed=stable_seed(row["code"]),
                     ),

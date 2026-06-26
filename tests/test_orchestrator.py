@@ -987,7 +987,10 @@ def test_orphan_broker_position_is_adopted(tmp_path: Path) -> None:
     adopted = store.get(OPTION_CODE)
     assert adopted is not None and adopted["status"] == "open"
     assert adopted["entry_price"] == 0.25
-    assert adopted["take_profit_pct"] == 100.0 and adopted["stop_loss_pct"] == 50.0
+    # Adopted orphans inherit the mandate's default exit grid (config-driven).
+    opts = _mandate().options
+    assert adopted["take_profit_pct"] == opts.default_take_profit_pct
+    assert adopted["stop_loss_pct"] == opts.default_stop_loss_pct
 
 
 def test_orphan_adoption_rejects_position_cap_breach(tmp_path: Path) -> None:

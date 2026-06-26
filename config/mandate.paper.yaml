@@ -169,6 +169,18 @@ options:
   # near-TP spikes that reverse before the fixed take-profit line.
   trailing_profit_activation_pct: 30.0
   trailing_profit_giveback_pct: 35.0
+  # Exit grid TIGHTENED 2026-06-26: take-profit +100% -> +50% (stop stays -50%).
+  # WHY: every committee win-prob estimate capped at ~0.40 (max), all below the
+  # 0.55 floor -> 0 entries, because hitting +100% on a long option needs a big
+  # move (structurally <50% win rate). A +50% target is far easier to hit, so the
+  # MC baseline AND the committee's win-prob estimates rise enough to clear 0.55
+  # WITHOUT lowering the floor. Drives the MC-POP grid + the committee briefing
+  # (both now read these, not hardcoded 100/50) so the model estimates the right
+  # target. TRADEOFF: a tighter TP raises the no-friction breakeven 0.33 -> 0.50,
+  # so the 0.55 floor's EV margin is thinner -- an evaluation; revert TP to 100 if
+  # the realized win rate doesn't clear ~0.55. SL kept at 50.
+  default_take_profit_pct: 50.0
+  default_stop_loss_pct: 50.0
 
 portfolio:
   # The $2000 TOTAL LOSS BUDGET (operator 2026-06-15: "use what you want, never

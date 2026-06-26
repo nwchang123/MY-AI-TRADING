@@ -729,7 +729,8 @@ class Committee:
         lines = [
             "CANDIDATE CONTRACTS (already pass the mandate's liquidity/DTE/cost "
             "limits; choose option_code from THIS list only). mc_pop is the "
-            "no-edge Monte Carlo baseline P(hit +100% before -50%): your "
+            f"no-edge Monte Carlo baseline P(hit +{kelly_tp_pct:.0f}% before "
+            f"-{kelly_sl_pct:.0f}%): your "
             "WIN_PROB above it is a claim that the catalyst adds real edge. "
             "delta is how much the option tracks the stock (|delta| near 0.5 = "
             "near the money); breakeven_move is the % the stock must move by "
