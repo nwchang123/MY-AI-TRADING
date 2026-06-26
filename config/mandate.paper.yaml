@@ -138,10 +138,21 @@ options:
   earnings_window_min_days: 10   # skip earnings <10d out (IV already ramped, crush imminent)
   earnings_window_max_days: 25   # >0 switches to earnings-window-preferred selection + volume backfill
   pre_earnings_exit_trading_days: 2   # EXIT safety: close a held position 2 trading days before its earnings (avoid IV-crush). Uses the Finnhub calendar in .env.
-  max_entry_iv: 0   # leave 0 at first; tune down from observed earnings-window IVs
+  # ENABLED 2026-06-26: reject a contract whose own implied vol (DECIMAL, e.g.
+  # 0.80 = 80%) exceeds this -- the absolute "already-ramped vol" backstop that
+  # pairs with the pre-earnings selection (don't buy a call into peak IV and eat
+  # the crush). 0.80 only blocks the egregious cases; the relative
+  # max_iv_rank_for_long_premium gate below is the precise tool. Tune down toward
+  # observed earnings-window IVs once IV Rank history has accumulated.
+  max_entry_iv: 0.80
   min_abs_delta: 0.20
   max_gamma_per_contract: 2.0
   max_theta_decay_pct_per_day: 8.0
+  # Reject long premium when IV Rank > this (vol expensive vs its own 52w range).
+  # Already enabled; the binding fix shipped 2026-06-26 was the iv30 DATA flow
+  # (Yahoo's snapshot omits iv30, so IV Rank was starved) -- the orchestrator now
+  # derives iv30 from the at-the-money chain. Tighten toward 0.50 once real IV
+  # Rank history accrues to enforce "buy cheap vol" for the pre-earnings ramp.
   max_iv_rank_for_long_premium: 0.80
   iv_crush_exit_drop_pct: 25.0
   # Profit protection: after a position has shown >=30% profit at the bid,

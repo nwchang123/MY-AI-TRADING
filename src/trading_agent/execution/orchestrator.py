@@ -1367,7 +1367,11 @@ class PaperTradingCycle:
         return subtract_trading_days(earnings_day, k)
 
     def _iv_rank_value(self, ticker: str, snapshot: dict | None) -> float | None:
-        current_iv30 = float((snapshot or {}).get("iv30") or 0.0)
+        return self._iv_rank_from_iv30(
+            ticker, float((snapshot or {}).get("iv30") or 0.0)
+        )
+
+    def _iv_rank_from_iv30(self, ticker: str, current_iv30: float) -> float | None:
         if current_iv30 <= 0 or self.iv_history is None:
             return None
         extremes = self.iv_history.extremes(ticker)
@@ -1379,19 +1383,34 @@ class PaperTradingCycle:
             iv_52w_low=extremes[1],
         )
 
+    @staticmethod
+    def _atm_iv_pct(candidates: list) -> float:
+        """At-the-money 30d IV proxy (PERCENT) from the near-money candidates.
+
+        ``candidate.iv`` is the per-contract implied vol as a DECIMAL (yfinance
+        impliedVolatility). The eligible candidates sit near the money, so their
+        median IV * 100 is a serviceable iv30 in percent -- matching the
+        CBOE-sourced history units -- for when the underlying snapshot omits iv30
+        (Yahoo's fast_info has none, which starved IV Rank).
+        """
+        ivs = sorted(c.iv for c in candidates if getattr(c, "iv", 0.0) and c.iv > 0)
+        if not ivs:
+            return 0.0
+        return round(ivs[len(ivs) // 2] * 100.0, 4)
+
     def _try_enter(
         self, now: datetime, ticker: str, held_codes: set[str], result: CycleResult
     ) -> str | None:
         snapshot = self._underlying_snapshot(ticker, result)
+        spot = float((snapshot or {}).get("price") or 0.0)
 
-        # Record iv30 for IV Rank history (always, even without candidates).
-        if self.iv_history is not None and snapshot:
-            current_iv30 = float(snapshot.get("iv30") or 0)
-            if current_iv30 > 0:
-                self.iv_history.record(ticker, current_iv30, today=market_date(now))
+        # Record iv30 from the snapshot (CBOE) when present -- even without
+        # candidates -- so IV Rank history keeps building.
+        snapshot_iv30 = float((snapshot or {}).get("iv30") or 0.0)
+        if self.iv_history is not None and snapshot_iv30 > 0:
+            self.iv_history.record(ticker, snapshot_iv30, today=market_date(now))
 
         iv_rank_val = self._iv_rank_value(ticker, snapshot)
-        spot = float((snapshot or {}).get("price") or 0.0)
         candidates = self._eligible_candidates(
             now, ticker, result, spot=spot, iv_rank_val=iv_rank_val
         )
@@ -1407,6 +1426,19 @@ class PaperTradingCycle:
                 }
             )
             return None
+
+        # Yahoo's snapshot omits iv30, which starved IV Rank. When the snapshot
+        # gave none, fall back to the at-the-money chain IV (just fetched) so IV
+        # Rank accumulates AND gates this cycle too. Stored in percent to match
+        # the CBOE-sourced history.
+        if snapshot_iv30 <= 0:
+            chain_iv30 = self._atm_iv_pct(candidates)
+            if chain_iv30 > 0:
+                iv_rank_val = self._iv_rank_from_iv30(ticker, chain_iv30)
+                for candidate in candidates:
+                    candidate.iv_rank = iv_rank_val
+                if self.iv_history is not None:
+                    self.iv_history.record(ticker, chain_iv30, today=market_date(now))
 
         price_context = self._price_context(ticker, result)
 

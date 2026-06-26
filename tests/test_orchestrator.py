@@ -2,6 +2,7 @@ import json
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from trading_agent.data.iv_history import IV30History
 from trading_agent.data.moomoo_market import build_us_option_code, parse_us_option_code
 from trading_agent.domain.evidence import EvidenceItem
 from trading_agent.domain.liquidity import LiquidityValidator
@@ -171,7 +172,19 @@ def _mandate() -> Mandate:
     account = mandate.account.model_copy(
         update={"initial_capital_usd": 100.0, "compounding": True}
     )
-    options = mandate.options.model_copy(update={"max_contract_cost_usd": 65.0})
+    # Pin the IV-ramp/IV-ceiling knobs OFF to the legacy baseline these tests were
+    # written against: the live paper mandate enabled max_entry_iv (0.80) and the
+    # earnings window (10/25) on 2026-06-26, but most tests here exercise MC /
+    # eligibility / volume-ratio selection with high-IV fixtures and assume
+    # earnings_window_max_days == 0. Dedicated tests override these explicitly.
+    options = mandate.options.model_copy(
+        update={
+            "max_contract_cost_usd": 65.0,
+            "max_entry_iv": 0.0,
+            "earnings_window_min_days": 0,
+            "earnings_window_max_days": 0,
+        }
+    )
     portfolio = mandate.portfolio.model_copy(
         update={
             "max_total_premium_at_risk_usd": 100.0,
@@ -199,6 +212,7 @@ def _cycle(
     max_open_positions_override: int | None = None,
     mandate: "Mandate | None" = None,
     earnings_calendar=None,
+    iv_history=None,
 ) -> PaperTradingCycle:
     mandate = mandate or _mandate()
     return PaperTradingCycle(
@@ -218,6 +232,7 @@ def _cycle(
         order_poll_interval_seconds=0.1,
         sleep_fn=lambda _seconds: None,
         earnings_calendar=earnings_calendar,
+        iv_history=iv_history,
     )
 
 
@@ -362,6 +377,48 @@ def test_entry_routes_through_gate_and_places_order(tmp_path: Path) -> None:
     assert broker.placed == [("buy", OPTION_CODE)]
     assert result.entries == [{"ticker": "EXAMPLE", "option_code": OPTION_CODE}]
     assert len(cycle.position_store.open_positions()) == 1
+
+
+def test_atm_iv_pct_is_median_decimal_iv_as_percent() -> None:
+    from types import SimpleNamespace as NS
+
+    cands = [NS(iv=0.40), NS(iv=0.50), NS(iv=0.60), NS(iv=0.0)]
+    # 0.0 is skipped; median of {0.40,0.50,0.60} = 0.50 -> 50.0 percent.
+    assert PaperTradingCycle._atm_iv_pct(cands) == 50.0
+    assert PaperTradingCycle._atm_iv_pct([]) == 0.0
+    assert PaperTradingCycle._atm_iv_pct([NS(iv=0.0)]) == 0.0
+
+
+def test_entry_records_chain_iv30_when_snapshot_lacks_it(tmp_path: Path) -> None:
+    # FakeMarket's snapshot carries price but no iv30 (the Yahoo case that
+    # starved IV Rank). The chain IV (0.5 decimal) must be recorded as iv30 in
+    # percent (50.0) so IV Rank history keeps building.
+    iv_hist = IV30History(tmp_path / "iv30.json")
+    cycle = _cycle(
+        tmp_path,
+        broker=FakeBroker(),
+        market=FakeMarket(iv=0.5),
+        committee=_committee(_open_responses()),
+        iv_history=iv_hist,
+    )
+
+    cycle.run_once(["EXAMPLE"])
+
+    assert iv_hist.values("EXAMPLE") == [50.0]
+
+
+def test_iv_rank_from_iv30_uses_history_extremes(tmp_path: Path) -> None:
+    iv_hist = IV30History(tmp_path / "iv30.json")
+    iv_hist.record("EXAMPLE", 40.0, today=date(2026, 6, 1))
+    iv_hist.record("EXAMPLE", 60.0, today=date(2026, 6, 2))
+    cycle = _cycle(
+        tmp_path, broker=FakeBroker(), market=FakeMarket(),
+        committee=_committee(_open_responses()), iv_history=iv_hist,
+    )
+    # 50 sits halfway in the [40, 60] range -> IV Rank 0.5.
+    assert cycle._iv_rank_from_iv30("EXAMPLE", 50.0) == 0.5
+    assert cycle._iv_rank_from_iv30("EXAMPLE", 0.0) is None  # no current IV
+    assert cycle._iv_rank_from_iv30("UNKNOWN", 50.0) is None  # no history
 
 
 def test_entry_persists_catalyst_window_end(tmp_path: Path) -> None:
