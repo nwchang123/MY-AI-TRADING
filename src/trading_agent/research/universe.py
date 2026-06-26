@@ -241,8 +241,14 @@ def select_universe(
         normalized.sort(key=lambda c: (c[0] in priority, c[1], c[2]), reverse=True)
         ranked = _dedupe(t for t, _, _ in normalized)
     else:
-        # Pre-catalyst mode: intersect the small-cap pool with the upcoming-
-        # earnings window, then rank farther-earnings-first (lower current IV).
+        # Pre-catalyst mode: PREFER names whose next earnings is in the caller's
+        # window (ranked farther-earnings-first -- lower current IV, more room for
+        # the vol ramp), then BACKFILL with the volume-ratio order. Hard-filtering
+        # to earnings-only once starved the pool to 0-1 names (2026-06-15) and
+        # opened zero positions; the backfill keeps the universe populated while
+        # still front-loading the fresh, not-yet-priced-in catalysts. When enough
+        # names have an upcoming earnings date the backfill is never reached, so
+        # this is effectively pure pre-catalyst exactly when the calendar is rich.
         pool = _dedupe(t for t, _, _ in normalized)
         try:
             earnings = {
@@ -251,8 +257,8 @@ def select_universe(
             }
         except Exception:  # noqa: BLE001 - calendar is best-effort, never blocks
             earnings = {}
-        ranked = [t for t in pool if t in earnings]
-        ranked.sort(
+        earnings_first = [t for t in pool if t in earnings]
+        earnings_first.sort(
             key=lambda t: (
                 t in priority,
                 earnings[t].toordinal(),
@@ -260,6 +266,13 @@ def select_universe(
             ),
             reverse=True,
         )
+        volume_backfill = [
+            t
+            for t, _, _ in sorted(
+                normalized, key=lambda c: (c[0] in priority, c[1], c[2]), reverse=True
+            )
+        ]
+        ranked = _dedupe(earnings_first + volume_backfill)
 
     wl = [str(t).strip().upper() for t in watchlist if str(t).strip()]
     ranked = _dedupe(wl) + [t for t in ranked if t not in set(wl)]

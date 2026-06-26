@@ -424,16 +424,23 @@ def test_select_universe_earnings_mode_ranks_farther_earnings_first() -> None:
         earnings_of=lambda tickers: earnings,
     )
 
-    # CCC has no upcoming earnings -> excluded, never probed. BBB's earnings are
-    # farther out (lower current IV) so it ranks ahead of AAA despite AAA's far
-    # higher volume ratio: the volume-spike bias is gone in earnings mode.
-    assert picked == ["BBB", "AAA"]
-    assert "CCC" not in provider.probed
+    # Earnings names come FIRST, farther-earnings-first (BBB 7/1 ahead of AAA 6/23
+    # -- lower current IV), so the volume-spike bias is gone among them. CCC has no
+    # upcoming earnings so it is BACKFILLED last (by volume ratio) rather than
+    # dropped -- the universe is never starved.
+    assert picked == ["BBB", "AAA", "CCC"]
 
 
-def test_select_universe_earnings_mode_empty_without_upcoming_earnings() -> None:
-    market = FakeScanMarket([_row("US.AAA", 5e7, volume_ratio=9.0)])
-    provider = FakeProvider(optionable={"AAA"})
+def test_select_universe_earnings_mode_backfills_when_no_upcoming_earnings() -> None:
+    # The 2026-06-15 starvation: zero names in the earnings window must NOT empty
+    # the universe -- it falls back to the volume-ratio ranking.
+    market = FakeScanMarket(
+        [
+            _row("US.AAA", 5e7, volume_ratio=9.0),
+            _row("US.BBB", 4e7, volume_ratio=3.0),
+        ]
+    )
+    provider = FakeProvider(optionable={"AAA", "BBB"})
 
     picked = select_universe(
         market=market,
@@ -443,8 +450,31 @@ def test_select_universe_earnings_mode_empty_without_upcoming_earnings() -> None
         earnings_of=lambda tickers: {},
     )
 
-    assert picked == []
-    assert provider.probed == []
+    assert picked == ["AAA", "BBB"]  # volume-ratio backfill, not []
+
+
+def test_select_universe_earnings_mode_fills_to_max_with_backfill() -> None:
+    # One name has upcoming earnings; the slot budget is larger, so volume-ratio
+    # names backfill the rest -- earnings name still ranks first.
+    market = FakeScanMarket(
+        [
+            _row("US.AAA", 5e7, volume_ratio=9.0),  # no earnings, top volume
+            _row("US.BBB", 4e7, volume_ratio=1.0),  # has earnings
+            _row("US.CCC", 3e7, volume_ratio=5.0),  # no earnings
+        ]
+    )
+    provider = FakeProvider(optionable={"AAA", "BBB", "CCC"})
+
+    picked = select_universe(
+        market=market,
+        provider=provider,
+        universe=_universe(),
+        max_tickers=3,
+        earnings_of=lambda tickers: {"BBB": date(2026, 7, 1)},
+    )
+
+    # BBB (earnings) first, then AAA, CCC by volume ratio.
+    assert picked == ["BBB", "AAA", "CCC"]
 
 
 def _probe_iv(provider, max_entry_iv: float) -> EligibleContractProbe:
