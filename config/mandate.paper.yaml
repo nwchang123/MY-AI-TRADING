@@ -125,14 +125,19 @@ options:
   # persists -- this is a cost filter, not a quality bar.
   min_catalyst_score_for_committee: 15.0
   # --- Phase 1: pre-catalyst (earnings) IV-ramp selection ---
-  # DISABLED for now (all 0 = legacy volume-ratio selection unchanged). To
-  # ACTIVATE: set the window to 10/25, pre_earnings exit to 2, AND add a Finnhub
-  # key (TRADING_AGENT_FINNHUB_API_KEY) to .env -- without the key the bulk
-  # earnings calendar falls back to a thin yfinance per-ticker shortlist and the
-  # universe will be sparse. Recommended enable values shown in comments.
-  earnings_window_min_days: 0   # DISABLED 2026-06-15 PM: earnings-ONLY selection stacked on the liquidity pivot starved the universe to 0-1 names. Reverted to volume-ratio selection over the liquid mid-cap universe (scan confirmed that universe is healthy without the earnings filter).
-  earnings_window_max_days: 0   # 0 = volume-ratio selection (no earnings-window intersection)
-  pre_earnings_exit_trading_days: 2   # KEPT as an EXIT safety: even with volume-ratio selection, a held position is closed 2 trading days before its own earnings (avoid IV-crush). Uses the Finnhub calendar that stays configured in .env.
+  # ACTIVATED 2026-06-26. Safe to enable now because select_universe PREFERS
+  # upcoming-earnings names then BACKFILLS with volume-ratio (commit 5b2155b), so
+  # the window can no longer starve the universe to 0-1 names (the 2026-06-15
+  # failure that forced the revert). Finnhub key also refreshed in .env the same
+  # day -- the prior key 401'd, so the bulk earnings calendar had been silently
+  # empty. WHY: volume-ratio alone kept feeding already-spiked names the committee
+  # vetoed as "priced in" (0 entries for many sessions); buying 10-25 days BEFORE
+  # earnings catches the IV ramp and exits 2 trading days before the print. This
+  # is an EVALUATION -- pre-earnings names can still draw binary/IV-crush vetoes,
+  # so watch the entry count. Revert by setting both windows back to 0.
+  earnings_window_min_days: 10   # skip earnings <10d out (IV already ramped, crush imminent)
+  earnings_window_max_days: 25   # >0 switches to earnings-window-preferred selection + volume backfill
+  pre_earnings_exit_trading_days: 2   # EXIT safety: close a held position 2 trading days before its earnings (avoid IV-crush). Uses the Finnhub calendar in .env.
   max_entry_iv: 0   # leave 0 at first; tune down from observed earnings-window IVs
   min_abs_delta: 0.20
   max_gamma_per_contract: 2.0
