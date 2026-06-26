@@ -122,6 +122,8 @@ class TelegramBot:
         self._current_update_meta: dict[str, Any] | None = None
         self._last_deadman_alert: datetime | None = None
         self._operator_alerts_sent: dict[str, datetime] = {}
+        self._last_mandate: Mandate | None = None
+        self._last_mandate_error: str | None = None
 
     # --- plumbing --------------------------------------------------------
     def _http_request(self, method: str, payload: dict[str, Any] | None) -> dict[str, Any]:
@@ -163,9 +165,39 @@ class TelegramBot:
     def _runtime(self) -> Path:
         return self.settings.root_dir / "runtime"
 
+    def _mandate(self) -> Mandate:
+        """Load the mandate, serving the last good one on a parse error.
+
+        The bot reloads the mandate live (the kill-switch path rides every poll),
+        so a config edit that adds a field the running bot's older code does not
+        know yet raises pydantic ``extra_forbidden`` (the models are
+        ``extra="forbid"``). Without a fallback that broke every poll -- 677x on
+        2026-06-26 after a ``news_cache_ttl_hours`` edit. Keep serving the last
+        successfully-loaded mandate so a deploy-time config/code skew degrades to
+        "slightly stale config" instead of a dead listener; restarting the bot
+        still adopts the new schema. A genuine bad config at startup (no last-good
+        yet) still raises, so it fails loudly when there is nothing to fall back on.
+        """
+        try:
+            mandate = Mandate.load(self.settings.mandate_path)
+        except Exception as exc:  # noqa: BLE001 - keep the listener alive
+            if self._last_mandate is None:
+                raise
+            message = str(exc)
+            if message != self._last_mandate_error:
+                self._last_mandate_error = message
+                print(
+                    "mandate reload failed; serving last-good config until the "
+                    f"bot is restarted: {message}",
+                    file=sys.stderr,
+                )
+            return self._last_mandate
+        self._last_mandate = mandate
+        self._last_mandate_error = None
+        return mandate
+
     def _halt_path(self) -> Path:
-        mandate = Mandate.load(self.settings.mandate_path)
-        return self.settings.root_dir / mandate.execution.kill_switch_file
+        return self.settings.root_dir / self._mandate().execution.kill_switch_file
 
     def _store(self) -> PositionStore:
         return PositionStore(self._runtime() / f"positions.{self.settings.mode}.sqlite")
@@ -424,7 +456,7 @@ class TelegramBot:
             for r in rows
             if r["status"] == "closed" and r["exit_price"] is not None
         )
-        mandate = Mandate.load(self.settings.mandate_path)
+        mandate = self._mandate()
         equity = mandate.account.initial_capital_usd + realized
         lines.append(
             f"持仓 {len(open_rows)} 个 | 已实现盈亏 ${realized:+.2f} | 权益 ${equity:.2f}"
@@ -784,7 +816,7 @@ class TelegramBot:
     def _operator_risk_candidates(self) -> list[tuple[str, str]]:
         candidates: list[tuple[str, str]] = []
         now_day = market_date(self._now())
-        mandate = Mandate.load(self.settings.mandate_path)
+        mandate = self._mandate()
         rows = self._store().open_positions()
         risk = build_portfolio_risk_report(rows, as_of=now_day)
         premium = float(risk.get("premium_at_risk_usd") or 0)

@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from shutil import copyfile
 
+import pytest
+
 from trading_agent.bot import TelegramBot
 from trading_agent.settings import Settings
 
@@ -54,6 +56,34 @@ def _bot(tmp_path: Path, llm=None, spawned=None) -> TelegramBot:
         spawn_fn=(lambda: spawned.append(True)) if spawned is not None else None,
         now_fn=lambda: NOW,
     )
+
+
+def _add_unknown_execution_field(tmp_path: Path) -> None:
+    """Simulate a deploy skew: config gains a field this code's model rejects."""
+    path = tmp_path / "config" / "mandate.paper.yaml"
+    text = path.read_text(encoding="utf-8")
+    path.write_text(
+        text.replace(
+            "max_daily_llm_tokens: 5000000",
+            "max_daily_llm_tokens: 5000000\n  bogus_field_xyz: 1",
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_mandate_serves_last_good_on_bad_config(tmp_path: Path) -> None:
+    bot = _bot(tmp_path)
+    good = bot._mandate()  # first load succeeds and is cached
+    _add_unknown_execution_field(tmp_path)  # config now skews ahead of the code
+    served = bot._mandate()  # must NOT raise -- the dead listener bug
+    assert served is good
+
+
+def test_mandate_raises_when_no_last_good(tmp_path: Path) -> None:
+    bot = _bot(tmp_path)
+    _add_unknown_execution_field(tmp_path)  # bad before any successful load
+    with pytest.raises(Exception):
+        bot._mandate()
 
 
 def _write_heartbeat(tmp_path: Path, at: datetime) -> None:
