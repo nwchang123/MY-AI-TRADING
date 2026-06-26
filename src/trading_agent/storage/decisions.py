@@ -82,6 +82,40 @@ class DecisionCache:
             return None
         return entry.get("output")
 
+    def get_by_thesis(
+        self, ticker: str, thesis_digest: str, now: datetime | None = None
+    ) -> str | None:
+        """Reuse a cached HOLD/REJECT decision when only the contracts drifted.
+
+        A reject/hold turns on the thesis (evidence), not on which near-money
+        strike was eligible this minute, so an unchanged thesis can reuse the prior
+        decision even when the candidate option codes churned -- the dominant
+        cache-miss cause (the 4.8% hit rate diagnosed via ``classify_miss``).
+
+        An ``open_position`` decision is NEVER reused this way: it names a specific
+        contract that may no longer be eligible, so it still requires the exact
+        full-``decision_digest`` match in :meth:`get`. Returns the cached output
+        JSON, or None on miss/expiry/open.
+        """
+        current = now or datetime.now(timezone.utc)
+        entry = self._ensure_loaded().get(ticker.upper())
+        if not entry or entry.get("thesis") != thesis_digest:
+            return None
+        try:
+            cached_at = datetime.fromisoformat(entry["at"])
+        except (KeyError, ValueError):
+            return None
+        if current - cached_at > self.ttl:
+            return None
+        output = entry.get("output")
+        try:
+            decision = json.loads(output or "{}").get("decision")
+        except json.JSONDecodeError:
+            return None
+        if decision == "open_position":
+            return None
+        return output
+
     def fresh_rejections(
         self, now: datetime | None = None, *, within_hours: float | None = None
     ) -> set[str]:

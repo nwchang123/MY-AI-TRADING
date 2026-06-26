@@ -18,7 +18,7 @@ from trading_agent.data.earnings import YahooEarningsCalendar
 from trading_agent.data.earnings_calendar import build_earnings_calendar
 from trading_agent.data.iv_history import IV30History
 from trading_agent.data.moomoo_market import MoomooMarket
-from trading_agent.data.news_feeds import GoogleNewsClient
+from trading_agent.data.news_feeds import CachingNewsClient, GoogleNewsClient
 from trading_agent.data.price_history import YahooPriceHistory
 from trading_agent.data.option_data import OptionDataProvider, build_option_provider
 from trading_agent.data.sec_edgar import SecEdgarClient
@@ -97,6 +97,20 @@ def _position_store(settings: Settings) -> PositionStore:
     return PositionStore(
         settings.root_dir / "runtime" / f"positions.{settings.mode}.sqlite"
     )
+
+
+def _news_client(mandate: Mandate) -> Any:
+    """Google News client wrapped in a TTL cache that stabilizes the headline set.
+
+    Freezing each ticker's headlines for ``news_cache_ttl_hours`` stops the RSS
+    feed's top-N churn from busting the thesis-keyed decision cache, so unchanged
+    HOLD/REJECT names stop re-burning tokens every cycle. 0 disables the wrapper.
+    """
+    client: Any = GoogleNewsClient()
+    ttl = mandate.execution.news_cache_ttl_hours
+    if ttl > 0:
+        client = CachingNewsClient(client, ttl_hours=ttl)
+    return client
 
 
 def _print_json(payload: Any) -> None:
@@ -337,9 +351,10 @@ def _build_cycle(
         audit=_audit_writer(settings),
         trd_env=trd_env,
         max_open_positions_override=max_open_positions_override,
-        news_client=GoogleNewsClient(),
+        news_client=_news_client(mandate),
         decision_cache=DecisionCache(
-            settings.root_dir / "runtime" / f"decisions.{settings.mode}.json"
+            settings.root_dir / "runtime" / f"decisions.{settings.mode}.json",
+            ttl_hours=mandate.execution.decision_cache_ttl_hours,
         ),
         llm_budget=(
             DailyTokenBudget(
@@ -499,12 +514,16 @@ def _auto_universe(settings: Settings, max_tickers: int) -> list[str]:
         ),
         ProbeCache(settings.root_dir / "runtime" / "probe_cache.json"),
     )
-    # Bench rejected names for 2h, not the full 6h decision TTL: the bench
-    # only saves a probe + evidence fetch, but it blocks the re-evaluation a
-    # changed digest would trigger (and the eligible-name flow is scarce).
-    skip = DecisionCache(
-        settings.root_dir / "runtime" / f"decisions.{settings.mode}.json"
-    ).fresh_rejections(within_hours=2.0)
+    # Bench rejected names only for the configured selection window: the bench
+    # saves probe/evidence fetches but blocks even changed-digest re-evaluation.
+    # Keep it shorter than the decision cache when eligible-name flow is scarce.
+    if mandate.execution.rejection_bench_hours > 0:
+        skip = DecisionCache(
+            settings.root_dir / "runtime" / f"decisions.{settings.mode}.json",
+            ttl_hours=mandate.execution.decision_cache_ttl_hours,
+        ).fresh_rejections(within_hours=mandate.execution.rejection_bench_hours)
+    else:
+        skip = set()
     try:
         priority = SecEdgarClient(settings.sec_user_agent).recent_8k_tickers()
     except Exception as exc:  # noqa: BLE001 - seeds are an enrichment, never block

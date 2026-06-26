@@ -113,6 +113,17 @@ options:
   # >= 0.75. This is the real lever -- 91% of candidates were dying on hard vetoes
   # that short-circuited before the numeric floors ever ran.
   veto_win_prob_penalty: 0.02
+  # Pre-screen catalyst gate (cost filter before the LLM committee). LOWERED
+  # 20.0 -> 15.0 on 2026-06-25: at 20.0 the 2026-06-18..24 paper run scored a max
+  # catalyst total of 17.8 (median 10.2) on the liquid mid-cap universe, so NOTHING
+  # reached the committee and the agent opened ZERO new positions for 6 sessions.
+  # The veto is already near-off (penalty 0.02) and the win-prob/MC floors were
+  # loosened on 2026-06-17, confirming the binding gate had moved upstream to here.
+  # 15.0 lets the top tier (~the [15,20) cluster) through to the committee, which
+  # still applies the real quality gates; the thesis-keyed decision cache keeps the
+  # extra committee runs from re-burning tokens. Tune lower only if the drought
+  # persists -- this is a cost filter, not a quality bar.
+  min_catalyst_score_for_committee: 15.0
   # --- Phase 1: pre-catalyst (earnings) IV-ramp selection ---
   # DISABLED for now (all 0 = legacy volume-ratio selection unchanged). To
   # ACTIVATE: set the window to 10/25, pre_earnings exit to 2, AND add a Finnhub
@@ -183,6 +194,22 @@ execution:
   # 2M was still exhausted by 25-ticker universes. 5M (~125 committee passes)
   # covers a full session with headroom. DeepSeek pricing: ~$0.05/day.
   max_daily_llm_tokens: 5000000
+  # Cache unchanged committee HOLD/REJECT decisions for one trading day. The
+  # thesis hash includes public evidence IDs, so fresh filings/news still force a
+  # new committee run; this mainly prevents the same stale thesis from burning
+  # another ~30k tokens after the old 6h TTL expires.
+  decision_cache_ttl_hours: 24
+  # Freeze each ticker's Google News headlines for 4h (2026-06-26). The RSS feed
+  # reshuffles its top-N every request, so re-fetching each cycle churned the news
+  # evidence IDs and busted the thesis cache even when nothing broke -- "both
+  # changed" was 64% of misses and the budget hit 100% by mid-session on 06-25/26.
+  # 4h spans the 2h rejection bench so a re-competing name still hits the thesis
+  # cache; SEC filings stay real-time, so a fresh 8-K still forces a re-run.
+  news_cache_ttl_hours: 4
+  # Only bench fresh rejections out of universe selection for 2h. After that the
+  # ticker can compete again; if evidence is unchanged, the 24h thesis cache
+  # serves the decision without LLM spend.
+  rejection_bench_hours: 2
   # Decouple cadence (2026-06-24): exits/stops are checked every 60s tick, but
   # the universe+committee entry evaluation only runs every 5 min. A committee
   # pass costs ~33k tokens, so a 25-name universe burns ~800k per full pass --

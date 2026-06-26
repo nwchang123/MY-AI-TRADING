@@ -1437,18 +1437,20 @@ class PaperTradingCycle:
             return None
 
         # Skip committee when catalyst score is too weak to justify LLM cost.
-        if scores.total < 20.0:
+        min_catalyst = self.active_mandate.options.min_catalyst_score_for_committee
+        if scores.total < min_catalyst:
             self.audit.append(
                 "pre_screen_reject",
                 {"ticker": ticker, "reasons": ["weak_catalyst_score"],
-                 "catalyst_score": scores.total},
+                 "catalyst_score": scores.total, "threshold": min_catalyst},
             )
             result.rejected.append(
                 {
                     "ticker": ticker,
                     "stage": "pre_screen",
                     "reasons": [
-                        f"catalyst score {scores.total:.1f} below threshold 20.0"
+                        f"catalyst score {scores.total:.1f} below threshold "
+                        f"{min_catalyst:.1f}"
                     ],
                 }
             )
@@ -1521,6 +1523,14 @@ class PaperTradingCycle:
         output = None
         if self.decision_cache is not None:
             cached = self.decision_cache.get(ticker, digest, now)
+            reuse = "exact"
+            if cached is None:
+                # Full digest busts every cycle as the near-money contracts drift.
+                # Reuse the prior HOLD/REJECT when the THESIS is unchanged (open
+                # decisions still require the exact contract match above) -- this is
+                # the fix for the ~4.8% hit rate that exhausted the token budget.
+                cached = self.decision_cache.get_by_thesis(ticker, th_digest, now)
+                reuse = "thesis"
             if cached is not None:
                 try:
                     output = CommitteeOutput.model_validate_json(cached)
@@ -1530,7 +1540,7 @@ class PaperTradingCycle:
                     self.audit.append(
                         "committee_cache_hit",
                         {"ticker": ticker, "decision": output.decision,
-                         "digest": digest[:16]},
+                         "digest": digest[:16], "reuse": reuse},
                     )
             if output is None:
                 # The cache did not save us -- record WHY so we can confirm the

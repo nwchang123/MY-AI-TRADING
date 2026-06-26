@@ -1,8 +1,9 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from trading_agent.data.news_feeds import (
+    CachingNewsClient,
     GoogleNewsClient,
     NewsFeedError,
     parse_google_news_rss,
@@ -91,3 +92,85 @@ def test_bare_ticker_query_when_no_name_supplied() -> None:
     )
     client.fetch_evidence("SOFI")
     assert seen == ['"SOFI" stock']
+
+
+class _StubNews:
+    """Inner news client whose result/behavior is driven by ``fn(call_no)``."""
+
+    def __init__(self, fn) -> None:
+        self._fn = fn
+        self.calls: list[tuple[str, str | None]] = []
+
+    def fetch_evidence(self, ticker: str, query_name: str | None = None):
+        self.calls.append((ticker, query_name))
+        return self._fn(len(self.calls))
+
+
+def test_caching_freezes_headline_set_within_ttl() -> None:
+    # The core fix: a re-fetch inside the window reuses the first result, so the
+    # evidence-id set (and thus the thesis hash) stays stable across cycles even
+    # though the live feed would have returned a different list on the 2nd call.
+    clock = {"t": NOW}
+    stub = _StubNews(lambda n: [f"call-{n}"])
+    client = CachingNewsClient(stub, ttl_hours=4.0, now_fn=lambda: clock["t"])
+
+    first = client.fetch_evidence("SOFI")
+    clock["t"] = NOW + timedelta(hours=3)
+    second = client.fetch_evidence("SOFI")
+
+    assert first == ["call-1"]
+    assert second == ["call-1"]  # frozen, not the live "call-2"
+    assert len(stub.calls) == 1  # the feed was hit once, not per cycle
+
+
+def test_caching_refetches_after_ttl_expiry() -> None:
+    clock = {"t": NOW}
+    stub = _StubNews(lambda n: [f"call-{n}"])
+    client = CachingNewsClient(stub, ttl_hours=4.0, now_fn=lambda: clock["t"])
+
+    client.fetch_evidence("SOFI")
+    clock["t"] = NOW + timedelta(hours=4, minutes=1)
+    refreshed = client.fetch_evidence("SOFI")
+
+    assert refreshed == ["call-2"]  # genuinely fresh news still gets through
+    assert len(stub.calls) == 2
+
+
+def test_caching_keys_on_ticker_and_query_name() -> None:
+    clock = {"t": NOW}
+    stub = _StubNews(lambda n: [f"call-{n}"])
+    client = CachingNewsClient(stub, ttl_hours=4.0, now_fn=lambda: clock["t"])
+
+    client.fetch_evidence("TE", query_name="Tradeweb Markets Inc")
+    client.fetch_evidence("TE", query_name="Other Name")
+    client.fetch_evidence("SOFI")
+
+    assert len(stub.calls) == 3  # each distinct (ticker, query_name) is its own slot
+
+
+def test_caching_serves_stale_on_feed_failure() -> None:
+    clock = {"t": NOW}
+
+    def fn(n: int):
+        if n == 1:
+            return ["fresh"]
+        raise NewsFeedError("feed down")
+
+    stub = _StubNews(fn)
+    client = CachingNewsClient(stub, ttl_hours=4.0, now_fn=lambda: clock["t"])
+
+    client.fetch_evidence("SOFI")
+    clock["t"] = NOW + timedelta(hours=5)  # past TTL, forces a re-fetch that fails
+    served = client.fetch_evidence("SOFI")
+
+    assert served == ["fresh"]  # stale beats an empty set that would churn the thesis
+
+
+def test_caching_propagates_failure_with_no_prior_entry() -> None:
+    def fn(n: int):
+        raise NewsFeedError("feed down")
+
+    client = CachingNewsClient(_StubNews(fn), ttl_hours=4.0, now_fn=lambda: NOW)
+
+    with pytest.raises(NewsFeedError):
+        client.fetch_evidence("SOFI")

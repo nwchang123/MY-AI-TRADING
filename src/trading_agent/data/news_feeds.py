@@ -133,3 +133,58 @@ class GoogleNewsClient:
         return news_items_from_raw(
             rows, ticker, default_source="news_rss", retrieved_at=now
         )
+
+
+class CachingNewsClient:
+    """TTL cache around a news client that stabilizes the headline set per ticker.
+
+    Google News RSS reshuffles its top-N between requests, so fetching the live
+    feed every cycle churns the news ``evidence_id`` set even when no genuinely
+    new story broke. That churn flips the thesis hash every cycle and busts the
+    thesis-keyed decision cache -- the dominant ``both_changed`` miss (~64% of
+    misses) that exhausted the daily token budget. Freezing the headline set for
+    a short window keeps the thesis stable across the many cycles inside it, so an
+    unchanged HOLD/REJECT reuses its cached decision instead of re-burning ~33k
+    tokens on an identical re-evaluation.
+
+    Only news -- the noisy enrichment -- is stabilized. SEC filings (the primary
+    catalyst evidence) are fetched separately and stay real-time, so a genuinely
+    new 8-K still changes the thesis and forces a fresh run immediately.
+
+    Implements the same ``fetch_evidence(ticker, query_name=...)`` surface as
+    :class:`GoogleNewsClient`, so it drops in as a transparent wrapper. On a feed
+    failure it returns the last cached headlines when available (graceful
+    degradation that also avoids a transient outage busting the thesis); with no
+    prior entry the underlying error propagates as before.
+    """
+
+    def __init__(
+        self,
+        inner: Any,
+        *,
+        ttl_hours: float = 4.0,
+        now_fn: Callable[[], datetime] | None = None,
+    ):
+        self._inner = inner
+        self._ttl = timedelta(hours=ttl_hours)
+        self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        self._cache: dict[str, tuple[datetime, list[EvidenceItem]]] = {}
+
+    def fetch_evidence(
+        self, ticker: str, query_name: str | None = None
+    ) -> list[EvidenceItem]:
+        now = self._now_fn()
+        key = f"{ticker.upper()}|{query_name or ''}"
+        cached = self._cache.get(key)
+        if cached is not None and now - cached[0] <= self._ttl:
+            return cached[1]
+        try:
+            items = self._inner.fetch_evidence(ticker, query_name=query_name)
+        except Exception:
+            if cached is not None:
+                # Stale headlines beat dropping news entirely: an empty set would
+                # itself churn the thesis and trigger a needless fresh run.
+                return cached[1]
+            raise
+        self._cache[key] = (now, items)
+        return items

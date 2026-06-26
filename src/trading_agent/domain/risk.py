@@ -71,6 +71,15 @@ class OptionsMandate(BaseModel):
     # still clear ``min_estimated_win_probability``. E.g. penalty 0.10 + floor
     # 0.55 => one veto needs PM confidence >= 0.65, two vetoes >= 0.75.
     veto_win_prob_penalty: float = Field(default=0.0, ge=0, le=1)
+    # Pre-screen catalyst gate: candidates whose deterministic catalyst score
+    # (range -25..+75; catalyst*50 + operations*25 - contradictions*25) is below
+    # this never reach the LLM committee. This is a COST filter (skip hopeless
+    # names to save ~33k tokens/pass), NOT the quality gate -- the committee +
+    # win-prob/MC floors decide quality downstream. Set too high and the committee
+    # never sees anything: at 20.0 the whole 2026-06-18..24 run scored a max of
+    # 17.8 (median 10.2) so ZERO candidates passed and ZERO entries opened for 6
+    # sessions. Default 20.0 preserves the historical (live) behavior.
+    min_catalyst_score_for_committee: float = Field(default=20.0)
     # --- Phase 1: pre-catalyst (earnings) IV-ramp selection ---
     # When earnings_window_max_days > 0, the universe is picked by UPCOMING
     # earnings proximity instead of realized volume spikes: only names whose next
@@ -150,6 +159,23 @@ class ExecutionMandate(BaseModel):
     # the committee is skipped until the next market day. Protects the API
     # balance from a runaway loop. 0 disables.
     max_daily_llm_tokens: int = Field(default=0, ge=0)
+    # Local committee decision cache TTL. Evidence IDs are still hashed into the
+    # key, so fresh filings/news force a re-evaluation; this TTL mostly controls
+    # how long unchanged reject/hold decisions avoid repeat LLM burns.
+    decision_cache_ttl_hours: float = Field(default=6.0, gt=0)
+    # Freeze each ticker's Google News headline set for this long. The RSS feed
+    # reshuffles its top-N between requests, so re-fetching every cycle churns the
+    # news evidence IDs and busts the thesis-keyed decision cache even when no new
+    # story broke -- the dominant cache miss that drained the token budget. Keep
+    # this >= rejection_bench_hours so a name re-competing after its bench still
+    # hits the thesis cache. SEC filings stay real-time regardless, so a fresh
+    # 8-K still forces a re-run. 0 disables (always fetch live).
+    news_cache_ttl_hours: float = Field(default=4.0, ge=0)
+    # Universe selection can bench recent reject/hold names before fetching more
+    # evidence. Keep this shorter than the decision cache if you want names to
+    # compete for slots again while still allowing a later thesis-cache hit. 0
+    # disables the pre-selection bench entirely.
+    rejection_bench_hours: float = Field(default=2.0, ge=0)
     # Decouple cadence: exits/risk are monitored every tick (cheap, no LLM),
     # but new-entry EVALUATION (universe + committee, the token-hungry part)
     # only runs this often. At a 60s tick a value of 300 means the committee
