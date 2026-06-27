@@ -75,6 +75,10 @@ def test_build_universe_filters_maps_mandate() -> None:
     # liquidity pivot: price 2->5, mcap 100M-5B -> 1B-50B, turnover 5M->30M)
     # never silently breaks this test.
     assert by_field["CUR_PRICE"].filter_min == universe.min_underlying_price_usd
+    # Share-price ceiling (small-account: keep options affordable). When the mandate
+    # sets it, it maps to the CUR_PRICE upper bound; 0 would leave it one-sided.
+    if universe.max_underlying_price_usd > 0:
+        assert by_field["CUR_PRICE"].filter_max == universe.max_underlying_price_usd
     assert by_field["MARKET_VAL"].filter_min == universe.min_market_cap_usd
     assert by_field["MARKET_VAL"].filter_max == universe.max_market_cap_usd
     # TURNOVER is accumulate-class: SimpleFilter is rejected by OpenD.
@@ -93,6 +97,22 @@ def test_build_universe_filters_maps_mandate() -> None:
     assert by_field["CHANGE_RATE"].days == 1
     constrained = [by_field["CUR_PRICE"], by_field["MARKET_VAL"], by_field["TURNOVER"]]
     assert all(f.is_no_filter is False for f in constrained)
+
+
+def test_build_universe_filters_omits_price_ceiling_when_zero() -> None:
+    # A 0 ceiling (large-account default) must leave CUR_PRICE one-sided -- a
+    # filter_max of 0 would reject every name.
+    sdk = SimpleNamespace(
+        SimpleFilter=FakeSimpleFilter,
+        AccumulateFilter=FakeAccumulateFilter,
+        StockField=_stock_field(),
+        SortDir=_sort_dir(),
+    )
+    universe = _universe().model_copy(update={"max_underlying_price_usd": 0.0})
+    filters = build_universe_filters(universe, sdk)
+    by_field = {f.stock_field: f for f in filters}
+    assert by_field["CUR_PRICE"].filter_min == universe.min_underlying_price_usd
+    assert by_field["CUR_PRICE"].filter_max is None
 
 
 def test_parse_filter_rows_extracts_fields() -> None:

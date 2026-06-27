@@ -1,5 +1,12 @@
 account:
-  initial_capital_usd: 2000
+  # SMALL-ACCOUNT PIVOT 2026-06-27: 2000 -> 500 to match the operator's intended
+  # LIVE capital. Paper must simulate the real conditions: a strategy validated at
+  # $2000 is worthless if live money is $500. $500 was untradeable BEFORE only
+  # because the universe held $50-200 names whose near-money options cost >$500 --
+  # now max_underlying_price_usd caps the share price (~$50) so a near-the-money,
+  # high-delta contract fits the budget. Single-leg long options for now; debit
+  # spreads (better cost-efficiency for a small account) are a later phase.
+  initial_capital_usd: 500
   live_mode_requires_operator_flag: true
   withdrawal_capability: forbidden
   # Paper compounds: dollar caps scale with realized equity relative to this $500
@@ -37,6 +44,14 @@ universe:
   # emptied) watchlist anyway. EVALUATION: widen back toward 100-500B if the
   # mid-cap pool proves too thin to populate the universe.
   min_underlying_price_usd: 5
+  # SMALL-ACCOUNT CEILING 2026-06-27: cap the share price so a near-the-money
+  # option fits a $500 account. Premium scales with share price; at <=$50 a 30-45d
+  # near-money contract runs ~$150-400 (high delta, higher win prob) instead of
+  # the $600-1500 a $200 name costs (which forces deep-OTM lottery tickets). Kept
+  # WITH the turnover/market-cap/liquidity filters so we get LOW-priced LIQUID
+  # names (tight option spreads), not the micro-caps with the 13-29% spread tax.
+  # 0 disables. EVALUATION: raise toward $80 if the <=$50 pool runs too thin.
+  max_underlying_price_usd: 50
   min_market_cap_usd: 3000000000
   max_market_cap_usd: 50000000000
   min_average_daily_turnover_usd: 10000000
@@ -75,17 +90,15 @@ options:
   min_dte: 14
   max_dte: 45
   min_option_bid_usd: 0.05
-  # Single-contract cost cap = 65% of the $500 base = $325 (ask <= ~$3.24), which
-  # reaches near-the-money strikes (higher delta -> higher win probability)
-  # instead of deep-OTM lottery tickets. At the old $100 base this was $65
-  # (ask <= ~$0.64) -- the binding constraint that starved candidate flow AND
-  # pinned the strategy to the lowest-win-rate options. Compounding scales this
-  # with realized equity, so wins widen the reachable strikes.
-  # = the full loss budget: a single near-the-money contract may use the whole
-  # budget, so the AI is not forced into deep-OTM junk on higher-priced liquid
-  # names. max_total_premium_at_risk_usd still caps total exposure (= total
-  # possible loss). RAISED 500 -> 2000 on 2026-06-15 (see account block).
-  max_contract_cost_usd: 2000
+  # Single-contract cost cap = 65% of the $500 budget = $325 (ask <= ~$3.24).
+  # ALIGNED 2026-06-27 with portfolio.max_single_position_cost_usd (also $325):
+  # this is the value the committee is TOLD it may spend, and the risk gate now
+  # enforces the SAME number, so the committee no longer proposes a contract the
+  # gate then rejects (the prior 2000-vs-800 mismatch wasted committee runs and
+  # produced "premium too big for account" vetoes). With max_underlying_price_usd
+  # capping the share price, $325 reaches near-the-money (high-delta) strikes
+  # rather than deep-OTM lottery tickets.
+  max_contract_cost_usd: 325
   # 2026-06-15 EVENING fix: spread<=15 KEPT (the real liquidity cost; the free feed
   # reports it reliably -- ROKU near-money strikes were 5-12%). But OI>=100 / vol>=10
   # blocked ~24/25 liquid names: the free feed returns NO per-contract volume
@@ -186,20 +199,24 @@ options:
   default_stop_loss_pct: 50.0
 
 portfolio:
-  # The $2000 TOTAL LOSS BUDGET (operator 2026-06-15: "use what you want, never
-  # lose more than the budget"; RAISED 500->2000 because $500 couldn't afford a
-  # near-money option on liquid names -- 0/25 eligible). max_total_premium_at_risk_usd
-  # caps total option exposure -- and since these are LONG options (max loss =
-  # premium), that ceiling bounds total possible loss to the budget.
-  # hard_drawdown_stop_usd writes HALT once cumulative drawdown hits the full
-  # budget. daily_loss_stop set equal to the budget (no tighter daily %-brake, per
-  # "don't limit by %"); put a smaller number here for a per-day brake.
+  # The $500 TOTAL LOSS BUDGET (operator 2026-06-15: "use what you want, never
+  # lose more than the budget"). SCALED TO $500 on 2026-06-27 to match the intended
+  # live capital; the $50 share-price ceiling now makes near-money options
+  # affordable here (the reason $500 was raised to 2000 before -- without a price
+  # ceiling the universe held $50-200 names whose near-money options cost >$500).
+  # max_total_premium_at_risk_usd caps total option exposure -- and since these are
+  # LONG options (max loss = premium), that ceiling bounds total possible loss to
+  # the budget. hard_drawdown_stop_usd writes HALT once cumulative drawdown hits
+  # the full budget. daily_loss_stop set equal to the budget (no tighter daily
+  # %-brake, per "don't limit by %"); put a smaller number here for a per-day brake.
+  # single-position cost = 65% of $500 = $325, ALIGNED with options.max_contract_cost_usd
+  # (the committee is told the same number the gate enforces -- no more mismatch).
   max_open_positions: 2
-  max_total_premium_at_risk_usd: 2000
-  max_single_position_cost_usd: 800
+  max_total_premium_at_risk_usd: 500
+  max_single_position_cost_usd: 325
   max_new_positions_per_day: 2
-  daily_loss_stop_usd: 2000
-  hard_drawdown_stop_usd: 2000
+  daily_loss_stop_usd: 500
+  hard_drawdown_stop_usd: 500
   consecutive_loss_stop: 3
   cooldown_after_consecutive_losses_hours: 24
   # No new entries when the VIX is above this (panic regime guard); exits still run.

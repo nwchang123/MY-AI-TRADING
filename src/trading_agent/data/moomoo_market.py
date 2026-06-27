@@ -125,8 +125,14 @@ def build_universe_filters(universe: UniverseMandate, sdk: Any) -> list[Any]:
     change_rate.is_no_filter = True
     change_rate.days = 1
 
+    # A 0 ceiling means "no upper bound" -- pass None so the filter stays one-sided.
+    price_ceiling = getattr(universe, "max_underlying_price_usd", 0.0) or 0.0
     return [
-        make(field.CUR_PRICE, fmin=universe.min_underlying_price_usd),
+        make(
+            field.CUR_PRICE,
+            fmin=universe.min_underlying_price_usd,
+            fmax=price_ceiling if price_ceiling > 0 else None,
+        ),
         make(
             field.MARKET_VAL,
             fmin=universe.min_market_cap_usd,

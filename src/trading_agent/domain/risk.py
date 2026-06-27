@@ -27,6 +27,12 @@ class UniverseMandate(BaseModel):
 
     market: Literal["US"]
     min_underlying_price_usd: float = Field(gt=0)
+    # Upper bound on the underlying share price. A long option's premium scales
+    # with the share price, so on a small account only LOW-priced underlyings have
+    # a near-the-money (high-delta, higher-win-prob) contract that fits the cost
+    # cap; high-priced names force deep-OTM lottery tickets. 0 = no ceiling (the
+    # legacy behavior, leaving high-priced names in for a large account).
+    max_underlying_price_usd: float = Field(default=0.0, ge=0)
     min_market_cap_usd: float = Field(gt=0)
     max_market_cap_usd: float = Field(gt=0)
     min_average_daily_turnover_usd: float = Field(gt=0)
