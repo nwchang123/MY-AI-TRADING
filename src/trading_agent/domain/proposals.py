@@ -50,6 +50,21 @@ class ExitPlan(BaseModel):
     stop_loss_pct: float = Field(gt=0, le=100)
     time_stop: date
 
+    @field_validator("take_profit_pct", "stop_loss_pct", mode="before")
+    @classmethod
+    def normalize_pct(cls, v: object) -> object:
+        """The committee LLM is inconsistent about how it expresses exit
+        percentages: sometimes a signed fraction (-0.5 = "stop at -50%"),
+        sometimes a magnitude (50.0). Both mean the same trade, but the schema
+        wants a positive magnitude in [0, 100], so a -0.5 used to fail validation
+        and kill an otherwise-valid proposal. Coerce to that convention: drop the
+        sign, and scale a sub-unit fraction up to a percentage."""
+        if isinstance(v, (int, float)):
+            v = abs(float(v))
+            if 0 < v <= 1:
+                v *= 100.0
+        return v
+
 
 class OpenPositionProposal(BaseModel):
     model_config = ConfigDict(extra="forbid")

@@ -1059,9 +1059,15 @@ class PaperTradingCycle:
         # catastrophic in earnings season -- every in-window expiry falls on/
         # before the next print, emptying the candidate list for the whole
         # universe.
-        earnings_date = None
-        if self.active_mandate.options.earnings_window_max_days > 0:
-            earnings_date = self._next_earnings_date(ticker)
+        #
+        # Only apply it when the print is actually REACHABLE inside the DTE
+        # window (earnings_date <= end). A momentum-BACKFILL name whose earnings
+        # sit beyond max_dte (e.g. NVDA ~59d out vs a 45d cap) has NO in-window
+        # expiry after the print, so this filter would silently empty its entire
+        # (deeply liquid) chain -- exactly why big names logged no_eligible_contracts
+        # every cycle. Past the window it is not a pre-earnings play; treat the
+        # name as the momentum candidate it was backfilled as and keep its chain.
+        earnings_date = self._ivramp_earnings_date(ticker, now)
         try:
             chain = self.market.option_chain(ticker, start, end, "ALL")
         except Exception as exc:  # noqa: BLE001
@@ -1350,6 +1356,25 @@ class PaperTradingCycle:
         self._earnings_date_cache[key] = result
         return result
 
+    def _ivramp_earnings_date(self, ticker: str, now: datetime) -> date | None:
+        """Confirmed earnings date ONLY when this name is a genuine IV-ramp pick.
+
+        A pre-earnings IV-ramp play requires a print that an in-window contract
+        can outlive, i.e. an earnings date inside the DTE reach (today+max_dte).
+        Returns None when the strategy is off, the date is unknown, or the print
+        sits beyond max_dte (a momentum-BACKFILL name -- not a dated earnings
+        pick). Shared by the candidate expiry filter and the committee briefing
+        so both agree on whether a name is IV-ramp or momentum.
+        """
+
+        if self.active_mandate.options.earnings_window_max_days <= 0:
+            return None
+        ed = self._next_earnings_date(ticker)
+        if ed is None:
+            return None
+        end = now.date() + timedelta(days=self.mandate.options.max_dte)
+        return ed if ed <= end else None
+
     def _pre_earnings_exit_date(self, ticker: str) -> date | None:
         """Exit date for the pre-earnings (IV-ramp) play, or None when disabled.
 
@@ -1606,9 +1631,17 @@ class PaperTradingCycle:
             return None
 
         before = self.committee.usage_total()
+        # Surface the confirmed earnings date (when this is a genuine IV-ramp
+        # pick) so the committee stops re-deriving it from filings and rejecting
+        # on a guessed date / "no confirmed date". None for momentum-backfill
+        # names (earnings unknown OR beyond max_dte), matching the candidate
+        # expiry filter so briefing and chain agree on the strategy; the briefing
+        # handles the None case explicitly.
+        earnings_date = self._ivramp_earnings_date(ticker, now)
         output = self.committee.run(
             context, scores, candidates=candidates, market_snapshot=snapshot,
             price_context=price_context, iv_rank=iv_rank_val,
+            earnings_date=earnings_date,
         )
         usage = usage_delta(before, self.committee.usage_total())
         self.audit.append(
@@ -1621,6 +1654,7 @@ class PaperTradingCycle:
                 "ticker": ticker,
                 **usage.model_dump(mode="json"),
                 "total_tokens": usage.total_tokens,
+                "prompt_cache_hit_rate": usage.prompt_cache_hit_rate,
             },
         )
         if self.llm_budget is not None:

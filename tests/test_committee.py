@@ -2,7 +2,7 @@ import json
 from datetime import date, datetime, timezone
 
 from trading_agent.domain.evidence import CandidateContext, EvidenceItem
-from trading_agent.domain.proposals import OptionCandidate
+from trading_agent.domain.proposals import ExitPlan, OptionCandidate
 from trading_agent.research.committee import Committee, parse_win_prob
 from trading_agent.research.llm import MockLLMClient
 from trading_agent.research.scoring import ScoreInputs, score_candidate
@@ -52,6 +52,45 @@ def _scores():
 def _run(responses: list[str]):
     client = MockLLMClient(responses)
     return Committee(client).run(_context(), _scores())
+
+
+def test_exit_plan_normalizes_signed_fractional_stop_loss():
+    """The committee sometimes expresses the stop as a signed fraction (-0.5 =
+    '-50%'); the schema wants a positive magnitude. Coerce instead of failing
+    validation and killing an otherwise-valid proposal (last night: 6 lost)."""
+    ep = ExitPlan(take_profit_pct=1.0, stop_loss_pct=-0.5, time_stop=date(2026, 7, 17))
+    assert ep.take_profit_pct == 100.0
+    assert ep.stop_loss_pct == 50.0
+    # A plain magnitude passes through unchanged.
+    ep2 = ExitPlan(take_profit_pct=100.0, stop_loss_pct=50.0, time_stop=date(2026, 7, 17))
+    assert ep2.stop_loss_pct == 50.0
+
+
+def test_iv_ramp_briefing_states_confirmed_earnings_date():
+    """A known earnings date is handed to the committee as fact so no role
+    re-derives (and rejects on) a guessed date -- last night's dominant veto."""
+    c = Committee(
+        MockLLMClient([]),
+        pre_earnings_exit_trading_days=2,
+        earnings_window_max_days=25,
+    )
+    block = c._format_strategy(date(2026, 7, 24))
+    assert "2026-07-24" in block
+    assert "treat it as FACT" in block
+    assert "expires AFTER this date" in block
+
+
+def test_iv_ramp_briefing_tolerates_missing_earnings_date():
+    """A momentum-backfill name without a confirmed date must NOT be vetoed
+    solely for lacking one."""
+    c = Committee(
+        MockLLMClient([]),
+        pre_earnings_exit_trading_days=2,
+        earnings_window_max_days=25,
+    )
+    block = c._format_strategy(None)
+    assert "could not confirm an exact earnings date" in block
+    assert "Do NOT veto SOLELY" in block
 
 
 def _candidates() -> list[OptionCandidate]:

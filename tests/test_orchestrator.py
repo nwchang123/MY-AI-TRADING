@@ -300,6 +300,44 @@ def test_eligible_candidates_drops_contracts_expiring_before_earnings(
     assert after in codes
 
 
+def test_eligible_candidates_keeps_chain_when_earnings_beyond_dte_window(
+    tmp_path: Path,
+) -> None:
+    # Regression: a momentum-BACKFILL name whose next print sits BEYOND max_dte
+    # (e.g. NVDA ~59d out vs a 45d cap) has no in-window expiry after the print,
+    # so blindly requiring expiry > earnings emptied its entire (deeply liquid)
+    # chain -- the no_eligible_contracts-every-cycle bug. Past the window it is
+    # not a pre-earnings play, so the filter must stay inert and keep the chain.
+    from trading_agent.execution.orchestrator import CycleResult
+
+    base = _mandate()
+    opts = base.options.model_copy(
+        update={
+            "earnings_window_min_days": 10,
+            "earnings_window_max_days": 25,
+            "pre_earnings_exit_trading_days": 2,
+        }
+    )
+    mandate = base.model_copy(update={"options": opts})
+
+    before = "US.EXAMPLE260622C00005000"  # expires 06-22 (in-window)
+    after = "US.EXAMPLE260710C00005000"  # expires 07-10 (in-window)
+    cycle = _cycle(
+        tmp_path,
+        broker=FakeBroker(),
+        market=FakeMarket(chain_codes=[before, after]),
+        committee=_committee([]),
+        mandate=mandate,
+        # Earnings far past max_dte: NO in-window expiry outlives it.
+        earnings_calendar=_FixedEarningsCalendar(date(2026, 12, 1)),
+    )
+    codes = {
+        c.option_code
+        for c in cycle._eligible_candidates(NOW, "EXAMPLE", CycleResult())
+    }
+    assert codes == {before, after}
+
+
 def test_eligible_candidates_keeps_all_when_pre_earnings_disabled(
     tmp_path: Path,
 ) -> None:

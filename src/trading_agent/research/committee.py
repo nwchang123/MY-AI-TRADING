@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -36,16 +36,14 @@ U.S. options experiment. Hard rules:
 - Never allege insider trading and never rely on rumors or private information.
 - Be concise: at most 6 sentences unless asked for JSON."""
 
-_CATALYST_SYSTEM = (
-    _COMMON_RULES
-    + "\n\nRole: catalyst_analyst. Explain the public catalyst and its expected"
+_CATALYST_TASK = (
+    "ROLE TASK: catalyst_analyst. Explain the public catalyst and its expected"
     " timing. State which evidence_ids support it. Distinguish confirmed dates"
     " from speculation."
 )
 
-_OPTIONS_SYSTEM = (
-    _COMMON_RULES
-    + "\n\nRole: options_analyst. Recommend at most one liquid option contract"
+_OPTIONS_TASK = (
+    "ROLE TASK: options_analyst. Recommend at most one liquid option contract"
     " (call or put) consistent with the catalyst direction and the mandate"
     " (14-45 DTE, premium within the per-contract budget stated in the briefing)."
     " Note liquidity"
@@ -56,9 +54,8 @@ _OPTIONS_SYSTEM = (
 # Used instead of _OPTIONS_SYSTEM when the briefing carries a real candidate list
 # (sourced from the live option chain and already liquidity-checked). The analyst
 # must pick from those contracts rather than describe a hypothetical one.
-_OPTIONS_SYSTEM_WITH_CHAIN = (
-    _COMMON_RULES
-    + "\n\nRole: options_analyst. The briefing lists CANDIDATE CONTRACTS that"
+_OPTIONS_TASK_WITH_CHAIN = (
+    "ROLE TASK: options_analyst. The briefing lists CANDIDATE CONTRACTS that"
     " already pass the mandate's liquidity, DTE, and cost limits. Recommend"
     " exactly ONE of them, by its exact option_code, consistent with the catalyst"
     " direction. Prefer adequate open interest/volume and a tight spread. Do not"
@@ -96,9 +93,8 @@ _WIN_PROB_RULE = (
     " you see specific risks that make this worse than a random coin-flip."
 )
 
-_SKEPTIC_SYSTEM = (
-    _COMMON_RULES
-    + "\n\nRole: skeptic. Hunt for dilution, ATM shelves, insider selling, stale"
+_SKEPTIC_TASK = (
+    "ROLE TASK: skeptic. Hunt for dilution, ATM shelves, insider selling, stale"
     " news, weak evidence, and IV-crush risk. The briefing includes deterministic"
     " red flags already computed by code; treat them as confirmed facts and weigh"
     " them rather than re-deriving them. If the trade should not proceed, begin"
@@ -106,18 +102,16 @@ _SKEPTIC_SYSTEM = (
     + _WIN_PROB_RULE
 )
 
-_RISK_SYSTEM = (
-    _COMMON_RULES
-    + "\n\nRole: risk_manager. Argue against the trade when downside is poorly"
+_RISK_TASK = (
+    "ROLE TASK: risk_manager. Argue against the trade when downside is poorly"
     " bounded or the catalyst window is unclear. Weigh the deterministic red flags"
     " in the briefing. If risk is unacceptable, begin your reply with"
     f" '{VETO_PREFIX}:' followed by the reason."
     + _WIN_PROB_RULE
 )
 
-_PM_SYSTEM = (
-    _COMMON_RULES
-    + "\n\nRole: portfolio_manager. Produce the FINAL decision as a single JSON"
+_PM_TASK = (
+    "ROLE TASK: portfolio_manager. Produce the FINAL decision as a single JSON"
     " object and nothing else.\n"
     "If you decide not to trade, output exactly:"
     ' {"decision": "hold"|"reject", "rationale": "<short reason>"}.\n'
@@ -290,6 +284,7 @@ class Committee:
         market_snapshot: dict | None = None,
         price_context: dict | None = None,
         iv_rank: float | None = None,
+        earnings_date: date | None = None,
     ) -> CommitteeOutput:
         red_flags = detect_red_flags(context, scores)
         # Non-directional critical flags (none today, but future-proofed) still
@@ -351,19 +346,19 @@ class Committee:
             {c.option_code for c in effective} if effective else None
         )
         direction_block = _puts_only_block(bearish) if puts_only else ""
-        options_system = _OPTIONS_SYSTEM_WITH_CHAIN if candidate_block else _OPTIONS_SYSTEM
+        options_task = _OPTIONS_TASK_WITH_CHAIN if candidate_block else _OPTIONS_TASK
         veto_policy = (
             _PM_VETO_SOFT if self.veto_win_prob_penalty > 0 else _PM_VETO_HARD
         )
-        pm_system = (
-            _PM_SYSTEM
+        pm_task = (
+            _PM_TASK
             + veto_policy
             + (_PM_CANDIDATE_RULE if candidate_block else "")
             + (f"\n{direction_block}" if direction_block else "")
         )
 
         briefing = self._briefing(context, scores)
-        strategy_block = self._format_strategy()
+        strategy_block = self._format_strategy(earnings_date)
         if strategy_block:
             briefing = f"{strategy_block}\n\n{briefing}"
         budget_block = self._format_budget()
@@ -384,11 +379,13 @@ class Committee:
         flag_block = format_red_flags(red_flags)
         calls = 0
 
+        catalyst_prompt = f"{briefing}\n\n{_CATALYST_TASK}"
         options_briefing = (
             f"{briefing}\n\n{candidate_block}" if candidate_block else briefing
         )
-        catalyst = self.client.complete(system=_CATALYST_SYSTEM, user=briefing)
-        options = self.client.complete(system=options_system, user=options_briefing)
+        options_prompt = f"{options_briefing}\n\n{options_task}"
+        catalyst = self.client.complete(system=_COMMON_RULES, user=catalyst_prompt)
+        options = self.client.complete(system=_COMMON_RULES, user=options_prompt)
         calls += 2
 
         analyst_context = (
@@ -396,19 +393,14 @@ class Committee:
             + (f"\n\n{candidate_block}" if candidate_block else "")
             + f"\n\n[catalyst_analyst]\n{catalyst}\n\n[options_analyst]\n{options}"
         )
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            skeptic_fut = pool.submit(
-                self.adversary_client.complete,
-                system=_SKEPTIC_SYSTEM,
-                user=analyst_context,
-            )
-            risk_fut = pool.submit(
-                self.adversary_client.complete,
-                system=_RISK_SYSTEM,
-                user=analyst_context,
-            )
-            skeptic = skeptic_fut.result()
-            risk = risk_fut.result()
+        skeptic = self.adversary_client.complete(
+            system=_COMMON_RULES,
+            user=f"{analyst_context}\n\n{_SKEPTIC_TASK}",
+        )
+        risk = self.adversary_client.complete(
+            system=_COMMON_RULES,
+            user=f"{analyst_context}\n\n{_RISK_TASK}",
+        )
         calls += 2
 
         notes = [
@@ -433,7 +425,7 @@ class Committee:
             f"{analyst_context}\n\n[skeptic]\n{skeptic}\n\n[risk_manager]\n{risk}"
         )
         pm_raw = self.pro_client.complete(
-            system=pm_system, user=pm_context, json_mode=True
+            system=_COMMON_RULES, user=f"{pm_context}\n\n{pm_task}", json_mode=True
         )
         calls += 1
         notes.append(
@@ -600,7 +592,7 @@ class Committee:
             win_probability=win_probability,
         )
 
-    def _format_strategy(self) -> str:
+    def _format_strategy(self, earnings_date: date | None = None) -> str:
         """Tell every role what strategy this trade actually is.
 
         Two distinct regimes share the pre-earnings EXIT guard, so the briefing
@@ -619,6 +611,27 @@ class Committee:
 
         k = self.pre_earnings_exit_trading_days
         if self.earnings_window_max_days > 0:
+            # The committee used to RE-DERIVE the earnings date from filings (and
+            # often guess it wrong, then reject for "no confirmed date" / "expiry
+            # before the print"). When our calendar confirms the date, state it as
+            # fact so no role second-guesses it; when it is unknown (a momentum
+            # BACKFILL name, not a true earnings pick), say so explicitly so the
+            # absence of a date is not itself a veto.
+            if earnings_date is not None:
+                earnings_line = (
+                    f" The confirmed next earnings date is {earnings_date.isoformat()} "
+                    "(from our earnings calendar -- treat it as FACT, do NOT re-derive "
+                    "or doubt it). Every listed candidate contract already expires "
+                    "AFTER this date, so do NOT veto for expiring before the print."
+                )
+            else:
+                earnings_line = (
+                    " Our calendar could not confirm an exact earnings date for this "
+                    "name (it entered via the momentum backfill, not a dated earnings "
+                    "pick). Do NOT veto SOLELY because a confirmed earnings date is "
+                    "missing or because you cannot pin the print to a day -- judge it "
+                    "on the catalyst evidence and current IV instead."
+                )
             return (
                 "STRATEGY -- PRE-EARNINGS IV-RAMP: this position is opened AHEAD "
                 f"of an upcoming earnings date and CLOSED ~{k} trading day(s) "
@@ -626,7 +639,7 @@ class Committee:
                 "the volatility ramp INTO the event, not the earnings reaction. So "
                 "do NOT veto on event/earnings IV-crush (we exit before it). DO "
                 "still veto if current IV is ALREADY extreme (we would overpay) or "
-                "the catalyst is stale / already released."
+                "the catalyst is stale / already released." + earnings_line
             )
         if k > 0:
             return (
