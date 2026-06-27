@@ -33,6 +33,18 @@ DEFAULT_SHORTLIST_CAP = 60
 # the option DTE and the pre-earnings exit with the SAME source selection used).
 DEFAULT_LOOKAHEAD_DAYS = 90
 
+# Finnhub's free /calendar/earnings caps each response at ~1500 rows. A single
+# 90-day query in earnings season overflows that cap AND returns the rows ordered
+# so the NEAREST (this-month) prints are the ones dropped -- catastrophic, because
+# those are exactly the in-window names the strategy trades. So the wide lookahead
+# is fetched in sub-windows this many days wide, each comfortably under the cap
+# (peak-season 30-day windows observed ~1200 rows), then merged. Verified live
+# 2026-06-27: a 90-day query returned only Aug/Sep (July silently truncated).
+WIDE_CHUNK_DAYS = 30
+# Above this row count a response was probably truncated by the free-tier cap;
+# used only to warn, never to block.
+FINNHUB_ROW_CAP = 1500
+
 
 @runtime_checkable
 class EarningsCalendar(Protocol):
@@ -76,6 +88,7 @@ class FinnhubEarningsCalendar:
         *,
         timeout: float = 20.0,
         lookahead_days: int = DEFAULT_LOOKAHEAD_DAYS,
+        chunk_days: int = WIDE_CHUNK_DAYS,
         now_fn: Callable[[], datetime] | None = None,
         fetch_fn: Callable[[str], bytes] | None = None,
     ):
@@ -84,6 +97,7 @@ class FinnhubEarningsCalendar:
         self.token = token
         self.timeout = timeout
         self.lookahead_days = lookahead_days
+        self.chunk_days = max(1, chunk_days)
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self._fetch = fetch_fn or self._http_fetch
         self._wide: dict[str, date] | None = None  # cached next_earnings_date window
@@ -116,15 +130,38 @@ class FinnhubEarningsCalendar:
         wanted = {t.strip().upper() for t in tickers}
         return {t: d for t, d in calendar.items() if t in wanted}
 
+    def _wide_calendar(self) -> dict[str, date]:
+        """The full lookahead window, fetched in sub-windows to dodge the
+        free-tier row cap, merged earliest-date-per-symbol.
+
+        A single ``_calendar(today, today+90d)`` silently drops the nearest
+        prints once the response overflows ~1500 rows, so a name whose earnings
+        are 2 weeks out reads back as None -- which is precisely an in-window
+        IV-ramp candidate. Chunking keeps each response under the cap so the
+        per-ticker lookups agree with the narrow-window ``upcoming`` selection.
+        """
+
+        today = self._now_fn().date()
+        horizon = today + timedelta(days=self.lookahead_days)
+        merged: dict[str, date] = {}
+        start = today
+        while start <= horizon:
+            stop = min(start + timedelta(days=self.chunk_days), horizon)
+            for sym, day in self._calendar(start, stop).items():
+                if sym not in merged or day < merged[sym]:
+                    merged[sym] = day
+            if stop >= horizon:
+                break
+            # +1 day so adjacent chunks do not re-fetch the shared boundary date.
+            start = stop + timedelta(days=1)
+        return merged
+
     def next_earnings_date(self, ticker: str) -> date | None:
         # One cached wide-window fetch backs every per-ticker lookup in a cycle,
         # so the orchestrator aligns DTE + the pre-earnings exit with the SAME
         # source the universe scanner used -- without a request per ticker.
         if self._wide is None:
-            today = self._now_fn().date()
-            self._wide = self._calendar(
-                today, today + timedelta(days=self.lookahead_days)
-            )
+            self._wide = self._wide_calendar()
         return self._wide.get(ticker.strip().upper())
 
 

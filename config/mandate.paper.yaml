@@ -27,11 +27,18 @@ universe:
   # caps. Small-cap OPTIONS carry a 13-29% bid-ask tax that systematically kills a
   # long-option buyer regardless of thesis (the committee on 2026-06-15 correctly
   # rejected PENG/CNXC/WGO on exactly this). Underlying >=$5 (drop penny junk),
-  # market cap 1B-50B (mid/large), turnover >=30M (liquid). The $325 contract-cost
-  # cap still naturally filters high-priced mega-caps whose ATM options exceed it.
+  # turnover >=10M (liquid).
+  # MID-CAP BAND 2026-06-27: max cap 500B -> 50B. The two competing forces are
+  # liquidity (large caps -> tight option spreads) and inefficiency (smaller caps
+  # -> real catalyst edge). The 3B-50B mid-cap band is the sweet spot: option
+  # spreads still tradeable, but enough mispricing for a catalyst to move the name
+  # before it is fully arbitraged. 500B let in mega-caps (NVDA/AAPL/MSFT) that are
+  # too efficient to ever clear the committee -- they only entered via the (now
+  # emptied) watchlist anyway. EVALUATION: widen back toward 100-500B if the
+  # mid-cap pool proves too thin to populate the universe.
   min_underlying_price_usd: 5
   min_market_cap_usd: 3000000000
-  max_market_cap_usd: 500000000000
+  max_market_cap_usd: 50000000000
   min_average_daily_turnover_usd: 10000000
   require_listed_equity: true
   reject_otc: true
@@ -48,22 +55,18 @@ universe:
   # to bias harder toward accumulation, lower/0 to revert. Only affects the
   # volume backfill now that earnings-window names are preferred first.
   premove_change_penalty: 0.1
-  watchlist:
-    - NVDA
-    - TSLA
-    - AMD
-    - META
-    - AMZN
-    - GOOG
-    - MSFT
-    - AAPL
-    - NFLX
-    - COIN
-    - SHOP
-    - PLTR
-    - SMCI
-    - MU
-    - QQQ
+  # EMPTIED 2026-06-27. The watchlist was 15 static mega-caps PREPENDED to the
+  # top of every cycle, ahead of the fresh catalysts -- and they are the worst
+  # fit for this strategy: no catalyst edge (committee vetoes "already priced
+  # in"), ATM options over the $325 cost cap (TSLA call $1751 on 06-26), earnings
+  # beyond the DTE window, and QQQ is an ETF with no single-name thesis at all.
+  # Audit 2026-06-26: the watchlist took 20% of committee runs + 36% of the
+  # no_eligible_contracts churn for 0 entries, and it re-injected exactly the
+  # >max_market_cap_usd names the scan filter is designed to exclude. The scan's
+  # own market-cap band now defines the universe. select_universe still treats a
+  # watchlist as a FALLBACK (appended to backfill empty slots only), so populate
+  # this again ONLY with names you want traded on days the catalyst scan runs dry.
+  watchlist: []
 
 options:
   allowed_opening_actions: [buy_call, buy_put]

@@ -98,12 +98,51 @@ def test_finnhub_next_earnings_date_caches_one_wide_fetch() -> None:
         "tok",
         fetch_fn=fetch,
         now_fn=lambda: datetime(2026, 6, 14, tzinfo=timezone.utc),
+        chunk_days=365,  # one chunk over the 90d lookahead: isolates the cache test
     )
     assert cal.next_earnings_date("AAA") == date(2026, 6, 18)
     assert cal.next_earnings_date("bbb") == date(2026, 6, 25)  # case-insensitive
     assert cal.next_earnings_date("ZZZ") is None  # not in the calendar
     assert cal.next_earnings_date("CCC") is None  # 2099 is past the 90d lookahead
     assert calls["n"] == 1  # one cached wide-window fetch backs every lookup
+
+
+def test_finnhub_wide_window_chunks_to_dodge_row_cap() -> None:
+    """The free tier caps a response at ~1500 rows and drops the NEAREST prints
+    first, so a single 90-day query silently loses this-month earnings. The wide
+    lookahead must be fetched in sub-windows and merged, so a date two weeks out
+    (an in-window IV-ramp name) still resolves. Regression for the live
+    2026-06-27 finding that next_earnings_date returned None for every July
+    name while upcoming() (narrow window) saw them fine."""
+    calls: list[tuple[str, str]] = []
+
+    def fetch(url: str) -> bytes:
+        # Each chunk only "contains" earnings inside its own [from, to] -- mirrors
+        # the cap behavior where a wide query would have dropped the early rows.
+        import re
+
+        frm = re.search(r"from=(\d{4}-\d{2}-\d{2})", url).group(1)
+        to = re.search(r"to=(\d{4}-\d{2}-\d{2})", url).group(1)
+        calls.append((frm, to))
+        rows = [
+            {"symbol": "JUL", "date": "2026-07-21"},  # near: lost without chunking
+            {"symbol": "SEP", "date": "2026-09-01"},  # far
+        ]
+        rows = [r for r in rows if frm <= r["date"] <= to]
+        return json.dumps({"earningsCalendar": rows}).encode()
+
+    cal = FinnhubEarningsCalendar(
+        "tok",
+        fetch_fn=fetch,
+        now_fn=lambda: datetime(2026, 6, 27, tzinfo=timezone.utc),
+        chunk_days=30,
+    )
+    assert cal.next_earnings_date("JUL") == date(2026, 7, 21)  # the near date survives
+    assert cal.next_earnings_date("SEP") == date(2026, 9, 1)
+    assert len(calls) >= 2  # the 90d lookahead was split into sub-windows
+    # Sub-windows are contiguous and non-overlapping (no re-fetch of a boundary).
+    for (_, prev_to), (next_from, _) in zip(calls, calls[1:]):
+        assert next_from > prev_to
 
 
 def test_yfinance_next_earnings_date_delegates() -> None:

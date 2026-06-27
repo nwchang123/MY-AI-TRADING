@@ -283,8 +283,18 @@ def select_universe(
         ]
         ranked = _dedupe(earnings_first + volume_backfill)
 
-    wl = [str(t).strip().upper() for t in watchlist if str(t).strip()]
-    ranked = _dedupe(wl) + [t for t in ranked if t not in set(wl)]
+    # Watchlist is a FALLBACK, not a queue-jump. It used to be PREPENDED, which
+    # forced the same static mega-caps to the top of every cycle ahead of the
+    # fresh catalysts -- and those names are the worst fit for this strategy
+    # (no catalyst edge -> "priced in" vetoes, ATM options over the cost cap,
+    # earnings beyond the DTE window). Live 2026-06-26 the watchlist took 20% of
+    # committee runs and 36% of the no_eligible_contracts churn for 0 entries,
+    # and it re-injected the >max_market_cap names the scan deliberately excludes.
+    # Now appended only to backfill empty slots when the catalyst-ranked scan runs
+    # short, so it can never crowd out a real catalyst again.
+    wl = _dedupe(str(t).strip().upper() for t in watchlist if str(t).strip())
+    ranked_set = set(ranked)
+    ranked = ranked + [t for t in wl if t not in ranked_set]
 
     industries: dict[str, str] = {}
     if industry_of is not None and (max_per_industry > 0 or excluded_industries):

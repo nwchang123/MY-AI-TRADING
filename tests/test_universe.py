@@ -171,6 +171,29 @@ def test_select_universe_priority_tickers_jump_the_queue() -> None:
     assert picked == ["NEWS", "BIG"]
 
 
+def test_select_universe_watchlist_is_fallback_not_queue_jump() -> None:
+    # The watchlist must NOT prepend ahead of the catalyst-ranked scan -- doing
+    # so forced static mega-caps to the top of every cycle. A scanned catalyst
+    # name ranks first; the watchlist name only backfills the remaining slot.
+    market = FakeScanMarket(
+        [
+            _row("US.CAT", 9e7, volume_ratio=8.0),  # real catalyst (high vol ratio)
+        ]
+    )
+    provider = FakeProvider(optionable={"CAT", "WL"})
+
+    picked = select_universe(
+        market=market,
+        provider=provider,
+        universe=_universe(),
+        max_tickers=5,
+        watchlist={"WL"},
+    )
+
+    # Catalyst first, watchlist appended as fallback -- not the other way round.
+    assert picked == ["CAT", "WL"]
+
+
 def test_select_universe_skips_fresh_rejections_without_probing() -> None:
     market = FakeScanMarket(
         [
